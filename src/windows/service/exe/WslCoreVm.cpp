@@ -129,7 +129,7 @@ std::unique_ptr<WslCoreVm> WslCoreVm::Create(_In_ const wil::shared_handle& User
             CONFIG_TELEMETRY(newInstance->m_vmConfig));
     }
     catch (...)
-    {
+     {
         const auto hr = wil::ResultFromCaughtException();
 
         // Log telemetry when the WSL VM fails to start including the error
@@ -437,6 +437,10 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
         throw;
     }
 
+    //Added by balaje
+
+    m_vmConfig.EnableGpuSupport = false;
+
     // Add GPUs to the utility VM.
     if (m_vmConfig.EnableGpuSupport)
     {
@@ -492,6 +496,10 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
         addShare(TEXT(LXSS_GPU_PACKAGED_LIB_SHARE), path.c_str());
     }
 
+    // Added by Balaje
+
+    m_vmConfig.EnableHostFileSystemAccess = false;  
+
     // Asynchronously add drvfs devices if supported.
     if (m_vmConfig.EnableHostFileSystemAccess)
     {
@@ -522,9 +530,13 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
     m_notifyChannel = AcceptConnection(m_vmConfig.KernelBootTimeout);
 
     // Receive and parse the guest kernel version
-    ReadGuestCapabilities();
+    //Commented by balaje
+    //ReadGuestCapabilities();
 
     // Mount the system distro.
+
+    //Added by Balaje
+    m_systemDistroDeviceType = LxMiniInitMountDeviceTypeInvalid;
     switch (m_systemDistroDeviceType)
     {
     case LxMiniInitMountDeviceTypeLun:
@@ -542,6 +554,9 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
 
     // Mount the kernel modules VHD.
     ULONG modulesLun = ULONG_MAX;
+
+    //Added by Balaje
+    m_vmConfig.KernelModulesPath = L"";     
     if (!m_vmConfig.KernelModulesPath.empty())
     {
         modulesLun =
@@ -553,6 +568,9 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
     // N.B. This can fail if the target directory is compressed, encrypted, or if
     //      the user does not have write access.
     ULONG swapLun = ULONG_MAX;
+
+    //Added by Balaje
+    m_vmConfig.SwapSizeBytes = 0;   
     if ((m_systemDistroDeviceId != ULONG_MAX) && (m_vmConfig.SwapSizeBytes > 0))
         try
         {
@@ -602,10 +620,12 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
     //
     // N.B. This must be done before sending the initial configuration message because some guest
     //      behavior is determined by the networking mode.
-    ValidateNetworkingMode();
+
+    // Commented by Balaje  
+    //ValidateNetworkingMode();
 
     // Send the early configuration message.
-    wsl::shared::MessageWriter<LX_MINI_INIT_EARLY_CONFIG_MESSAGE> message(LxMiniInitMessageEarlyConfig);
+    /* wsl::shared::MessageWriter<LX_MINI_INIT_EARLY_CONFIG_MESSAGE> message(LxMiniInitMessageEarlyConfig);
     message->SwapLun = swapLun;
     message->SystemDistroDeviceType = m_systemDistroDeviceType;
     message->SystemDistroDeviceId = m_systemDistroDeviceId;
@@ -797,7 +817,7 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
     }
 
     // Perform additional initialization.
-    InitializeGuest();
+    InitializeGuest(); */
 }
 
 WslCoreVm::~WslCoreVm() noexcept
@@ -1335,6 +1355,64 @@ void WslCoreVm::CollectCrashDumps(wil::unique_socket&& listenSocket) const
         CATCH_LOG();
     }
 }
+// Added by Balaje for BSD support  
+std::shared_ptr<LxssRunningInstance> WslCoreVm::CreateBSDInstance(
+    _In_ const GUID& InstanceId,
+    _In_ const LXSS_DISTRO_CONFIGURATION& Configuration,
+    _In_ LX_MESSAGE_TYPE MessageType,
+    _In_ DWORD ReceiveTimeout,
+    _In_ ULONG DefaultUid,
+    _In_ ULONG64 ClientLifetimeId,
+    _In_ ULONG ExportFlags,
+    _Out_opt_ ULONG* ConnectPort)
+{
+    // Add the VHD to the machine.
+    auto lock = m_lock.lock_exclusive();
+   // const auto lun = AttachDiskLockHeld(Configuration.VhdFilePath.c_str(), DiskType::VHD, MountFlags::None, {}, false, m_userToken.get());
+
+    // Launch the init daemon and create the instance.
+    int flags = LxMiniInitMessageFlagNone;
+    std::wstring sharedMemoryRoot{};
+
+#ifdef WSL_DEV_INSTALL_PATH
+
+    std::wstring installPath = TEXT(WSL_DEV_INSTALL_PATH);
+
+#else
+
+    std::wstring installPath = m_installPath.wstring();
+
+#endif
+
+    std::wstring userProfile{};
+   /* if (LXSS_ENABLE_GUI_APPS() && (MessageType == LxMiniInitMessageLaunchInit))
+    {
+        WI_SetFlag(flags, LxMiniInitMessageFlagLaunchSystemDistro);
+        sharedMemoryRoot = m_sharedMemoryRoot;
+
+        userProfile = m_userProfile;
+    }*/
+
+    WI_SetFlagIf(flags, LxMiniInitMessageFlagExportCompressGzip, WI_IsFlagSet(ExportFlags, LXSS_EXPORT_DISTRO_FLAGS_GZIP));
+    WI_SetFlagIf(flags, LxMiniInitMessageFlagExportCompressXzip, WI_IsFlagSet(ExportFlags, LXSS_EXPORT_DISTRO_FLAGS_XZIP));
+    WI_SetFlagIf(flags, LxMiniInitMessageFlagVerbose, WI_IsFlagSet(ExportFlags, LXSS_EXPORT_DISTRO_FLAGS_VERBOSE));
+
+    wsl::shared::MessageWriter<LX_MINI_INIT_MESSAGE> message(MessageType);
+    message->MountDeviceType = LxMiniInitMountDeviceTypeLun;
+    message->DeviceId = 0; // lun;
+    message->Flags = flags;
+    message.WriteString(message->FsTypeOffset, "ext4");
+    message.WriteString(message->MountOptionsOffset, "discard,errors=remount-ro,data=ordered");
+    message.WriteString(message->VmIdOffset, m_machineId);
+    message.WriteString(message->DistributionNameOffset, Configuration.Name);
+    message.WriteString(message->SharedMemoryRootOffset, sharedMemoryRoot);
+    message.WriteString(message->InstallPathOffset, installPath);
+    message.WriteString(message->UserProfileOffset, userProfile);
+    m_miniInitChannel.SendMessage<LX_MINI_INIT_MESSAGE>(message.Span());
+  //  Configuration.Name = L"bsd"; // Added by Balaje as temp fix till we have proper distro support for bsd 
+    return CreateBSDInstanceInternal(
+        InstanceId, Configuration, ReceiveTimeout, DefaultUid, ClientLifetimeId, WI_IsFlagSet(flags, LxMiniInitMessageFlagLaunchSystemDistro), ConnectPort);
+}
 
 std::shared_ptr<LxssRunningInstance> WslCoreVm::CreateInstance(
     _In_ const GUID& InstanceId,
@@ -1392,6 +1470,61 @@ std::shared_ptr<LxssRunningInstance> WslCoreVm::CreateInstance(
 
     return CreateInstanceInternal(
         InstanceId, Configuration, ReceiveTimeout, DefaultUid, ClientLifetimeId, WI_IsFlagSet(flags, LxMiniInitMessageFlagLaunchSystemDistro), ConnectPort);
+}
+
+std::shared_ptr<LxssRunningInstance> WslCoreVm::CreateBSDInstanceInternal(
+    _In_ const GUID& InstanceId,
+    _In_ const LXSS_DISTRO_CONFIGURATION& Configuration,
+    _In_ DWORD ReceiveTimeout,
+    _In_ ULONG DefaultUid,
+    _In_ ULONG64 ClientLifetimeId,
+    _In_ bool LaunchSystemDistro,
+    _Out_opt_ ULONG* ConnectPort)
+{
+    // Clear the drive mounting flag if support is disabled at the VM level.
+    //
+    // N.B. If the system distro is enabled the share will still be created since
+    //      GUI apps require access to the Windows file system in order to launch mstsc.
+    LXSS_DISTRO_CONFIGURATION localConfig = Configuration;
+    WI_ClearFlagIf(localConfig.Flags, LXSS_DISTRO_FLAGS_ENABLE_DRIVE_MOUNTING, !m_vmConfig.EnableHostFileSystemAccess);
+
+    // Establish a communication channel with the init daemon.
+    auto initSocket = AcceptConnection(ReceiveTimeout);
+
+    // If the system distro is enabled, establish a communication channel with its init daemon.
+    wil::unique_socket systemDistroSocket;
+    LaunchSystemDistro = false; // BSD does not support GUI apps yet        
+    if (LaunchSystemDistro)
+    {
+        WI_ASSERT(m_vmConfig.EnableGuiApps);
+        systemDistroSocket = AcceptConnection(ReceiveTimeout);
+    }
+
+    // Set feature flags for the instance.
+    ULONG featureFlags{};
+    WI_SetFlagIf(featureFlags, LxInitFeatureVirtIo9p, m_vmConfig.EnableVirtio9p);
+    WI_SetFlagIf(featureFlags, LxInitFeatureVirtIoFs, m_vmConfig.EnableVirtioFs);
+    WI_SetFlagIf(featureFlags, LxInitFeatureDnsTunneling, m_vmConfig.EnableDnsTunneling);
+
+    // Create an instance, this takes ownership of the sockets.
+    auto instance = std::make_shared<WslCoreInstance>(
+        m_userToken.get(),
+        initSocket,
+        systemDistroSocket,
+        InstanceId,
+        m_runtimeId,
+        localConfig,
+        DefaultUid,
+        ClientLifetimeId,
+        std::bind(s_InitializeDrvFs, this, std::placeholders::_1),
+        featureFlags,
+        m_vmConfig.DistributionStartTimeout,
+        m_vmConfig.InstanceIdleTimeout,
+        ConnectPort);
+
+    WI_ASSERT(!initSocket && !systemDistroSocket);
+
+    return instance;
 }
 
 std::shared_ptr<LxssRunningInstance> WslCoreVm::CreateInstanceInternal(

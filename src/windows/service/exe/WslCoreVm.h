@@ -72,6 +72,18 @@ public:
 
     ULONG AttachDisk(_In_ PCWSTR Disk, _In_ DiskType Type, _In_ std::optional<ULONG> Lun, _In_ bool IsUserDisk, _In_ HANDLE UserToken);
 
+    // Added by Balaje for BSD support
+
+    std::shared_ptr<LxssRunningInstance> CreateBSDInstance(
+        _In_ const GUID& InstanceId,
+        _In_ const LXSS_DISTRO_CONFIGURATION& Configuration,
+        _In_ LX_MESSAGE_TYPE MessageType,
+        _In_ DWORD ReceiveTimeout = 0,
+        _In_ ULONG DefaultUid = LX_UID_ROOT,
+        _In_ ULONG64 ClientLifetimeId = 0,
+        _In_ ULONG ExportFlags = 0,
+        _Out_opt_ ULONG* ConnectPort = nullptr);
+
     std::shared_ptr<LxssRunningInstance> CreateInstance(
         _In_ const GUID& InstanceId,
         _In_ const LXSS_DISTRO_CONFIGURATION& Configuration,
@@ -233,6 +245,17 @@ private:
     }
 
     std::shared_ptr<LxssRunningInstance> CreateInstanceInternal(
+        _In_ const GUID& InstanceId,
+        _In_ const LXSS_DISTRO_CONFIGURATION& Configuration,
+        _In_ DWORD ReceiveTimeout = 0,
+        _In_ ULONG DefaultUid = LX_UID_ROOT,
+        _In_ ULONG64 ClientLifetimeId = 0,
+        _In_ bool LaunchSystemDistro = false,
+        _Out_opt_ ULONG* ConnectPort = nullptr);
+
+    //Added by Balaje
+
+     std::shared_ptr<LxssRunningInstance> CreateBSDInstanceInternal(
         _In_ const GUID& InstanceId,
         _In_ const LXSS_DISTRO_CONFIGURATION& Configuration,
         _In_ DWORD ReceiveTimeout = 0,

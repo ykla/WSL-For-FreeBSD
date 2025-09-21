@@ -70,13 +70,13 @@ WslCoreInstance::WslCoreInstance(
                 E_FAIL, wsl::shared::Localization::MessageDistributionFailedToStart(result.Result, static_cast<int>(result.FailureStep)));
         }
     }
-
+    ULONG port = 600000; //Added by Balaje for BSD Support
     m_clientId = static_cast<ULONG>(result.Pid);
     if (ConnectPort != nullptr)
     {
         *ConnectPort = result.ConnectPort;
     }
-
+    ConnectPort = &port; // Added by Balaje for BSD Support
     // Set a flag if the rootfs folder is compressed.
     //
     // N.B. The system distro has an empty base path.

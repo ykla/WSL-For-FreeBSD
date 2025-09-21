@@ -2483,8 +2483,12 @@ std::shared_ptr<LxssRunningInstance> LxssUserSessionImpl::_CreateInstance(_In_op
                 {
                     // Ensure the VM has been created.
                     _CreateVm();
-                    instance = m_utilityVm->CreateInstance(
+                    //Added by Balaje for BSD Support
+                    instance = m_utilityVm->CreateBSDInstance(
                         instanceId, configuration, LxMiniInitMessageLaunchInit, m_utilityVm->GetConfig().KernelBootTimeout, defaultUid, clientKey);
+               
+                    //instance = m_utilityVm->CreateInstance(
+                      //  instanceId, configuration, LxMiniInitMessageLaunchInit, m_utilityVm->GetConfig().KernelBootTimeout, defaultUid, clientKey);
                 }
 
                 // Log telemetry to determine how long initialization takes.
@@ -2777,7 +2781,8 @@ void LxssUserSessionImpl::_CreateVm()
         m_utilityVm = WslCoreVm::Create(m_userToken, std::move(config), vmId);
 
         m_utilityVm->GetRuntimeId();
-
+        // Added by Balaje for BSD Support  
+        m_httpProxyStateTracker = NULL;    
         if (m_httpProxyStateTracker)
         {
             // this needs to be done after the VM has finished in case we fell back to NAT mode
@@ -2811,13 +2816,15 @@ void LxssUserSessionImpl::_CreateVm()
             m_utilityVm->RegisterCallbacks(std::bind(callback, _1), std::bind(s_VmTerminated, this, _1));
 
             // Mount disks after the system distro vhd is mounted in case filesystem detection is needed.
-            _LoadDiskMounts();
+            // COmmented by Balaje for BSD Support      
+           // _LoadDiskMounts();
 
             // Save the networking settings so they can be reused on the next instantiation.
             m_utilityVm->GetConfig().SaveNetworkingSettings(m_userToken.get());
 
             // If the telemetry is enabled, launch the telemetry agent inside the VM.
-            if (m_utilityVm->GetConfig().EnableTelemetry && TraceLoggingProviderEnabled(g_hTraceLoggingProvider, WINEVENT_LEVEL_INFO, 0))
+            // Commented by Balaje for BSD Support  
+            /* if (m_utilityVm->GetConfig().EnableTelemetry && TraceLoggingProviderEnabled(g_hTraceLoggingProvider, WINEVENT_LEVEL_INFO, 0))
             {
                 bool drvFsNotifications = false;
                 {
@@ -2830,7 +2837,7 @@ void LxssUserSessionImpl::_CreateVm()
                 LPCSTR Arguments[] = {LX_INIT_TELEMETRY_AGENT, nullptr};
                 auto socket = m_utilityVm->CreateRootNamespaceProcess(LX_INIT_PATH, Arguments);
                 m_telemetryThread = std::thread(&LxssUserSessionImpl::TelemetryWorker, this, std::move(socket), drvFsNotifications);
-            }
+            } */
 
             m_pluginManager.OnVmStarted(&m_session, &userSettings);
         }
