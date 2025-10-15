@@ -4,6 +4,8 @@
 
 This repository hosts work-in-progress efforts to run **FreeBSD** inside **Windows Subsystem for Linux (WSL2)** with minimal to no changes to the FreeBSD base system. The project builds on the open-source components of WSL2 to enable FreeBSD to boot and run seamlessly in a Windows environment.
 
+Technical description and video available here - https://x.com/balajesankar/status/1970585411153207715
+
 ---
 
 ## Project Goals
@@ -16,7 +18,7 @@ This repository hosts work-in-progress efforts to run **FreeBSD** inside **Windo
 
 ## Current Status
 
-🚧 **Work in Progress** – This is an experimental personal project.  
+🚧 This is an experimental personal project. Here is what works now 
 
 - FreeBSD boots successfully inside WSL2  
 - Basic functionality is up and running  
