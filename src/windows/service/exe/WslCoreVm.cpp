@@ -394,7 +394,7 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
         "Attachments": {
             "0": {
                 "Type": "VirtualDisk",
-                "Path" : "C:\\dev\\vhdx\\FreeBSD14.3-ForWSL.vhdx"
+                "Path" : "C:\\Users\\ykla\\vhdx\\FreeBSD15.1-ForWSL.vhdx"
             }
         }
     }
