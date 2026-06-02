@@ -55,6 +55,7 @@ import argparse
 import hashlib
 import lzma
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -110,52 +111,70 @@ def err(msg: str) -> None:
 # Networking
 # ---------------------------------------------------------------------------
 
-def http_download(url: str, dest: Path, *, resume: bool = True) -> None:
-    """Stream ``url`` to ``dest`` with optional range resume."""
+def http_download(url: str, dest: Path, *, resume: bool = True, max_retries: int = 5) -> None:
+    """Stream ``url`` to ``dest`` with optional range resume and retries."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    headers = {"User-Agent": "wslfb-setup-freebsd-vhdx/1.0"}
-    mode = "wb"
-    pos = 0
-    if resume and dest.exists():
-        pos = dest.stat().st_size
-        headers["Range"] = f"bytes={pos}-"
-        mode = "ab"
 
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            # If server ignored Range, start over
-            if pos > 0 and resp.status != 206:
-                pos = 0
-                mode = "wb"
-            total = resp.headers.get("Content-Length")
-            total = int(total) + pos if total else None
-            with open(dest, mode) as f:
-                done = pos
-                t0 = time.monotonic()
-                while True:
-                    chunk = resp.read(CHUNK)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
+    for attempt in range(1, max_retries + 1):
+        headers = {"User-Agent": "wslfb-setup-freebsd-vhdx/1.0"}
+        mode = "wb"
+        pos = 0
+        if resume and dest.exists():
+            pos = dest.stat().st_size
+            if pos > 0:
+                headers["Range"] = f"bytes={pos}-"
+                mode = "ab"
+
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                # If server ignored Range, start over
+                if pos > 0 and resp.status != 206:
+                    pos = 0
+                    mode = "wb"
+                total = resp.headers.get("Content-Length")
+                total = int(total) + pos if total else None
+                with open(dest, mode) as f:
+                    done = pos
+                    t0 = time.monotonic()
+                    while True:
+                        chunk = resp.read(CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            pct = done * 100 // total
+                            sys.stdout.write(
+                                f"\r  ... {done/1_048_576:8.1f} MiB / {total/1_048_576:8.1f} MiB  {pct:3d}%"
+                            )
+                            sys.stdout.flush()
                     if total:
-                        pct = done * 100 // total
-                        sys.stdout.write(
-                            f"\r  ... {done/1_048_576:8.1f} MiB / {total/1_048_576:8.1f} MiB  {pct:3d}%"
-                        )
-                        sys.stdout.flush()
-                if total:
-                    sys.stdout.write("\n")
-                dt = time.monotonic() - t0
-                if dt > 0:
-                    info(f"  downloaded {done/1_048_576:.1f} MiB in {dt:.1f}s "
-                         f"({done/1_048_576/dt:.1f} MiB/s)")
-    except urllib.error.HTTPError as e:
-        if e.code == 416 and pos > 0:
-            # Already fully downloaded
-            return
-        raise
+                        sys.stdout.write("\n")
+                    dt = time.monotonic() - t0
+                    if dt > 0:
+                        info(f"  downloaded {done/1_048_576:.1f} MiB in {dt:.1f}s "
+                             f"({done/1_048_576/dt:.1f} MiB/s)")
+                return  # success
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and pos > 0:
+                # Already fully downloaded
+                return
+            if e.code in (429, 503) and attempt < max_retries:
+                wait = attempt * 10
+                warn(f"HTTP {e.code} on attempt {attempt}/{max_retries}, "
+                     f"retrying in {wait}s ...")
+                time.sleep(wait)
+                continue
+            raise
+        except (urllib.error.URLError, OSError) as e:
+            if attempt < max_retries:
+                wait = attempt * 5
+                warn(f"network error on attempt {attempt}/{max_retries}: {e}, "
+                     f"retrying in {wait}s ...")
+                time.sleep(wait)
+                continue
+            raise
 
 
 def sha256_of(path: Path, *, algo: str = "sha256") -> str:
