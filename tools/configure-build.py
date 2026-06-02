@@ -22,7 +22,7 @@ set CXX=cl.exe
 set PATH=C:\\ProgramData\\chocolatey\\bin;%PATH%
 set HTTP_PROXY=http://127.0.0.1:7890
 set HTTPS_PROXY=http://127.0.0.1:7890
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TLS_VERIFY=OFF 2>&1
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TLS_VERIFY=OFF 2>&1
 exit /b %ERRORLEVEL%
 '''
     # Write to temp
