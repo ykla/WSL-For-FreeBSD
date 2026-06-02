@@ -14,8 +14,8 @@ the hvs(4) driver and libutil.
 
 This script follows the "use an existing image, bypass compilation" path:
 
-  1. Download a stock FreeBSD 14.3 amd64 VHD from download.freebsd.org
-     (or honour --vhd / --url if you already have one).
+  1. Download a stock FreeBSD amd64 VHD from download.freebsd.org
+     using multi-threaded (16 threads) range requests for speed.
   2. Verify the SHA256 against the upstream CHECKSUM.SHA256 file.
   3. Convert / copy the VHD to VHDX format and place it at the path that
      src/windows/service/exe/WslCoreVm.cpp hard-codes:
@@ -42,6 +42,7 @@ Usage
     python tools/setup-freebsd-vhdx.py --url  https://...custom.vhd.xz
     python tools/setup-freebsd-vhdx.py --skip-verify
     python tools/setup-freebsd-vhdx.py --prefer qemu|convert|copy
+    python tools/setup-freebsd-vhdx.py --threads 8
 
 Environment variables (overridden by flags)
 ------------------------------------------
@@ -60,22 +61,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Defaults -- FreeBSD 14.3-RELEASE amd64 VM image
+# Defaults -- FreeBSD 15.1-RC2 amd64 VM image
 # ---------------------------------------------------------------------------
 
 DEFAULT_RELEASE = "15.1-RC2"
 DEFAULT_ARCH = "amd64"
 DEFAULT_BASE_URL = (
-    "https://mirrors.nju.edu.cn/freebsd/releases/VM-IMAGES"
-    f"/{DEFAULT_RELEASE}/{DEFAULT_ARCH}/Latest"
-)
-FALLBACK_BASE_URL = (
     "https://download.freebsd.org/releases/VM-IMAGES"
     f"/{DEFAULT_RELEASE}/{DEFAULT_ARCH}/Latest"
 )
@@ -83,8 +81,10 @@ DEFAULT_VHD_NAME = f"FreeBSD-{DEFAULT_RELEASE}-{DEFAULT_ARCH}-ufs.vhd.xz"
 DEFAULT_CHECKSUM_NAME = "CHECKSUM.SHA256"
 DEFAULT_OUTPUT = Path(r"C:\dev\vhdx\FreeBSD14.3-ForWSL.vhdx")
 DEFAULT_CACHE = Path(os.environ.get("WSFB_CACHE_DIR", tempfile.gettempdir())) / "wslfb-freebsd-image"
+DEFAULT_THREADS = 16
 
 CHUNK = 1024 * 1024  # 1 MiB
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ def _c(code: str, msg: str) -> str:
 
 
 def info(msg: str) -> None:
-    print(_c("36", f"[info] ") + msg)
+    print(_c("36", "[info] ") + msg)
 
 
 def warn(msg: str) -> None:
@@ -112,18 +112,170 @@ def err(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Networking
+# Progress bar
 # ---------------------------------------------------------------------------
 
-def http_download(url: str, dest: Path, *, resume: bool = True, max_retries: int = 5) -> None:
-    """Stream ``url`` to ``dest`` with optional range resume and retries."""
+class ProgressBar:
+    """Thread-safe progress bar for multi-threaded downloads."""
+
+    def __init__(self, total: int, width: int = 40) -> None:
+        self.total = total
+        self.done = 0
+        self.width = width
+        self.lock = threading.Lock()
+        self.t0 = time.monotonic()
+
+    def update(self, nbytes: int) -> None:
+        with self.lock:
+            self.done += nbytes
+            self._render()
+
+    def _render(self) -> None:
+        if self.total <= 0:
+            return
+        pct = self.done / self.total
+        filled = int(self.width * pct)
+        bar = "#" * filled + "-" * (self.width - filled)
+        elapsed = time.monotonic() - self.t0
+        speed = self.done / elapsed / 1_048_576 if elapsed > 0 else 0
+        sys.stdout.write(
+            f"\r  [{bar}] {pct:6.1%}  "
+            f"{self.done/1_048_576:8.1f}/{self.total/1_048_576:.1f} MiB  "
+            f"{speed:6.1f} MiB/s"
+        )
+        sys.stdout.flush()
+
+    def finish(self) -> None:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Multi-threaded download
+# ---------------------------------------------------------------------------
+
+def _get_content_length(url: str) -> int:
+    """HEAD request to get Content-Length; -1 if unknown."""
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return int(resp.headers.get("Content-Length", -1))
+
+
+def _download_range(
+    url: str,
+    start: int,
+    end: int,
+    dest: Path,
+    chunk_size: int,
+    bar: ProgressBar,
+    thread_id: int,
+    errors: list[str],
+) -> None:
+    """Download byte range [start, end] and write into dest at the correct offset."""
+    headers = {
+        "User-Agent": UA,
+        "Range": f"bytes={start}-{end}",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            with open(dest, "r+b") as f:
+                f.seek(start)
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    bar.update(len(chunk))
+    except Exception as e:
+        errors.append(f"thread {thread_id} (range {start}-{end}): {e}")
+
+
+def http_download_mt(
+    url: str,
+    dest: Path,
+    *,
+    num_threads: int = DEFAULT_THREADS,
+    chunk_size: int = 4 * CHUNK,  # 4 MiB per read
+) -> None:
+    """Download ``url`` to ``dest`` using ``num_threads`` parallel range requests."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Get total size
+    total = _get_content_length(url)
+    if total <= 0:
+        # Fallback: single-threaded
+        info("server does not report Content-Length, falling back to single-thread")
+        http_download_st(url, dest)
+        return
+
+    # Check if server supports Range (try a small range request)
+    try:
+        test_req = urllib.request.Request(url, headers={
+            "User-Agent": UA,
+            "Range": "bytes=0-0",
+        })
+        with urllib.request.urlopen(test_req, timeout=30) as resp:
+            if resp.status != 206:
+                info("server does not support Range, falling back to single-thread")
+                http_download_st(url, dest)
+                return
+    except Exception:
+        http_download_st(url, dest)
+        return
+
+    info(f"downloading with {num_threads} threads, total size {total/1_048_576:.1f} MiB")
+
+    # Create the destination file at full size (sparse)
+    with open(dest, "wb") as f:
+        f.seek(total - 1)
+        f.write(b"\0")
+
+    # Split into ranges
+    part_size = total // num_threads
+    ranges: list[tuple[int, int]] = []
+    for i in range(num_threads):
+        start = i * part_size
+        end = (i + 1) * part_size - 1 if i < num_threads - 1 else total - 1
+        ranges.append((start, end))
+
+    bar = ProgressBar(total)
+    errors: list[str] = []
+    threads: list[threading.Thread] = []
+
+    for idx, (start, end) in enumerate(ranges):
+        t = threading.Thread(
+            target=_download_range,
+            args=(url, start, end, dest, chunk_size, bar, idx, errors),
+            daemon=True,
+        )
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    bar.finish()
+
+    if errors:
+        for e in errors:
+            err(e)
+        raise RuntimeError(f"{len(errors)} thread(s) failed during download")
+
+    elapsed = time.monotonic() - bar.t0
+    speed = total / elapsed / 1_048_576 if elapsed > 0 else 0
+    info(f"  downloaded {total/1_048_576:.1f} MiB in {elapsed:.1f}s ({speed:.1f} MiB/s)")
+
+
+def http_download_st(url: str, dest: Path, *, max_retries: int = 5) -> None:
+    """Single-threaded fallback with resume and retries."""
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     for attempt in range(1, max_retries + 1):
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"}
+        headers = {"User-Agent": UA}
         mode = "wb"
         pos = 0
-        if resume and dest.exists():
+        if dest.exists():
             pos = dest.stat().st_size
             if pos > 0:
                 headers["Range"] = f"bytes={pos}-"
@@ -132,7 +284,6 @@ def http_download(url: str, dest: Path, *, resume: bool = True, max_retries: int
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
-                # If server ignored Range, start over
                 if pos > 0 and resp.status != 206:
                     pos = 0
                     mode = "wb"
@@ -159,10 +310,9 @@ def http_download(url: str, dest: Path, *, resume: bool = True, max_retries: int
                     if dt > 0:
                         info(f"  downloaded {done/1_048_576:.1f} MiB in {dt:.1f}s "
                              f"({done/1_048_576/dt:.1f} MiB/s)")
-                return  # success
+                return
         except urllib.error.HTTPError as e:
             if e.code == 416 and pos > 0:
-                # Already fully downloaded
                 return
             if e.code in (429, 503) and attempt < max_retries:
                 wait = attempt * 10
@@ -203,9 +353,7 @@ def fetch_checksum(base_url: str, checksum_name: str) -> dict[str, str]:
     """
     url = f"{base_url.rstrip('/')}/{checksum_name}"
     info(f"fetching checksum manifest: {url}")
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
-    })
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=60) as resp:
         text = resp.read().decode("ascii", errors="replace")
     out: dict[str, str] = {}
@@ -343,6 +491,8 @@ def parse_args() -> argparse.Namespace:
                    help="Skip SHA256 verification")
     p.add_argument("--prefer", default="qemu,convert,copy",
                    help="Comma-separated conversion backends, in order of preference")
+    p.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                   help="Number of parallel download threads")
     p.add_argument("--keep-cache", action="store_true",
                    help="Do not delete the cached .vhd after staging")
     return p.parse_args()
@@ -370,51 +520,21 @@ def main() -> int:
             url = f"{args.base_url.rstrip('/')}/{vhd_name}"
         compressed = cache / vhd_name
 
-        # Try primary mirror, fall back to upstream on persistent 429
-        mirrors_to_try = [args.base_url]
-        if args.base_url != FALLBACK_BASE_URL:
-            mirrors_to_try.append(FALLBACK_BASE_URL)
-
-        downloaded = False
-        for mirror_base in mirrors_to_try:
-            if compressed.exists() and compressed.stat().st_size > 0:
-                info(f"cached file found: {compressed} ({compressed.stat().st_size/1_048_576:.1f} MiB)")
-                downloaded = True
-                break
-            try_url = f"{mirror_base.rstrip('/')}/{vhd_name}"
-            info(f"download URL: {try_url}")
-            try:
-                http_download(try_url, compressed)
-                downloaded = True
-                break
-            except urllib.error.HTTPError as e:
-                if e.code in (429, 503) and mirror_base != mirrors_to_try[-1]:
-                    warn(f"mirror {mirror_base} returned HTTP {e.code}, trying fallback ...")
-                    continue
-                raise
-
-        if not downloaded:
-            err("all mirrors failed")
-            return 2
+        if compressed.exists() and compressed.stat().st_size > 0:
+            info(f"cached file found: {compressed} ({compressed.stat().st_size/1_048_576:.1f} MiB)")
+        else:
+            info(f"download URL: {url}")
+            http_download_mt(url, compressed, num_threads=args.threads)
 
         if not args.skip_verify:
-            sums = {}
-            for mirror_base in mirrors_to_try:
-                try:
-                    sums = fetch_checksum(mirror_base, args.checksum_name)
-                    if sums:
-                        break
-                except Exception:
-                    if mirror_base != mirrors_to_try[-1]:
-                        warn(f"checksum fetch from {mirror_base} failed, trying fallback ...")
-                        continue
-                    raise
+            sums = fetch_checksum(args.base_url, args.checksum_name)
             if vhd_name not in sums:
                 warn(f"no entry for {vhd_name} in {args.checksum_name}; "
                      "this is normal for older release layouts but means we "
                      "cannot verify. Pass --skip-verify to silence.")
             else:
                 expected = sums[vhd_name]
+                info("verifying SHA256 (this may take a moment) ...")
                 actual = sha256_of(compressed)
                 if actual.lower() != expected.lower():
                     err(f"sha256 mismatch for {compressed}\n"
