@@ -68,14 +68,14 @@ from pathlib import Path
 # Defaults -- FreeBSD 14.3-RELEASE amd64 VM image
 # ---------------------------------------------------------------------------
 
-DEFAULT_RELEASE = "14.3-RELEASE"
+DEFAULT_RELEASE = "15.1-RC2"
 DEFAULT_ARCH = "amd64"
 DEFAULT_BASE_URL = (
     "https://download.freebsd.org/releases/VM-IMAGES"
-    f"/{DEFAULT_RELEASE}/{DEFAULT_ARCH}"
+    f"/{DEFAULT_RELEASE}/{DEFAULT_ARCH}/Latest"
 )
-DEFAULT_VHD_NAME = f"FreeBSD-{DEFAULT_RELEASE}-{DEFAULT_ARCH}.vhd.xz"
-DEFAULT_CHECKSUM_NAME = f"CHECKSUM.SHA256-FreeBSD-{DEFAULT_RELEASE}-{DEFAULT_ARCH}"
+DEFAULT_VHD_NAME = f"FreeBSD-{DEFAULT_RELEASE}-{DEFAULT_ARCH}-ufs.vhd.xz"
+DEFAULT_CHECKSUM_NAME = "CHECKSUM.SHA256"
 DEFAULT_OUTPUT = Path(r"C:\dev\vhdx\FreeBSD14.3-ForWSL.vhdx")
 DEFAULT_CACHE = Path(os.environ.get("WSFB_CACHE_DIR", tempfile.gettempdir())) / "wslfb-freebsd-image"
 
@@ -170,22 +170,31 @@ def sha256_of(path: Path, *, algo: str = "sha256") -> str:
 
 
 def fetch_checksum(base_url: str, checksum_name: str) -> dict[str, str]:
-    """Parse a FreeBSD CHECKSUM.SHA256-* file."""
+    """Parse a FreeBSD CHECKSUM.SHA256 / FreeBSD-style manifest.
+
+    The ``Latest/CHECKSUM.SHA256`` files use BSD-style lines:
+        ``SHA256 (FreeBSD-15.1-RC2-amd64-ufs.vhd.xz) = <hex>``
+
+    Older ``CHECKSUM.SHA256-FreeBSD-<rel>-<arch>`` files use a
+    ``<hex>  <filename>`` GNU coreutils layout.  Both are handled here.
+    """
     url = f"{base_url.rstrip('/')}/{checksum_name}"
     info(f"fetching checksum manifest: {url}")
     with urllib.request.urlopen(url, timeout=60) as resp:
         text = resp.read().decode("ascii", errors="replace")
     out: dict[str, str] = {}
+    bsd_re = re.compile(r"^SHA256\s+\(([^)]+)\)\s*=\s*([0-9a-fA-F]{64})\s*$")
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # Format: "<hex>  <type>(.<ext>)  <basename>"
-        # e.g.  "abc... FreeBSD-14.3-RELEASE-amd64.vhd.xz"
-        parts = line.split()
-        if len(parts) < 2:
+        m = bsd_re.match(line)
+        if m:
+            out[m.group(1)] = m.group(2)
             continue
-        out[parts[-1]] = parts[0]
+        parts = line.split()
+        if len(parts) >= 2 and len(parts[0]) == 64:
+            out[parts[-1]] = parts[0]
     return out
 
 
