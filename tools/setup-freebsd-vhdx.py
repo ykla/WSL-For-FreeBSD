@@ -81,7 +81,7 @@ DEFAULT_VHD_NAME = f"FreeBSD-{DEFAULT_RELEASE}-{DEFAULT_ARCH}-ufs.vhd.xz"
 DEFAULT_CHECKSUM_NAME = "CHECKSUM.SHA256"
 DEFAULT_OUTPUT = Path(r"C:\dev\vhdx\FreeBSD14.3-ForWSL.vhdx")
 DEFAULT_CACHE = Path(os.environ.get("WSFB_CACHE_DIR", tempfile.gettempdir())) / "wslfb-freebsd-image"
-DEFAULT_THREADS = 16
+DEFAULT_THREADS = 32
 
 CHUNK = 1024 * 1024  # 1 MiB
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
@@ -192,18 +192,24 @@ def _download_range(
             tmp.unlink()
 
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            mode = "ab" if pos > 0 else "wb"
-            with open(tmp, mode) as f:
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    bar.update(len(chunk))
-    except Exception as e:
-        errors.append(f"thread {thread_id} (range {start}-{end}): {e}")
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                mode = "ab" if pos > 0 else "wb"
+                with open(tmp, mode) as f:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            return  # success
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(attempt * 2)
+                continue
+            errors.append(f"thread {thread_id} (range {start}-{end}): {e}")
 
 
 def _splice_parts(dest: Path, dest_dir: Path, num_threads: int) -> None:
@@ -425,7 +431,7 @@ def convert_with_qemu(src: Path, dst: Path) -> bool:
     if dst.exists():
         dst.unlink()
     rc = subprocess.run(
-        [qemu, "convert", "-f", "vhd", "-O", "vhdx", str(src), str(dst)],
+        [qemu, "convert", "-f", "vpc", "-O", "vhdx", str(src), str(dst)],
         check=False,
     )
     return rc.returncode == 0
