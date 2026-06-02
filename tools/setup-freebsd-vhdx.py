@@ -71,7 +71,7 @@ from pathlib import Path
 DEFAULT_RELEASE = "15.1-RC2"
 DEFAULT_ARCH = "amd64"
 DEFAULT_BASE_URL = (
-    "https://download.freebsd.org/releases/VM-IMAGES"
+    "https://mirrors.nju.edu.cn/freebsd/releases/VM-IMAGES"
     f"/{DEFAULT_RELEASE}/{DEFAULT_ARCH}/Latest"
 )
 DEFAULT_VHD_NAME = f"FreeBSD-{DEFAULT_RELEASE}-{DEFAULT_ARCH}-ufs.vhd.xz"
