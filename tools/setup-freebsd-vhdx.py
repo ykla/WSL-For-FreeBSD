@@ -165,22 +165,37 @@ def _download_range(
     url: str,
     start: int,
     end: int,
-    dest: Path,
+    dest_dir: Path,
     chunk_size: int,
     bar: ProgressBar,
     thread_id: int,
     errors: list[str],
 ) -> None:
-    """Download byte range [start, end] and write into dest at the correct offset."""
+    """Download byte range [start, end] into a per-thread temp file with resume."""
+    tmp = dest_dir / f".part.{thread_id:03d}"
     headers = {
         "User-Agent": UA,
         "Range": f"bytes={start}-{end}",
     }
+
+    # Resume: if part file exists, continue from where we left off
+    pos = 0
+    if tmp.exists():
+        pos = tmp.stat().st_size
+        if pos > 0 and (start + pos) <= end:
+            # Adjust range to skip already-downloaded bytes
+            headers["Range"] = f"bytes={start + pos}-{end}"
+            bar.update(pos)  # count existing bytes toward progress
+        else:
+            # Part file is corrupt or too large, restart
+            pos = 0
+            tmp.unlink()
+
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
-            with open(dest, "r+b") as f:
-                f.seek(start)
+            mode = "ab" if pos > 0 else "wb"
+            with open(tmp, mode) as f:
                 while True:
                     chunk = resp.read(chunk_size)
                     if not chunk:
@@ -191,15 +206,35 @@ def _download_range(
         errors.append(f"thread {thread_id} (range {start}-{end}): {e}")
 
 
+def _splice_parts(dest: Path, dest_dir: Path, num_threads: int) -> None:
+    """Concatenate per-thread temp files in order into dest."""
+    info("splicing downloaded parts ...")
+    with open(dest, "wb") as out:
+        for i in range(num_threads):
+            tmp = dest_dir / f".part.{i:03d}"
+            if not tmp.exists():
+                raise FileNotFoundError(f"missing part {i}: {tmp}")
+            with open(tmp, "rb") as inp:
+                while True:
+                    chunk = inp.read(4 * CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            tmp.unlink()
+
+
 def http_download_mt(
     url: str,
     dest: Path,
     *,
     num_threads: int = DEFAULT_THREADS,
     chunk_size: int = 4 * CHUNK,  # 4 MiB per read
+    cache: Path | None = None,
 ) -> None:
     """Download ``url`` to ``dest`` using ``num_threads`` parallel range requests."""
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if cache is None:
+        cache = dest.parent
 
     # Get total size
     total = _get_content_length(url)
@@ -226,11 +261,6 @@ def http_download_mt(
 
     info(f"downloading with {num_threads} threads, total size {total/1_048_576:.1f} MiB")
 
-    # Create the destination file at full size (sparse)
-    with open(dest, "wb") as f:
-        f.seek(total - 1)
-        f.write(b"\0")
-
     # Split into ranges
     part_size = total // num_threads
     ranges: list[tuple[int, int]] = []
@@ -246,7 +276,7 @@ def http_download_mt(
     for idx, (start, end) in enumerate(ranges):
         t = threading.Thread(
             target=_download_range,
-            args=(url, start, end, dest, chunk_size, bar, idx, errors),
+            args=(url, start, end, cache, chunk_size, bar, idx, errors),
             daemon=True,
         )
         threads.append(t)
@@ -258,9 +288,15 @@ def http_download_mt(
     bar.finish()
 
     if errors:
+        # Clean up partial files
+        for i in range(num_threads):
+            (cache / f".part.{i:03d}").unlink(missing_ok=True)
         for e in errors:
             err(e)
         raise RuntimeError(f"{len(errors)} thread(s) failed during download")
+
+    # Splice parts into final file
+    _splice_parts(dest, cache, num_threads)
 
     elapsed = time.monotonic() - bar.t0
     speed = total / elapsed / 1_048_576 if elapsed > 0 else 0
@@ -524,7 +560,7 @@ def main() -> int:
             info(f"cached file found: {compressed} ({compressed.stat().st_size/1_048_576:.1f} MiB)")
         else:
             info(f"download URL: {url}")
-            http_download_mt(url, compressed, num_threads=args.threads)
+            http_download_mt(url, compressed, num_threads=args.threads, cache=cache)
 
         if not args.skip_verify:
             sums = fetch_checksum(args.base_url, args.checksum_name)
