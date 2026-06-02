@@ -120,7 +120,7 @@ def http_download(url: str, dest: Path, *, resume: bool = True, max_retries: int
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     for attempt in range(1, max_retries + 1):
-        headers = {"User-Agent": "wslfb-setup-freebsd-vhdx/1.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"}
         mode = "wb"
         pos = 0
         if resume and dest.exists():
