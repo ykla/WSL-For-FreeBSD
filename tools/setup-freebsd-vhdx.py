@@ -203,7 +203,10 @@ def fetch_checksum(base_url: str, checksum_name: str) -> dict[str, str]:
     """
     url = f"{base_url.rstrip('/')}/{checksum_name}"
     info(f"fetching checksum manifest: {url}")
-    with urllib.request.urlopen(url, timeout=60) as resp:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    })
+    with urllib.request.urlopen(req, timeout=60) as resp:
         text = resp.read().decode("ascii", errors="replace")
     out: dict[str, str] = {}
     bsd_re = re.compile(r"^SHA256\s+\(([^)]+)\)\s*=\s*([0-9a-fA-F]{64})\s*$")
