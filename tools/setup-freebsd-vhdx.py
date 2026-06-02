@@ -75,6 +75,10 @@ DEFAULT_BASE_URL = (
     "https://mirrors.nju.edu.cn/freebsd/releases/VM-IMAGES"
     f"/{DEFAULT_RELEASE}/{DEFAULT_ARCH}/Latest"
 )
+FALLBACK_BASE_URL = (
+    "https://download.freebsd.org/releases/VM-IMAGES"
+    f"/{DEFAULT_RELEASE}/{DEFAULT_ARCH}/Latest"
+)
 DEFAULT_VHD_NAME = f"FreeBSD-{DEFAULT_RELEASE}-{DEFAULT_ARCH}-ufs.vhd.xz"
 DEFAULT_CHECKSUM_NAME = "CHECKSUM.SHA256"
 DEFAULT_OUTPUT = Path(r"C:\dev\vhdx\FreeBSD14.3-ForWSL.vhdx")
@@ -362,11 +366,46 @@ def main() -> int:
             vhd_name = args.vhd_name
             url = f"{args.base_url.rstrip('/')}/{vhd_name}"
         compressed = cache / vhd_name
-        info(f"download URL: {url}")
-        http_download(url, compressed)
+
+        # Try primary mirror, fall back to upstream on persistent 429
+        mirrors_to_try = [args.base_url]
+        if args.base_url != FALLBACK_BASE_URL:
+            mirrors_to_try.append(FALLBACK_BASE_URL)
+
+        downloaded = False
+        for mirror_base in mirrors_to_try:
+            if compressed.exists() and compressed.stat().st_size > 0:
+                info(f"cached file found: {compressed} ({compressed.stat().st_size/1_048_576:.1f} MiB)")
+                downloaded = True
+                break
+            try_url = f"{mirror_base.rstrip('/')}/{vhd_name}"
+            info(f"download URL: {try_url}")
+            try:
+                http_download(try_url, compressed)
+                downloaded = True
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 503) and mirror_base != mirrors_to_try[-1]:
+                    warn(f"mirror {mirror_base} returned HTTP {e.code}, trying fallback ...")
+                    continue
+                raise
+
+        if not downloaded:
+            err("all mirrors failed")
+            return 2
 
         if not args.skip_verify:
-            sums = fetch_checksum(args.base_url, args.checksum_name)
+            sums = {}
+            for mirror_base in mirrors_to_try:
+                try:
+                    sums = fetch_checksum(mirror_base, args.checksum_name)
+                    if sums:
+                        break
+                except Exception:
+                    if mirror_base != mirrors_to_try[-1]:
+                        warn(f"checksum fetch from {mirror_base} failed, trying fallback ...")
+                        continue
+                    raise
             if vhd_name not in sums:
                 warn(f"no entry for {vhd_name} in {args.checksum_name}; "
                      "this is normal for older release layouts but means we "
