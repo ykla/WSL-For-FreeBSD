@@ -5,10 +5,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <poll.h>
+#include <signal.h>
 #include <errno.h>
+#include <fcntl.h>
 
 
 struct sockaddr_hvs {
@@ -23,15 +30,20 @@ unsigned char   hvs_zero[sizeof(struct sockaddr) -
 
 #define PORT_HVS              50000  // same port for all connections
 #define PORT_HVS_BSD          60000
-#define LxMiniInitMessageGuestCapabilities 1
 
-typedef struct LX_INIT_GUEST_CAPABILITIES {
-    uint32_t Header;          // message type
-    bool SeccompAvailable;
-    char Buffer[];            // kernel version string
-} LX_INIT_GUEST_CAPABILITIES;
-
-
+// WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum)
+#define LxInitMessageCreateProcess               1
+#define LxInitMessageCreateSession               2
+#define LxInitMessageCreateSessionResponse       3
+#define LxInitMessageInitialize                  5
+#define LxInitMessageInitializeResponse          6
+#define LxInitMessageCreateProcessUtilityVm      8
+#define LxInitMessageExitStatus                  9
+#define LxInitMessageWindowSizeChanged           10
+#define LxInitMessageTerminateInstance           14
+#define LxMiniInitMessageCreateInstanceResult    33
+#define LxMiniInitMessageGuestCapabilities       43
+#define LxMessageResultUint32                    78
 
 /* MESSAGE_HEADER in C */
 struct MESSAGE_HEADER {
@@ -40,6 +52,14 @@ struct MESSAGE_HEADER {
     unsigned int SequenceNumber;
 };
 typedef struct MESSAGE_HEADER MESSAGE_HEADER;
+
+typedef struct LX_INIT_GUEST_CAPABILITIES {
+    MESSAGE_HEADER Header;    // full 12-byte message header
+    bool SeccompAvailable;
+    char Buffer[];            // kernel version string
+} LX_INIT_GUEST_CAPABILITIES;
+
+
 
 typedef struct _RESULT_MESSAGE_UINT32 {
     MESSAGE_HEADER Header;
@@ -83,15 +103,243 @@ typedef struct _LX_MINI_INIT_CREATE_INSTANCE_RESULT {
     char Buffer[];
 } LX_MINI_INIT_CREATE_INSTANCE_RESULT;
 
+/* Phase 1: WindowSizeChanged message (type 10) */
+typedef struct _LX_INIT_WINDOW_SIZE_CHANGED {
+    MESSAGE_HEADER Header;
+    unsigned short Rows;
+    unsigned short Columns;
+} LX_INIT_WINDOW_SIZE_CHANGED;
+
+/* Phase 1: ExitStatus message (type 9) */
+typedef struct _LX_INIT_PROCESS_EXIT_STATUS {
+    MESSAGE_HEADER Header;
+    int ExitCode;
+} LX_INIT_PROCESS_EXIT_STATUS;
+
+/* ---- Helper: reliable send/recv ---- */
+/* FIX: handle EAGAIN on non-blocking sockets by polling. */
+static int send_all(int fd, const void *buf, size_t len)
+{
+    const char *p = (const char *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, p + sent, len - sent, 0);
+        if (n > 0) {
+            sent += (size_t)n;
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            if (poll(&pfd, 1, 5000) <= 0) return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int recv_all(int fd, void *buf, size_t len)
+{
+    char *p = (char *)buf;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = recv(fd, p + got, len - got, 0);
+        if (n > 0) {
+            got += (size_t)n;
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd = { .fd = fd, .events = POLLIN };
+            if (poll(&pfd, 1, 5000) <= 0) return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ---- Phase 1: File system initialization ---- */
+static void initialize_filesystems(void)
+{
+    struct stat st;
+
+    /* /dev — devfs */
+    if (stat("/dev", &st) != 0) mkdir("/dev", 0755);
+    if (mount("devfs", "/dev", 0, NULL) < 0)
+        perror("[init] mount devfs (may already be mounted)");
+
+    /* /proc — linprocfs (Linux-compatible procfs on FreeBSD) */
+    if (stat("/proc", &st) != 0) mkdir("/proc", 0555);
+    if (mount("linprocfs", "/proc", 0, NULL) < 0)
+        perror("[init] mount linprocfs (may already be mounted)");
+
+    /* /run — tmpfs */
+    if (stat("/run", &st) != 0) mkdir("/run", 0755);
+    if (mount("tmpfs", "/run", 0, NULL) < 0)
+        perror("[init] mount tmpfs (may already be mounted)");
+
+    printf("[init] filesystems initialized (devfs, linprocfs, tmpfs)\n");
+}
+
+/* ---- Phase 1: Signal handling ---- */
+static int g_sigchld_pipe[2];
+
+static void sigchld_handler(int sig)
+{
+    (void)sig;
+    if (g_sigchld_pipe[1] >= 0)
+        write(g_sigchld_pipe[1], "c", 1);
+}
+
+static void reap_children(void)
+{
+    int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        printf("[init] child pid %d exited (status=%d)\n", pid, status);
+    }
+}
+
+/* ---- Phase 1: Message handlers ---- */
+
+/* Handle TerminateInstance (type 14): clean shutdown */
+static void handle_terminate_instance(int init_fd, MESSAGE_HEADER *hdr)
+{
+    printf("[init] received TerminateInstance, shutting down\n");
+
+    /* Send success response */
+    RESULT_MESSAGE_UINT32 resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.Header.MessageType = LxMessageResultUint32;
+    resp.Header.MessageSize = sizeof(resp);
+    resp.Header.SequenceNumber = hdr->SequenceNumber;
+    resp.Result = 0;
+    send_all(init_fd, &resp, sizeof(resp));
+
+    /* Clean up and exit */
+    sync();
+    exit(0);
+}
+
+/* Handle WindowSizeChanged (type 10): forward to notify channel */
+static void handle_window_size_changed(int notify_fd, void *msg_buf, size_t msg_size)
+{
+    if (msg_size < sizeof(LX_INIT_WINDOW_SIZE_CHANGED)) return;
+    LX_INIT_WINDOW_SIZE_CHANGED *wsc = (LX_INIT_WINDOW_SIZE_CHANGED *)msg_buf;
+    printf("[init] WindowSizeChanged: rows=%u, cols=%u\n", wsc->Rows, wsc->Columns);
+
+    /* Forward to hvbridge via notify channel (if open) */
+    if (notify_fd >= 0) {
+        send_all(notify_fd, msg_buf, msg_size);
+    }
+}
+
+/* ---- Phase 1: Event loop ---- */
+static void event_loop(int init_fd, int notify_fd)
+{
+    printf("[init] entering event loop (init_fd=%d, notify_fd=%d)\n", init_fd, notify_fd);
+
+    /* FIX: set init_fd non-blocking so recv_all can handle partial reads
+     * without blocking the event loop (and missing SIGCHLD). */
+    fcntl(init_fd, F_SETFL, fcntl(init_fd, F_GETFL) | O_NONBLOCK);
+
+    /* Set up SIGCHLD handling via self-pipe */
+    if (pipe(g_sigchld_pipe) < 0) {
+        perror("[init] pipe");
+        g_sigchld_pipe[0] = g_sigchld_pipe[1] = -1;
+    } else {
+        fcntl(g_sigchld_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(g_sigchld_pipe[1], F_SETFL, O_NONBLOCK);
+        signal(SIGCHLD, sigchld_handler);
+    }
+
+    for (;;) {
+        struct pollfd pfds[2];
+        int nfds = 0;
+
+        pfds[nfds].fd = init_fd;
+        pfds[nfds].events = POLLIN;
+        nfds++;
+
+        if (g_sigchld_pipe[0] >= 0) {
+            pfds[nfds].fd = g_sigchld_pipe[0];
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+
+        int rc = poll(pfds, nfds, -1);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            perror("[init] poll");
+            break;
+        }
+
+        /* SIGCHLD received — reap zombie children */
+        if (nfds > 1 && (pfds[1].revents & POLLIN)) {
+            char c;
+            while (read(g_sigchld_pipe[0], &c, 1) > 0) {}
+            reap_children();
+        }
+
+        /* Message from host on init channel */
+        if (pfds[0].revents & POLLIN) {
+            MESSAGE_HEADER hdr;
+            if (recv_all(init_fd, &hdr, sizeof(hdr)) < 0) {
+                printf("[init] host disconnected from init channel\n");
+                break;
+            }
+
+            if (hdr.MessageSize < sizeof(hdr)) {
+                printf("[init] invalid message size %u\n", hdr.MessageSize);
+                continue;
+            }
+
+            /* Read payload */
+            size_t payload_len = hdr.MessageSize - sizeof(hdr);
+            char *payload = NULL;
+            if (payload_len > 0) {
+                payload = malloc(payload_len);
+                if (!payload) { perror("[init] malloc"); break; }
+                if (recv_all(init_fd, payload, payload_len) < 0) {
+                    printf("[init] failed to read payload\n");
+                    free(payload);
+                    break;
+                }
+            }
+
+            /* Dispatch based on message type */
+            char *full_msg = malloc(hdr.MessageSize);
+            if (full_msg) {
+                memcpy(full_msg, &hdr, sizeof(hdr));
+                if (payload_len > 0)
+                    memcpy(full_msg + sizeof(hdr), payload, payload_len);
+
+                switch (hdr.MessageType) {
+                case LxInitMessageTerminateInstance:
+                    handle_terminate_instance(init_fd, &hdr);
+                    break; /* not reached */
+
+                case LxInitMessageWindowSizeChanged:
+                    handle_window_size_changed(notify_fd, full_msg, hdr.MessageSize);
+                    break;
+
+                default:
+                    printf("[init] unhandled message type %u (size=%u, seq=%u)\n",
+                           hdr.MessageType, hdr.MessageSize, hdr.SequenceNumber);
+                    break;
+                }
+                free(full_msg);
+            }
+            free(payload);
+        }
+    }
+}
+
 void send_create_session_response(int init_fd, unsigned int port, unsigned int seq)
 {
     LX_INIT_CREATE_SESSION_RESPONSE resp;
     memset(&resp, 0, sizeof(resp));
 
-    resp.Header.MessageType = /*LxInitMessageCreateSessionResponse*/ 3; // adjust as needed
+    resp.Header.MessageType = LxInitMessageCreateSessionResponse;
     resp.Header.MessageSize = sizeof(resp);
-    resp.Header.SequenceNumber = 3; // echo or increment host’s seq
-    resp.Port = PORT_HVS_BSD;
+    resp.Header.SequenceNumber = seq; // echo host's sequence number
+    resp.Port = port;
 
     ssize_t sent = send(init_fd, &resp, sizeof(resp), 0);
     if (sent < 0) {
@@ -116,10 +364,10 @@ void handle_create_process_utility_vm(int sock)
     // Build RESULT_MESSAGE<uint32_t> with port=60000
     RESULT_MESSAGE_UINT32 resp;
     memset(&resp, 0, sizeof(resp));
-    resp.Header.MessageType=8;
-resp.Header.MessageSize= sizeof(resp);
-resp.Header.SequenceNumber=4;
-    resp.Result = 60000;
+    resp.Header.MessageType = LxMessageResultUint32;
+    resp.Header.MessageSize = sizeof(resp);
+    resp.Header.SequenceNumber = 4;
+    resp.Result = PORT_HVS_BSD;
 
     // Send back
     if (send(sock, &resp, sizeof(resp), 0) != sizeof(resp)) {
@@ -130,7 +378,7 @@ resp.Header.SequenceNumber=4;
     }
 }
 
-void send_configuration_info_response(int init_fd) {
+void send_configuration_info_response(int init_fd, unsigned int seq) {
     const char *flavor = "GenericFlavor";
     const char *version = "1.0.0";
 
@@ -140,16 +388,16 @@ void send_configuration_info_response(int init_fd) {
     LX_INIT_CONFIGURATION_INFORMATION_RESPONSE *resp = malloc(msglen);
     if (!resp) { perror("malloc"); return; }
 
-    // Fill MESSAGE_HEADER
-    resp->Header.MessageType = 6; // replace with LxInitMessageInitializeResponse if defined
+    // Fill MESSAGE_HEADER - echo host's sequence number
+    resp->Header.MessageType = LxInitMessageInitializeResponse;
     resp->Header.MessageSize = (unsigned int)msglen;
-    resp->Header.SequenceNumber = 2; // example, or track real sequence
+    resp->Header.SequenceNumber = seq;
 
     // Fill fields
     resp->Plan9Port = 0;           // example
     resp->DefaultUid = 1;
-    resp->InteropPort = 60000;        // example
-    resp->SystemdEnabled =1 ;
+    resp->InteropPort = PORT_HVS_BSD;
+    resp->SystemdEnabled = false;  // FreeBSD does not use systemd
     resp->PidNamespace = 0;           // adjust if needed
     resp->FlavorIndex = 0;            // optional, we can copy to buffer instead
     resp->VersionIndex = 0;           // optional, copy to buffer
@@ -181,9 +429,9 @@ void send_create_instance_result(int init_fd)
     if (!msg) { perror("malloc"); return; }
 
     // Fill header
-    msg->Header.MessageType = 33;
+    msg->Header.MessageType = LxMiniInitMessageCreateInstanceResult;
     msg->Header.MessageSize = (unsigned int)msglen;
-    msg->Header.SequenceNumber = 1; // example sequence number
+    msg->Header.SequenceNumber = 1; // first message from guest
 
     // Fill message fields
     msg->Result = 0;            // success
@@ -228,6 +476,9 @@ static int hv_connect(unsigned int port) {
 }
 
 int main(void) {
+    /* Phase 1: Initialize filesystems before handshake */
+    initialize_filesystems();
+
     /* === 1. Capability socket === */
     int cap_fd = hv_connect(PORT_HVS);
     if (cap_fd < 0) {
@@ -237,8 +488,10 @@ int main(void) {
 
     const char *kver = "FreeBSD-13.3-HVPoC";
     size_t msglen = sizeof(LX_INIT_GUEST_CAPABILITIES) + strlen(kver) + 1;
-LX_INIT_GUEST_CAPABILITIES *msg = malloc(msglen);
-    msg->Header = LxMiniInitMessageGuestCapabilities;
+    LX_INIT_GUEST_CAPABILITIES *msg = malloc(msglen);
+    msg->Header.MessageType = LxMiniInitMessageGuestCapabilities;
+    msg->Header.MessageSize = (unsigned int)msglen;
+    msg->Header.SequenceNumber = 1;
     msg->SeccompAvailable = false;
     strcpy(msg->Buffer, kver);
 
@@ -295,9 +548,15 @@ printf("[capability] Host closed connection before first message\n");
 char recv_buf[512];
 ssize_t r1 = recv(init_fd, recv_buf, sizeof(recv_buf)-1, 0);
 if (r1 > 0) {
-    recv_buf[r] = '\0';
+    recv_buf[r1] = '\0';
     printf("[init] received configuration information (%zd bytes)\n", r1);
-    send_configuration_info_response(init_fd);
+    // Extract sequence number from the LxInitMessageInitialize header
+    unsigned int init_seq = 1;
+    if ((size_t)r1 >= sizeof(MESSAGE_HEADER)) {
+        MESSAGE_HEADER *hdr = (MESSAGE_HEADER *)recv_buf;
+        init_seq = hdr->SequenceNumber;
+    }
+    send_configuration_info_response(init_fd, init_seq);
 } else {
     perror("[init] recv configuration info");
 }
@@ -318,12 +577,13 @@ if (r2 <= 0) {
 
 // --- 7. Receive and echo LX_INIT_CREATE_PROCESS_UTILITY_VM ---
 // handle_create_process_utility_vm(init_fd);
-    while (1) {
-        pause();  // keep process alive without closing sockets
-    }
-    // (never reached normally)
+
+    /* Phase 1: Enter event loop (replaces pause()) */
+    event_loop(init_fd, notify_fd);
+
+    /* Clean up (only reached if event loop exits) */
     close(cap_fd);
     if (notify_fd >= 0) close(notify_fd);
     if (init_fd >= 0) close(init_fd);
     return 0;
-} 
+}

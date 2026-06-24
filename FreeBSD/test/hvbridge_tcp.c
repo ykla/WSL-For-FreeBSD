@@ -1,104 +1,51 @@
-/* SPDX-License-Identifier: MIT */
-/* Copyright (c) 2026 Balaje Sankar */
-
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/poll.h>
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * hvbridge_tcp.c - TCP-adapted version of hvbridge.c for local testing.
+ *
+ * Phase 1 changes:
+ *   - Single-process poll-based event loop (no forking for console)
+ *   - WindowSizeChanged handling on control channel (initial_c)
+ *   - ExitStatus sent on control channel (initial_c) instead of stdout
+ *   - Multi-session loop (accept new connections after session ends)
+ *   - SIGCHLD handling via self-pipe
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/poll.h>
 #include <sys/wait.h>
-#include <termios.h>
-#include <err.h>
-#include <libutil.h>
-#include <fcntl.h>
-#include <stddef.h>
 #include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
-#include <stdint.h>
+#include <termios.h>
+#include <stddef.h>
 
-/* WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum) */
-#define LxInitMessageCreateProcessUtilityVm      8
-#define LxInitMessageExitStatus                  9
-#define LxInitMessageWindowSizeChanged           10
-#define LxInitMessageTerminateInstance           14
-#define LxMessageResultUint32                    78
+#ifdef __linux__
+#include <pty.h>
+#else
+#include <libutil.h>
+#endif
 
-struct sockaddr_hvs {
-    unsigned char sa_len;
-    sa_family_t sa_family;
-    unsigned int hvs_port;
-    unsigned char hvs_zero[sizeof(struct sockaddr) -
-                           sizeof(sa_family_t) -
-                           sizeof(unsigned char) -
-                           sizeof(unsigned int)];
-};
+#include "wsl_protocol.h"
 
-#define PORT_HVS_BSD 60000
-
-struct MESSAGE_HEADER {
-    unsigned int MessageType;
-    unsigned int MessageSize;
-    unsigned int SequenceNumber;
-};
-
-typedef struct _LX_INIT_CREATE_PROCESS_COMMON
-{
-    unsigned int FilenameOffset;
-    unsigned int CurrentWorkingDirectoryOffset;
-    unsigned int CommandLineOffset;
-    unsigned short CommandLineCount;
-    unsigned int EnvironmentOffset;
-    unsigned short EnvironmentCount;
-    unsigned int NtEnvironmentOffset;
-    unsigned short NtEnvironmentCount;
-    unsigned int NtPathOffset;
-    unsigned int ShellOptions;
-    unsigned int UsernameOffset;
-    unsigned int DefaultUid;
-    int Flags;
-    char Buffer[]; /* flexible array member */
-} LX_INIT_CREATE_PROCESS_COMMON;
-
-typedef struct _LX_INIT_CREATE_PROCESS_UTILITY_VM
-{
-    struct MESSAGE_HEADER Header;
-    unsigned short Rows;
-    unsigned short Columns;
-    LX_INIT_CREATE_PROCESS_COMMON Common;
-} LX_INIT_CREATE_PROCESS_UTILITY_VM;
-
-typedef struct RESULT_MESSAGE_U32
-{
-    struct MESSAGE_HEADER Header;
-    uint32_t Result;
-} RESULT_MESSAGE_U32;
-
-/* Process exit status message (LxInitMessageExitStatus = 9) */
-typedef struct LX_INIT_PROCESS_EXIT_STATUS
-{
-    struct MESSAGE_HEADER Header;
-    int ExitCode;
-} LX_INIT_PROCESS_EXIT_STATUS;
-
-/* Window size changed message (LxInitMessageWindowSizeChanged = 10) */
-typedef struct LX_INIT_WINDOW_SIZE_CHANGED
-{
-    struct MESSAGE_HEADER Header;
-    unsigned short Rows;
-    unsigned short Columns;
-} LX_INIT_WINDOW_SIZE_CHANGED;
-
-/* Global storage for initial message */
-LX_INIT_CREATE_PROCESS_UTILITY_VM *g_initial_message = NULL;
-size_t g_initial_message_size = 0;
+/* Phase 1: also handle TerminateInstance on control channel */
+#define LxInitMessageTerminateInstance  14
 
 #define NUM_ADDITIONAL_SOCKETS 5
-#define ACCEPT_TIMEOUT_MS 60000 /* 60s */
+#define ACCEPT_TIMEOUT_MS 60000
 
-/* ---- Phase 1: SIGCHLD self-pipe ---- */
+/* Global storage for initial message */
+static LX_INIT_CREATE_PROCESS_UTILITY_VM *g_initial_message = NULL;
+static size_t g_initial_message_size = 0;
+
+/* Phase 1: SIGCHLD self-pipe */
 static int g_sigchld_pipe[2] = {-1, -1};
 
 /* ---- Phase 2: CreateProcess info parsing ---- */
@@ -118,6 +65,7 @@ static struct create_process_info *parse_create_process_info(
     if (!msg || msg_size < sizeof(*msg))
         return NULL;
 
+    /* Buffer starts at the flexible array member at the end of Common */
     size_t buf_offset = offsetof(LX_INIT_CREATE_PROCESS_UTILITY_VM, Common.Buffer);
     if (msg_size <= buf_offset)
         return NULL;
@@ -136,7 +84,7 @@ static struct create_process_info *parse_create_process_info(
     if (msg->Common.CurrentWorkingDirectoryOffset < buffer_size)
         info->cwd = strdup(buffer + msg->Common.CurrentWorkingDirectoryOffset);
 
-    /* CommandLine -> argv */
+    /* CommandLine -> argv (CommandLineCount consecutive NUL-terminated strings) */
     if (msg->Common.CommandLineCount > 0 &&
         msg->Common.CommandLineOffset < buffer_size) {
         info->argv = calloc((size_t)msg->Common.CommandLineCount + 1, sizeof(char *));
@@ -153,7 +101,7 @@ static struct create_process_info *parse_create_process_info(
         }
     }
 
-    /* Environment -> envp */
+    /* Environment -> envp (EnvironmentCount consecutive NUL-terminated "KEY=VALUE" strings) */
     if (msg->Common.EnvironmentCount > 0 &&
         msg->Common.EnvironmentOffset < buffer_size) {
         info->envp = calloc((size_t)msg->Common.EnvironmentCount + 1, sizeof(char *));
@@ -205,40 +153,36 @@ static void sigchld_handler(int sig)
     }
 }
 
-/* ---- Helpers ---- */
-/* FIX: send_all/recv_all handle EAGAIN on non-blocking sockets by polling. */
-static int send_all(int fd, const void *buf, size_t len)
+static int accept_with_poll(int listen_fd)
 {
-    const char *p = (const char *)buf;
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, p + sent, len - sent, 0);
-        if (n > 0) {
-            sent += (size_t)n;
-        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-            if (poll(&pfd, 1, 5000) <= 0) return -1;
-        } else {
-            return -1;
-        }
+    struct pollfd pfd = { .fd = listen_fd, .events = POLLIN };
+    int ret = poll(&pfd, 1, ACCEPT_TIMEOUT_MS);
+    if (ret <= 0) return -1;
+    return accept(listen_fd, NULL, NULL);
+}
+
+static int read_full(int fd, void *buf, size_t count)
+{
+    char *p = (char *)buf;
+    size_t got = 0;
+    while (got < count) {
+        ssize_t n = read(fd, p + got, count - got);
+        if (n <= 0) return -1;
+        got += (size_t)n;
     }
     return 0;
 }
 
-static int recv_all(int fd, void *buf, size_t len)
+/* Update PTY window size */
+static int update_pty_winsize(int master_fd, unsigned short rows, unsigned short cols)
 {
-    char *p = (char *)buf;
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = recv(fd, p + got, len - got, 0);
-        if (n > 0) {
-            got += (size_t)n;
-        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd pfd = { .fd = fd, .events = POLLIN };
-            if (poll(&pfd, 1, 5000) <= 0) return -1;
-        } else {
-            return -1;
-        }
+    struct winsize ws;
+    memset(&ws, 0, sizeof(ws));
+    ws.ws_row = rows;
+    ws.ws_col = cols;
+    if (ioctl(master_fd, TIOCSWINSZ, &ws) < 0) {
+        perror("[bridge] ioctl TIOCSWINSZ");
+        return -1;
     }
     return 0;
 }
@@ -262,117 +206,75 @@ static int write_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
-static ssize_t read_full(int fd, void *buf, size_t count) {
-    size_t total = 0;
-    char *p = buf;
-    while (total < count) {
-        ssize_t r = read(fd, p + total, count - total);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (r == 0) return total; /* EOF */
-        total += (size_t)r;
-    }
-    return (ssize_t)total;
-}
-
-/* Phase 1: Update PTY window size */
-static int update_pty_winsize(int master_fd, unsigned short rows, unsigned short cols)
-{
-    struct winsize ws;
-    memset(&ws, 0, sizeof(ws));
-    ws.ws_row = rows;
-    ws.ws_col = cols;
-    if (ioctl(master_fd, TIOCSWINSZ, &ws) < 0) {
-        perror("[bridge] ioctl TIOCSWINSZ");
-        return -1;
-    }
-    return 0;
-}
-
-int receive_initial_message(int sock_fd)
+/* Receive CreateProcessUtilityVm, store globally, reply with ResultUint32. */
+static int receive_initial_message(int sock_fd)
 {
     struct MESSAGE_HEADER header;
-    ssize_t r = read_full(sock_fd, &header, sizeof(header));
-    if (r <= 0) {
-        if (r == 0) fprintf(stderr, "peer closed while reading header\n");
-        else perror("read header");
+    if (read_full(sock_fd, &header, sizeof(header)) < 0) {
+        perror("[bridge] read header");
+        return -1;
+    }
+    printf("[bridge] received CreateProcessUtilityVm: type=%u, size=%u, seq=%u\n",
+           header.MessageType, header.MessageSize, header.SequenceNumber);
+
+    if (header.MessageSize < sizeof(header)) return -1;
+    size_t body = header.MessageSize - sizeof(header);
+
+    g_initial_message_size = header.MessageSize;
+    g_initial_message = malloc(header.MessageSize);
+    if (!g_initial_message) return -1;
+    memcpy(&g_initial_message->Header, &header, sizeof(header));
+
+    if (body > 0 && read_full(sock_fd, (char *)g_initial_message + sizeof(header), body) < 0) {
+        perror("[bridge] read body");
         return -1;
     }
 
-    if (header.MessageSize < sizeof(header)) {
-        fprintf(stderr, "invalid message size: %u\n", header.MessageSize);
-        return -1;
-    }
+    printf("[bridge]   Rows=%u, Cols=%u\n",
+           g_initial_message->Rows, g_initial_message->Columns);
 
-    size_t msg_size = (size_t)header.MessageSize;
-    LX_INIT_CREATE_PROCESS_UTILITY_VM *msg = malloc(msg_size);
-    if (!msg) {
-        perror("malloc");
-        return -1;
-    }
-
-    memcpy(&msg->Header, &header, sizeof(header));
-
-    ssize_t rem = read_full(sock_fd, ((char *)msg) + sizeof(header), msg_size - sizeof(header));
-    if (rem < 0) {
-        perror("read message body");
-        free(msg);
-        return -1;
-    }
-    if ((size_t)rem != msg_size - sizeof(header)) {
-        fprintf(stderr, "short read: expected %zu, got %zd\n", msg_size - sizeof(header), rem);
-        free(msg);
-        return -1;
-    }
-
-    if (g_initial_message)
-        free(g_initial_message);
-    g_initial_message = msg;
-    g_initial_message_size = msg_size;
-
-    if (g_initial_message_size >= offsetof(LX_INIT_CREATE_PROCESS_UTILITY_VM, Common)) {
-        printf("[bridge] stored initial message: Rows=%u, Columns=%u\n",
-               (unsigned int)g_initial_message->Rows,
-               (unsigned int)g_initial_message->Columns);
-    }
-
-    RESULT_MESSAGE_U32 resp;
+    /* Reply with ResultUint32 (type 78), echoing host's seq */
+    RESULT_MESSAGE_UINT32 resp;
     memset(&resp, 0, sizeof(resp));
     resp.Header.MessageType = LxMessageResultUint32;
     resp.Header.MessageSize = sizeof(resp);
     resp.Header.SequenceNumber = header.SequenceNumber;
     resp.Result = PORT_HVS_BSD;
 
-    ssize_t w = write(sock_fd, &resp, sizeof(resp));
-    if (w != sizeof(resp)){
-        perror("write result message");
+    if (send_all(sock_fd, &resp, sizeof(resp)) < 0) {
+        perror("[bridge] send result");
         return -1;
     }
-
+    printf("[bridge] sent ResultUint32 (type=%u, seq=%u, Result=%u)\n",
+           resp.Header.MessageType, resp.Header.SequenceNumber, resp.Result);
     return 0;
 }
 
 /* ---- Phase 1: Control channel buffered reader ---- */
+/* Reads WSL messages from the control channel (initial_c) non-blocking. */
 struct control_reader {
     char buf[512];
     size_t len;
 };
 
+/* Returns: 1 = complete message ready (*out_msg points into cr->buf),
+ *          0 = need more data,
+ *         -1 = error / EOF */
 static int control_try_read(int fd, struct control_reader *cr, void **out_msg)
 {
+    /* Read whatever is available */
     if (cr->len < sizeof(cr->buf)) {
         ssize_t n = recv(fd, cr->buf + cr->len, sizeof(cr->buf) - cr->len, 0);
         if (n > 0) {
             cr->len += (size_t)n;
         } else if (n == 0) {
-            return -1;
+            return -1;  /* EOF */
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             return -1;
         }
     }
 
+    /* Check for complete message */
     if (cr->len < sizeof(struct MESSAGE_HEADER)) return 0;
 
     struct MESSAGE_HEADER *hdr = (struct MESSAGE_HEADER *)cr->buf;
@@ -383,6 +285,7 @@ static int control_try_read(int fd, struct control_reader *cr, void **out_msg)
     return 1;
 }
 
+/* After processing a message, shift remaining data in the buffer. */
 static void control_consume(struct control_reader *cr, size_t msg_size)
 {
     if (cr->len > msg_size) {
@@ -394,6 +297,7 @@ static void control_consume(struct control_reader *cr, size_t msg_size)
 }
 
 /* ---- Phase 1: Run a single console session ---- */
+/* Returns the shell exit code. */
 static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                        int channel_fd, int interop_fd,
                        struct create_process_info *info)
@@ -496,6 +400,7 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
     int exit_code = -1;
     int session_done = 0;
 
+    /* pollfd indices */
     enum { IDX_CONTROL, IDX_STDIN, IDX_PTY, IDX_SIGCHLD, IDX_CHANNEL, IDX_INTEROP, NFDS };
 
     while (!session_done) {
@@ -525,7 +430,8 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             pid_t w = waitpid(pid, &status, WNOHANG);
             if (w == pid) {
                 /* FIX: Drain PTY with blocking read — child has exited,
-                 * slave is closed, so read will eventually return EOF. */
+                 * slave is closed, so read will eventually return EOF.
+                 * Temporarily set blocking to avoid EAGAIN truncation. */
                 int fl = fcntl(master_fd, F_GETFL);
                 fcntl(master_fd, F_SETFL, fl & ~O_NONBLOCK);
                 ssize_t n;
@@ -533,7 +439,7 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                     send_all(stdout_fd, buf, (size_t)n);
                 fcntl(master_fd, F_SETFL, fl);
 
-                /* Phase 1: send ExitStatus on control channel, not stdout */
+                /* Phase 1 fix: send ExitStatus on control channel, not stdout */
                 exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
                 LX_INIT_PROCESS_EXIT_STATUS exit_msg;
                 memset(&exit_msg, 0, sizeof(exit_msg));
@@ -561,7 +467,7 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             if (r > 0 && msg) {
                 struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
                 switch (mhdr->MessageType) {
-                case LxInitMessageWindowSizeChanged:
+                case LxInitMessageWindowSizeChanged: {
                     if (mhdr->MessageSize >= sizeof(LX_INIT_WINDOW_SIZE_CHANGED)) {
                         LX_INIT_WINDOW_SIZE_CHANGED *wsc =
                             (LX_INIT_WINDOW_SIZE_CHANGED *)msg;
@@ -570,6 +476,7 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                         update_pty_winsize(master_fd, wsc->Rows, wsc->Columns);
                     }
                     break;
+                }
                 default:
                     printf("[bridge] control msg type=%u (size=%u, seq=%u)\n",
                            mhdr->MessageType, mhdr->MessageSize, mhdr->SequenceNumber);
@@ -587,6 +494,7 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                 write_all(master_fd, buf, (size_t)n);
             } else if (n == 0) {
                 printf("[bridge] stdin closed\n");
+                /* Don't end session on stdin close; shell may still be running */
             }
         }
 
@@ -595,6 +503,8 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             ssize_t n = read(master_fd, buf, sizeof(buf));
             if (n > 0) {
                 send_all(stdout_fd, buf, (size_t)n);
+            } else if (n == 0) {
+                /* PTY closed */
             }
         }
 
@@ -621,59 +531,32 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
     return exit_code;
 }
 
-/* Accept socket with poll timeout */
-int accept_with_poll(int listen_fd) {
-    struct pollfd pfd;
-    pfd.fd = listen_fd;
-    pfd.events = POLLIN;
+int main(void)
+{
+    signal(SIGPIPE, SIG_IGN);
+    printf("[bridge] hvbridge_tcp starting (pid=%d)\n", getpid());
 
-    int ret = poll(&pfd, 1, ACCEPT_TIMEOUT_MS);
-    if (ret <= 0) {
-        if (ret == 0)
-            fprintf(stderr, "accept timeout\n");
-        else
-            perror("poll");
-        return -1;
-    }
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { perror("socket"); return 1; }
 
-    int client_fd = accept(listen_fd, NULL, NULL);
-    if (client_fd < 0) {
-        perror("accept");
-        return -1;
-    }
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    return client_fd;
-}
-
-int main(void) {
-    int s;
-    struct sockaddr_hvs addr;
-
-    s = socket(AF_HYPERV, SOCK_STREAM, 0);
-    if (s < 0) {
-        perror("socket");
-        exit(1);
-    }
-
+    struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sa_len = sizeof(addr);
-    addr.sa_family = AF_HYPERV;
-    addr.hvs_port = PORT_HVS_BSD;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT_HVS_BSD);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
-        close(s);
-        exit(1);
+        return 1;
     }
-
-    if (listen(s, 10) < 0) {
+    if (listen(s, 16) < 0) {
         perror("listen");
-        close(s);
-        exit(1);
+        return 1;
     }
-
-    printf("hv_sock server listening on port %u...\n", addr.hvs_port);
-    signal(SIGPIPE, SIG_IGN);
+    printf("[bridge] listening on port %d\n", PORT_HVS_BSD);
 
     /* Phase 1: multi-session loop */
     for (;;) {
@@ -740,11 +623,13 @@ int main(void) {
         /* Phase 2: free parsed CreateProcess info */
         free_create_process_info(proc_info);
 
+        /* Close all session sockets */
         close(init_c);
         close(initial_c);
         for (int i = 0; i < NUM_ADDITIONAL_SOCKETS; i++)
             close(client_sockets[i]);
 
+        /* Free initial message for next session */
         if (g_initial_message) {
             free(g_initial_message);
             g_initial_message = NULL;
@@ -755,5 +640,6 @@ int main(void) {
     }
 
     close(s);
+    printf("[bridge] shutting down\n");
     return 0;
 }
