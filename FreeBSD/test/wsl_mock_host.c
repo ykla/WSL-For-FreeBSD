@@ -33,6 +33,8 @@
  * Phase 4 test checks:
  *  16. Host disconnect triggers graceful child shutdown (no zombie/leak)
  *  17. New session works after a previous session's host disconnect
+ *  18. Grandchild holding PTY slave does not hang drain (poll timeout works)
+ *  19. New session works after grandchild PTY inheritance test
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -844,6 +846,166 @@ int main(void)
                 for (int i = 0; i < 5; i++) close(new_extra[i]);
                 close(new_init_fd);
                 close(new_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 15 (Phase 4): Grandchild PTY inheritance test ---- */
+    /* Fork a background process (grandchild) that inherits the PTY slave fd,
+     * then exit the shell. The grandchild keeps the PTY slave open, so
+     * master read() will never return EOF. Without the poll-based drain
+     * timeout fix, the bridge would hang forever in the drain loop. */
+    printf("\n[host] Step 15: Phase 4 grandchild PTY inheritance (verify drain timeout)...\n");
+    {
+        int gc_init_fd = -1, gc_control_fd = -1;
+        if (setup_bridge_session(&gc_init_fd, &gc_control_fd, 24, 80, 15, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup grandchild session\n");
+            CHECK(0, "Phase 4: grandchild session setup", "connect failed");
+        } else {
+            int gc_extra[5];
+            int gc_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                gc_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (gc_extra[i] < 0) { gc_extra_ok = 0; break; }
+            }
+
+            if (!gc_extra_ok) {
+                CHECK(0, "Phase 4: grandchild session extra sockets", "connect failed");
+                close(gc_init_fd); close(gc_control_fd);
+                for (int i = 0; i < 5; i++) if (gc_extra[i] >= 0) close(gc_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* Fork a grandchild that holds the PTY slave open.
+                 * 'sleep 60 &' runs in the background, inheriting the PTY
+                 * slave fd. When the shell exits, the grandchild keeps the
+                 * slave open, preventing master read() from returning EOF. */
+                const char *bg_cmd = "sleep 60 &\n";
+                send_all(gc_extra[0], bg_cmd, strlen(bg_cmd));
+                printf("  Sent '%s' to fork grandchild holding PTY slave\n", bg_cmd);
+
+                /* Read shell prompt / job control output */
+                char gc_buf[512];
+                memset(gc_buf, 0, sizeof(gc_buf));
+                int gc_drained = 0;
+                for (int attempt = 0; attempt < 10; attempt++) {
+                    int n = read_with_timeout(gc_extra[1], gc_buf + gc_drained,
+                                              sizeof(gc_buf) - gc_drained - 1, 300);
+                    if (n > 0) gc_drained += n;
+                    else break;
+                }
+                printf("  Shell output after background fork: '%s'\n", gc_buf);
+
+                /* Exit the shell. The grandchild (sleep 60) still holds the
+                 * PTY slave. The bridge must detect SIGCHLD, drain the PTY
+                 * with a 200ms poll timeout (not block forever), and send
+                 * ExitStatus. */
+                const char *exit_gc = "exit\n";
+                send_all(gc_extra[0], exit_gc, strlen(exit_gc));
+                printf("  Sent 'exit' — shell exits, grandchild still holds PTY slave\n");
+
+                /* Drain remaining stdout (shell exit messages) */
+                memset(gc_buf, 0, sizeof(gc_buf));
+                gc_drained = 0;
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    int n = read_with_timeout(gc_extra[1], gc_buf + gc_drained,
+                                              sizeof(gc_buf) - gc_drained, 200);
+                    if (n > 0) gc_drained += n;
+                    else break;
+                }
+
+                /* Read ExitStatus from control channel. With the fix, the
+                 * drain timeout is 200ms, so ExitStatus should arrive within
+                 * a few seconds. Without the fix, the bridge hangs forever
+                 * in the blocking drain loop and ExitStatus never arrives. */
+                int got_gc_exit = 0;
+                LX_INIT_PROCESS_EXIT_STATUS gc_exit_status;
+                memset(&gc_exit_status, 0, sizeof(gc_exit_status));
+
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    void *msg = recv_message(gc_control_fd, &hdr);
+                    if (!msg) { usleep(100000); continue; }
+                    struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
+                    if (mhdr->MessageType == LxInitMessageExitStatus &&
+                        mhdr->MessageSize >= sizeof(LX_INIT_PROCESS_EXIT_STATUS)) {
+                        memcpy(&gc_exit_status, msg, sizeof(gc_exit_status));
+                        got_gc_exit = 1;
+                        free(msg);
+                        break;
+                    }
+                    free(msg);
+                }
+
+                CHECK(got_gc_exit,
+                      "Phase 4: ExitStatus received despite grandchild holding PTY (drain timeout works)",
+                      "not received — bridge may be hung in drain loop");
+
+                if (got_gc_exit) {
+                    printf("  ExitStatus received: ExitCode=%d\n", gc_exit_status.ExitCode);
+                }
+
+                /* Close session sockets. The orphaned grandchild (sleep 60)
+                 * will be cleaned up when the test process exits. */
+                for (int i = 0; i < 5; i++) close(gc_extra[i]);
+                close(gc_init_fd);
+                close(gc_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 16 (Phase 4): New session after grandchild test ---- */
+    printf("\n[host] Step 16: Phase 4 new session after grandchild test (verify no deadlock)...\n");
+    {
+        int gc2_init_fd = -1, gc2_control_fd = -1;
+        if (setup_bridge_session(&gc2_init_fd, &gc2_control_fd, 24, 80, 16, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup post-grandchild session (bridge may be deadlocked)\n");
+            CHECK(0, "Phase 4: new session after grandchild test", "connect failed (deadlock?)");
+        } else {
+            int gc2_extra[5];
+            int gc2_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                gc2_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (gc2_extra[i] < 0) { gc2_extra_ok = 0; break; }
+            }
+
+            if (!gc2_extra_ok) {
+                CHECK(0, "Phase 4: post-grandchild extra sockets", "connect failed");
+                close(gc2_init_fd); close(gc2_control_fd);
+                for (int i = 0; i < 5; i++) if (gc2_extra[i] >= 0) close(gc2_extra[i]);
+            } else {
+                CHECK(1, "Phase 4: new session accepted after grandchild test (no deadlock)", "ok");
+
+                /* Quick echo test */
+                usleep(300000);
+                const char *echo_cmd = "echo grandchild_ok\n";
+                send_all(gc2_extra[0], echo_cmd, strlen(echo_cmd));
+
+                char gc2_out[4096];
+                memset(gc2_out, 0, sizeof(gc2_out));
+                int gc2_total = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    int n = read_with_timeout(gc2_extra[1], gc2_out + gc2_total,
+                                              sizeof(gc2_out) - gc2_total - 1, 200);
+                    if (n > 0) gc2_total += n;
+                    else break;
+                }
+                printf("  Console output: '%s'\n", gc2_out);
+                CHECK(strstr(gc2_out, "grandchild_ok") != NULL,
+                      "Phase 4: console I/O works after grandchild test",
+                      "output='%s'", gc2_out);
+
+                /* Send exit and close */
+                send_all(gc2_extra[0], "exit\n", 5);
+                /* Brief drain for ExitStatus */
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(gc2_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(gc2_extra[i]);
+                close(gc2_init_fd);
+                close(gc2_control_fd);
             }
         }
     }
