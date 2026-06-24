@@ -20,6 +20,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "terminal_notify.h"
+
 /* WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum) */
 #define LxInitMessageCreateProcessUtilityVm      8
 #define LxInitMessageExitStatus                  9
@@ -101,6 +103,12 @@ size_t g_initial_message_size = 0;
 
 /* ---- Phase 1: SIGCHLD self-pipe ---- */
 static int g_sigchld_pipe[2] = {-1, -1};
+
+/* SIGTERM/SIGINT flag: set by signal handler to request graceful shutdown.
+ * Checked in run_session()'s poll loop (after EINTR) and in main()'s
+ * multi-session loop. When set, the current session's child is killed and
+ * reaped via the existing cleanup path, then the bridge exits. */
+static volatile sig_atomic_t g_terminate = 0;
 
 /* ---- Phase 2: CreateProcess info parsing ---- */
 struct create_process_info {
@@ -257,6 +265,14 @@ static void sigchld_handler(int sig)
         char c = 'c';
         (void)write(g_sigchld_pipe[1], &c, 1);
     }
+}
+
+/* SIGTERM/SIGINT handler: set the terminate flag so the poll loop can
+ * break out and clean up the child process via the existing exit path. */
+static void terminate_handler(int sig)
+{
+    (void)sig;
+    g_terminate = 1;
 }
 
 /* ---- Helpers ---- */
@@ -629,9 +645,15 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
      * tracked_rows/cols are updated both after host-initiated changes
      * (to suppress feedback) and after guest-initiated changes (to track
      * the new state). */
-    unsigned short tracked_rows = ws.ws_row;
-    unsigned short tracked_cols = ws.ws_col;
+    /* Phase 6/7: Terminal size and font tracking (terminal_notify.h module). */
+    struct font_size_tracker fst;
+    font_size_tracker_init(&fst, ws.ws_row, ws.ws_col,
+                           ws.ws_xpixel, ws.ws_ypixel);
     time_t last_size_check = time(NULL);
+
+    /* Phase 8: OSC 11 background color sniffer (terminal_notify.h module). */
+    struct bg_color_tracker bct;
+    bg_color_tracker_init(&bct);
 
     enum { IDX_CONTROL, IDX_STDIN, IDX_PTY, IDX_SIGCHLD, IDX_CHANNEL, IDX_INTEROP, NFDS };
 
@@ -659,7 +681,14 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
         int timeout_ms = host_disconnected ? 500 : 1000;
         int rc = poll(pfds, NFDS, timeout_ms);
         if (rc < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                /* SIGTERM/SIGINT: break out to clean up child, don't retry */
+                if (g_terminate) {
+                    fprintf(stderr, "[bridge] terminate signal received, shutting down session\n");
+                    break;
+                }
+                continue;
+            }
             perror("[bridge] poll");
             /* Phase 4: never leave a child unreaped. Kill and wait before
              * breaking out of the loop. */
@@ -670,6 +699,13 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                 waitpid(pid, &s, 0);
                 child_reaped = 1;
             }
+            break;
+        }
+
+        /* SIGTERM/SIGINT may have arrived between poll() return and here.
+         * Check before processing events to ensure prompt shutdown. */
+        if (g_terminate) {
+            fprintf(stderr, "[bridge] terminate signal received, shutting down session\n");
             break;
         }
 
@@ -710,16 +746,21 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             last_size_check = now;
             struct winsize cur_ws;
             if (ioctl(master_fd, TIOCGWINSZ, &cur_ws) == 0) {
-                if (cur_ws.ws_row != tracked_rows ||
-                    cur_ws.ws_col != tracked_cols) {
+                /* Phase 6: Detect rows/cols change → notify host.
+                 * Read fst.tracked_rows/cols BEFORE font_size_check_change
+                 * updates them. */
+                if (cur_ws.ws_row != fst.tracked_rows ||
+                    cur_ws.ws_col != fst.tracked_cols) {
                     printf("[bridge] guest-side window size changed: %ux%u -> %ux%u, notifying host\n",
-                           tracked_cols, tracked_rows,
+                           fst.tracked_cols, fst.tracked_rows,
                            cur_ws.ws_col, cur_ws.ws_row);
-                    tracked_rows = cur_ws.ws_row;
-                    tracked_cols = cur_ws.ws_col;
                     notify_host_window_size(initial_c, cur_ws.ws_row,
                                             cur_ws.ws_col);
                 }
+                /* Phase 7: Detect font size change and update all tracked
+                 * values (rows, cols, xpixel, ypixel). */
+                font_size_check_change(&fst, cur_ws.ws_row, cur_ws.ws_col,
+                                       cur_ws.ws_xpixel, cur_ws.ws_ypixel);
             }
         }
 
@@ -795,6 +836,9 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                  * for SIGCHLD so we still reap the child. */
                 printf("[bridge] control channel closed by host, starting graceful shutdown (SIGHUP child pid=%d)\n", pid);
                 host_disconnected = 1;
+                /* Discard any half-parsed OSC sequence so stale sniffer state
+                 * doesn't persist into drain mode. Tracked color is preserved. */
+                bg_color_tracker_reset_sniffer(&bct);
                 if (!sighup_sent) {
                     kill(pid, SIGHUP);
                     sighup_sent = 1;
@@ -811,12 +855,19 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                         printf("[bridge] WindowSizeChanged: rows=%u, cols=%u\n",
                                wsc->Rows, wsc->Columns);
                         update_pty_winsize(master_fd, wsc->Rows, wsc->Columns);
-                        /* Phase 6: update tracking to suppress feedback loop.
-                         * The size change was host-initiated, so the next
-                         * TIOCGWINSZ poll will see the new size and should
-                         * NOT send a notification back to the host. */
-                        tracked_rows = wsc->Rows;
-                        tracked_cols = wsc->Columns;
+                        /* Phase 6/7: update tracking to suppress feedback loop.
+                         * Also re-read pixel dimensions — TIOCSWINSZ may
+                         * zero ws_xpixel/ws_ypixel, so read actual state. */
+                        struct winsize sync_ws;
+                        unsigned short sync_x = fst.tracked_xpixel;
+                        unsigned short sync_y = fst.tracked_ypixel;
+                        if (ioctl(master_fd, TIOCGWINSZ, &sync_ws) == 0) {
+                            sync_x = sync_ws.ws_xpixel;
+                            sync_y = sync_ws.ws_ypixel;
+                        }
+                        font_size_sync_after_resize(&fst, wsc->Rows,
+                                                    wsc->Columns,
+                                                    sync_x, sync_y);
                     }
                     break;
                 default:
@@ -843,7 +894,11 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
         if (pfds[IDX_PTY].revents & POLLIN) {
             ssize_t n = read(master_fd, buf, sizeof(buf));
             if (n > 0) {
+                /* Phase 8: sniff OSC 11 background color sequences.
+                 * Non-intrusive — parse but don't modify the byte stream. */
                 if (!host_disconnected) {
+                    for (ssize_t i = 0; i < n; i++)
+                        bg_color_feed_byte(&bct, (unsigned char)buf[i]);
                     send_all(stdout_fd, buf, (size_t)n);
                 }
                 /* Phase 4: if host disconnected, discard output to keep the
@@ -938,6 +993,8 @@ int main(void) {
 
     printf("hv_sock server listening on port %u...\n", addr.hvs_port);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, terminate_handler);
+    signal(SIGINT, terminate_handler);
 
     /* Phase 1: multi-session loop */
     for (;;) {
@@ -1019,6 +1076,12 @@ int main(void) {
         }
 
         printf("[bridge] ready for next session\n");
+
+        /* SIGTERM/SIGINT: exit the multi-session loop after cleaning up */
+        if (g_terminate) {
+            printf("[bridge] terminate signal received, exiting\n");
+            break;
+        }
     }
 
     close(s);

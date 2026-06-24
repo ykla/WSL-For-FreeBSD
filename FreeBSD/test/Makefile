@@ -18,7 +18,7 @@ all: $(BINARIES)
 wsl_mock_host: wsl_mock_host.c wsl_protocol.h
 	$(CC) $(CFLAGS) -o $@ wsl_mock_host.c $(LDFLAGS)
 
-hvinit_tcp: hvinit_tcp.c wsl_protocol.h
+hvinit_tcp: hvinit_tcp.c wsl_protocol.h gns_engine.h
 	$(CC) $(CFLAGS) -o $@ hvinit_tcp.c
 
 hvbridge_tcp: hvbridge_tcp.c wsl_protocol.h

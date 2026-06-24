@@ -24,14 +24,24 @@
 /* ---- WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum) ---- */
 #define LxInitMessageCreateSession               2
 #define LxInitMessageCreateSessionResponse       3
+#define LxInitMessageNetworkInformation           4
 #define LxInitMessageInitialize                  5
 #define LxInitMessageInitializeResponse          6
 #define LxInitMessageCreateProcessUtilityVm      8
 #define LxInitMessageExitStatus                  9
 #define LxInitMessageWindowSizeChanged           10
+#define LxInitMessageStartSocketRelay            15
+#define LxInitMessageQueryNetworkingMode         25
+#define LxInitMessageQueryVmId                   26
 #define LxMiniInitMessageCreateInstanceResult    33
 #define LxMiniInitMessageGuestCapabilities       43
 #define LxMessageResultUint32                    78
+
+/* GNS message types (334+) */
+#define LxGnsMessageInterfaceConfiguration              334
+#define LxGnsMessageResult                              335
+#define LxGnsMessageNoOp                                352
+#define LxGnsMessageConnectTestRequest                  355
 
 /* ---- Core structures ---- */
 
@@ -67,11 +77,28 @@ typedef struct LX_INIT_CREATE_SESSION_RESPONSE {
     unsigned int Port;
 } LX_INIT_CREATE_SESSION_RESPONSE;
 
-/* Initialize (host -> guest, type 5) — we only need the header for testing */
-typedef struct LX_INIT_INITIALIZE {
+/* Initialize (host -> guest, type 5) — full configuration information.
+ * Replaces the simplified LX_INIT_INITIALIZE stub with the real structure
+ * matching src/shared/inc/lxinitshared.h LX_INIT_CONFIGURATION_INFORMATION.
+ * Buffer[] contains 6 NUL-terminated strings referenced by the offset fields:
+ *   hostname, domainname, windows_hosts, distribution_name, plan9_socket, timezone */
+typedef struct LX_INIT_CONFIGURATION_INFORMATION {
     struct MESSAGE_HEADER Header;
+    uint32_t HostnameOffset;
+    uint32_t DomainnameOffset;
+    uint32_t WindowsHostsOffset;
+    uint32_t DistributionNameOffset;
+    uint32_t Plan9SocketOffset;
+    uint32_t TimezoneOffset;
+    uint32_t DrvFsVolumesBitmap;
+    uint32_t DrvFsDefaultOwner;
+    uint32_t FeatureFlags;
+    uint32_t DrvfsMount;       /* LX_INIT_DRVFS_MOUNT enum value */
     char Buffer[];
-} LX_INIT_INITIALIZE;
+} LX_INIT_CONFIGURATION_INFORMATION;
+
+/* Kept for backward compatibility — alias to the real structure */
+typedef LX_INIT_CONFIGURATION_INFORMATION LX_INIT_INITIALIZE;
 
 /* ConfigurationInformationResponse / InitializeResponse (guest -> host, type 6) */
 typedef struct LX_INIT_CONFIGURATION_INFORMATION_RESPONSE {
@@ -98,6 +125,25 @@ typedef struct LX_MINI_INIT_CREATE_INSTANCE_RESULT {
 } LX_MINI_INIT_CREATE_INSTANCE_RESULT;
 
 /* CreateProcessCommon (embedded in CreateProcessUtilityVm) */
+/* DrvFs mount mode (from lxinitshared.h LX_INIT_DRVFS_MOUNT) */
+typedef enum {
+    LxInitDrvfsMountNone        = 0,
+    LxInitDrvfsMountNonElevated = 1,
+    LxInitDrvfsMountElevated    = 2
+} LX_INIT_DRVFS_MOUNT;
+
+/* Feature flags (from lxinitshared.h LX_INIT_FEATURE_FLAGS) */
+#define LxInitFeatureNone               0x00
+#define LxInitFeatureVirtIo9p           0x01
+#define LxInitFeatureVirtIoFs           0x02
+#define LxInitFeatureDisable9pServer    0x04
+#define LxInitFeatureRootfsCompressed   0x08
+#define LxInitFeatureSystemDistro       0x10
+#define LxInitFeatureDnsTunneling       0x20
+
+/* Sentinel for "no port" in InitializeResponse */
+#define LX_INIT_UTILITY_VM_INVALID_PORT 0xFFFFFFFFu
+
 /* CreateProcess common structure (matches official lxinitshared.h) */
 typedef struct LX_INIT_CREATE_PROCESS_COMMON {
     uint32_t FilenameOffset;
@@ -143,6 +189,40 @@ typedef struct LX_INIT_WINDOW_SIZE_CHANGED {
     unsigned short Rows;
     unsigned short Columns;
 } LX_INIT_WINDOW_SIZE_CHANGED;
+
+/* Phase 9 (Task Group C): Networking structures */
+
+/* NetworkInformation (host -> guest, type 4)
+ * Buffer contains NUL-terminated strings indexed by FileHeaderIndex and
+ * FileContentsIndex. FileContents is written to /etc/resolv.conf. */
+typedef struct LX_INIT_NETWORK_INFORMATION {
+    struct MESSAGE_HEADER Header;
+    unsigned int FileHeaderIndex;
+    unsigned int FileContentsIndex;
+    char Buffer[];
+} LX_INIT_NETWORK_INFORMATION;
+
+/* StartSocketRelay (host -> guest, type 15) */
+typedef struct LX_INIT_START_SOCKET_RELAY {
+    struct MESSAGE_HEADER Header;
+    unsigned short Family;
+    unsigned short Port;
+    int HvSocketPort;
+    size_t BufferSize;
+} LX_INIT_START_SOCKET_RELAY;
+
+/* GNS InterfaceConfiguration (host -> guest, type 334) */
+typedef struct LX_GNS_INTERFACE_CONFIGURATION {
+    struct MESSAGE_HEADER Header;
+    char Content[];
+} LX_GNS_INTERFACE_CONFIGURATION;
+
+/* GNS Result (guest -> host, type 335) */
+typedef struct LX_GNS_RESULT {
+    struct MESSAGE_HEADER Header;
+    int Result;
+    char Buffer[];
+} LX_GNS_RESULT;
 
 /* ---- Helper: reliable send/recv over TCP ---- */
 /* Handles EAGAIN on non-blocking sockets by polling. */

@@ -17,6 +17,8 @@
 #include <errno.h>
 #include <fcntl.h>
 
+#include "gns_engine.h"
+
 
 struct sockaddr_hvs {
     unsigned char   sa_len;
@@ -44,6 +46,11 @@ unsigned char   hvs_zero[sizeof(struct sockaddr) -
 #define LxMiniInitMessageCreateInstanceResult    33
 #define LxMiniInitMessageGuestCapabilities       43
 #define LxMessageResultUint32                    78
+/* Phase 9 (Task Group C): networking message types */
+#define LxInitMessageNetworkInformation           4
+#define LxInitMessageStartSocketRelay            15
+#define LxInitMessageQueryNetworkingMode         25
+#define LxInitMessageQueryVmId                   26
 
 /* MESSAGE_HEADER in C */
 struct MESSAGE_HEADER {
@@ -52,6 +59,9 @@ struct MESSAGE_HEADER {
     unsigned int SequenceNumber;
 };
 typedef struct MESSAGE_HEADER MESSAGE_HEADER;
+
+/* A1: Include the Initialize(5) config parser after MESSAGE_HEADER is defined */
+#include "config_parser.h"
 
 typedef struct LX_INIT_GUEST_CAPABILITIES {
     MESSAGE_HEADER Header;    // full 12-byte message header
@@ -319,6 +329,31 @@ static void event_loop(int init_fd, int notify_fd)
                     handle_window_size_changed(notify_fd, full_msg, hdr.MessageSize);
                     break;
 
+                /* Phase 9 (Task Group C): networking messages */
+                case LxInitMessageNetworkInformation:
+                    gns_handle_network_information(full_msg, hdr.MessageSize);
+                    break;
+
+                case LxInitMessageStartSocketRelay: {
+                    struct relay_state rs;
+                    memset(&rs, 0, sizeof(rs));
+                    int r = gns_handle_start_socket_relay(init_fd, full_msg,
+                                                          hdr.MessageSize, &rs);
+                    if (r < 0) {
+                        fprintf(stderr, "[init] StartSocketRelay failed\n");
+                    }
+                    break;
+                }
+
+                case LxInitMessageQueryNetworkingMode:
+                    gns_handle_query_networking_mode(init_fd, full_msg,
+                                                    hdr.MessageSize);
+                    break;
+
+                case LxInitMessageQueryVmId:
+                    gns_handle_query_vm_id(init_fd, full_msg, hdr.MessageSize);
+                    break;
+
                 default:
                     printf("[init] unhandled message type %u (size=%u, seq=%u)\n",
                            hdr.MessageType, hdr.MessageSize, hdr.SequenceNumber);
@@ -387,20 +422,25 @@ void send_configuration_info_response(int init_fd, unsigned int seq) {
 
     LX_INIT_CONFIGURATION_INFORMATION_RESPONSE *resp = malloc(msglen);
     if (!resp) { perror("malloc"); return; }
+    memset(resp, 0, msglen);
 
     // Fill MESSAGE_HEADER - echo host's sequence number
     resp->Header.MessageType = LxInitMessageInitializeResponse;
     resp->Header.MessageSize = (unsigned int)msglen;
     resp->Header.SequenceNumber = seq;
 
-    // Fill fields
-    resp->Plan9Port = 0;           // example
-    resp->DefaultUid = 1;
+    /* A1: Use parsed config values when available, otherwise use defaults.
+     * DefaultUid comes from the Initialize message's DrvFsDefaultOwner field.
+     * Plan9Port is 0 (no Plan9 server yet — Task Group B).
+     * InteropPort is PORT_HVS_BSD (the bridge listen port).
+     * SystemdEnabled is always false for FreeBSD. */
+    resp->Plan9Port = 0;           /* No Plan9 server yet (Task Group B) */
+    resp->DefaultUid = g_config_parsed ? g_config.drvfs_default_owner : 1;
     resp->InteropPort = PORT_HVS_BSD;
-    resp->SystemdEnabled = false;  // FreeBSD does not use systemd
-    resp->PidNamespace = 0;           // adjust if needed
-    resp->FlavorIndex = 0;            // optional, we can copy to buffer instead
-    resp->VersionIndex = 0;           // optional, copy to buffer
+    resp->SystemdEnabled = false;  /* FreeBSD does not use systemd */
+    resp->PidNamespace = 0;        /* Not using PID namespaces */
+    resp->FlavorIndex = 0;         /* Offset of flavor string in Buffer */
+    resp->VersionIndex = (unsigned int)(strlen(flavor) + 1); /* Offset of version */
 
     // Copy strings sequentially in Buffer
     char *buf_ptr = resp->Buffer;
@@ -412,7 +452,8 @@ void send_configuration_info_response(int init_fd, unsigned int seq) {
     if (sent < 0) {
         perror("[init] send configuration_info_response");
     } else {
-        printf("[init] sent LX_INIT_CONFIGURATION_INFORMATION_RESPONSE (%zd bytes)\n", sent);
+        printf("[init] sent LX_INIT_CONFIGURATION_INFORMATION_RESPONSE (%zd bytes, DefaultUid=%u)\n",
+               sent, resp->DefaultUid);
     }
 
     free(resp);
@@ -545,20 +586,68 @@ printf("[capability] Host closed connection before first message\n");
 
 //handle send and receive message from void WslCoreInstance::Initialize()
 
-char recv_buf[512];
-ssize_t r1 = recv(init_fd, recv_buf, sizeof(recv_buf)-1, 0);
-if (r1 > 0) {
-    recv_buf[r1] = '\0';
-    printf("[init] received configuration information (%zd bytes)\n", r1);
-    // Extract sequence number from the LxInitMessageInitialize header
-    unsigned int init_seq = 1;
-    if ((size_t)r1 >= sizeof(MESSAGE_HEADER)) {
-        MESSAGE_HEADER *hdr = (MESSAGE_HEADER *)recv_buf;
-        init_seq = hdr->SequenceNumber;
+/* A1: Receive Initialize(5) message — read header first, then payload.
+ * The message may contain a full LX_INIT_CONFIGURATION_INFORMATION with
+ * variable-length Buffer[] (hostname, timezone, etc.), so we must read
+ * MessageSize bytes total, not just a fixed buffer. */
+{
+    MESSAGE_HEADER init_hdr;
+    ssize_t r_hdr = recv(init_fd, &init_hdr, sizeof(init_hdr), 0);
+    if (r_hdr != (ssize_t)sizeof(init_hdr)) {
+        perror("[init] recv Initialize header");
+    } else if (init_hdr.MessageSize < sizeof(init_hdr)) {
+        fprintf(stderr, "[init] invalid Initialize size %u\n", init_hdr.MessageSize);
+    } else {
+        size_t payload_len = init_hdr.MessageSize - sizeof(init_hdr);
+        char *full_msg = malloc(init_hdr.MessageSize);
+        if (!full_msg) {
+            perror("[init] malloc Initialize");
+        } else {
+            memcpy(full_msg, &init_hdr, sizeof(init_hdr));
+            if (payload_len > 0) {
+                ssize_t r_body = recv(init_fd, full_msg + sizeof(init_hdr),
+                                      payload_len, 0);
+                if (r_body != (ssize_t)payload_len) {
+                    fprintf(stderr, "[init] short read Initialize body: expected %zu, got %zd\n",
+                            payload_len, r_body);
+                    free(full_msg);
+                    full_msg = NULL;
+                }
+            }
+
+            if (full_msg) {
+                printf("[init] received Initialize (type=%u, seq=%u, size=%u)\n",
+                       init_hdr.MessageType, init_hdr.SequenceNumber,
+                       init_hdr.MessageSize);
+
+                /* A1: Parse the full Initialize message into g_config */
+                wsl_config_init(&g_config);
+                if (wsl_config_parse(&g_config, full_msg, init_hdr.MessageSize) == 0) {
+                    g_config_parsed = 1;
+                    wsl_config_dump(&g_config);
+
+                    /* A1: Set WSL_DISTRO_NAME environment variable from config.
+                     * This is used by interop and wslpath to identify the distro. */
+                    if (g_config.distribution_name) {
+                        setenv("WSL_DISTRO_NAME", g_config.distribution_name, 1);
+                        printf("[init] set WSL_DISTRO_NAME=%s\n", g_config.distribution_name);
+                    }
+
+                    /* A1: Export feature flags as hex string for mount.drvfs
+                     * (mirrors config.cpp line 682). */
+                    char flags_str[16];
+                    snprintf(flags_str, sizeof(flags_str), "%x", g_config.feature_flags);
+                    setenv("WSL_FEATURE_FLAGS", flags_str, 1);
+                } else {
+                    printf("[init] Initialize message too small for full parse, using defaults\n");
+                    /* Still send a response with default values */
+                }
+
+                send_configuration_info_response(init_fd, init_hdr.SequenceNumber);
+                free(full_msg);
+            }
+        }
     }
-    send_configuration_info_response(init_fd, init_seq);
-} else {
-    perror("[init] recv configuration info");
 }
 
 // --- 6. Receive LX_INIT_CREATE_SESSION ---
@@ -580,6 +669,12 @@ if (r2 <= 0) {
 
     /* Phase 1: Enter event loop (replaces pause()) */
     event_loop(init_fd, notify_fd);
+
+    /* A1: Free parsed config */
+    if (g_config_parsed) {
+        wsl_config_free(&g_config);
+        g_config_parsed = 0;
+    }
 
     /* Clean up (only reached if event loop exits) */
     close(cap_fd);

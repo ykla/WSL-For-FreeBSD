@@ -23,6 +23,7 @@
 #include <fcntl.h>
 
 #include "wsl_protocol.h"
+#include "gns_engine.h"
 
 /* Phase 1: additional message types for event loop */
 #define LxInitMessageTerminateInstance  14
@@ -157,6 +158,31 @@ static void event_loop(int init_fd, int notify_fd)
 
                 case LxInitMessageWindowSizeChanged:
                     handle_window_size_changed(notify_fd, full_msg, hdr.MessageSize);
+                    break;
+
+                /* Phase 9 (Task Group C): networking messages */
+                case LxInitMessageNetworkInformation:
+                    gns_handle_network_information(full_msg, hdr.MessageSize);
+                    break;
+
+                case LxInitMessageStartSocketRelay: {
+                    struct relay_state rs;
+                    memset(&rs, 0, sizeof(rs));
+                    int r = gns_handle_start_socket_relay(init_fd, full_msg,
+                                                          hdr.MessageSize, &rs);
+                    if (r < 0) {
+                        fprintf(stderr, "[init] StartSocketRelay failed\n");
+                    }
+                    break;
+                }
+
+                case LxInitMessageQueryNetworkingMode:
+                    gns_handle_query_networking_mode(init_fd, full_msg,
+                                                    hdr.MessageSize);
+                    break;
+
+                case LxInitMessageQueryVmId:
+                    gns_handle_query_vm_id(init_fd, full_msg, hdr.MessageSize);
                     break;
 
                 default:

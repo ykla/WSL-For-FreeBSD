@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * wsl_mock_host.c - Mock WSL host for testing Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 fixes.
+ * wsl_mock_host.c - Mock WSL host for testing Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 + Phase 7 + Phase 8 fixes.
  *
  * Simulates wslservice.exe: listens on port 50000, accepts guest
  * connections, sends WSL protocol messages, and validates the
@@ -50,6 +50,14 @@
  *  27. Guest→host window size notification: stty resize inside guest triggers
  *      WindowSizeChanged(10) on control channel (TIOCGWINSZ polling)
  *  28. Host→guest resize does NOT trigger feedback notification (loop prevention)
+ *
+ * Phase 7 test checks:
+ *  29. OSC 50 font-setting escape sequences pass through raw PTY unchanged
+ *      (cfmakeraw mode ensures transparent relay — no interception needed)
+ *  30. OSC 50 font-query escape sequence (ESC]50;?) passes through raw PTY
+ *  31. OSC 50 font traffic + grandchild PTY drain: ExitStatus still received
+ *      after font-setting sequences and grandchild holding PTY slave
+ *  32. New session works after font + grandchild combined test (no deadlock)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,7 +215,7 @@ static int setup_bridge_session(int *out_init_fd, int *out_control_fd,
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
-    printf("=== WSL Mock Host — Phase 6 Test Harness ===\n\n");
+    printf("=== WSL Mock Host — Phase 8 Test Harness ===\n\n");
 
     /* Listen on port 50000 for guest connections */
     int listen_fd = listen_on_port(PORT_HVS);
@@ -1574,6 +1582,609 @@ int main(void)
                 for (int i = 0; i < 5; i++) close(fb_extra[i]);
                 close(fb_init_fd);
                 close(fb_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 21 (Phase 7): OSC 50 font setting passthrough ---- */
+    /* Verify that OSC 50 (set font) escape sequences pass through the raw
+     * PTY unchanged. The bridge uses cfmakeraw mode, so no escape sequence
+     * interception occurs — bytes flow through transparently. */
+    printf("\n[host] Step 21: Phase 7 OSC 50 font setting passthrough...\n");
+    {
+        int ft_init_fd = -1, ft_control_fd = -1;
+        if (setup_bridge_session(&ft_init_fd, &ft_control_fd, 24, 80, 21, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup font test session\n");
+            CHECK(0, "Phase 7: font test session setup", "connect failed");
+        } else {
+            int ft_extra[5];
+            int ft_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                ft_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (ft_extra[i] < 0) { ft_extra_ok = 0; break; }
+            }
+
+            if (!ft_extra_ok) {
+                CHECK(0, "Phase 7: font test extra sockets", "connect failed");
+                close(ft_init_fd); close(ft_control_fd);
+                for (int i = 0; i < 5; i++) if (ft_extra[i] >= 0) close(ft_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* OSC 50: Set font to "Mono:size=14" (xterm font spec format).
+                 * ESC ] 50 ; Mono:size=14 BEL
+                 * The bridge should pass this through raw — no interception. */
+                const char *osc50_set1 = "printf '\\033]50;Mono:size=14\\007'\n";
+                send_all(ft_extra[0], osc50_set1, strlen(osc50_set1));
+                printf("  Sent OSC 50 font set: Mono:size=14\n");
+
+                /* OSC 50: Set font to "Liberation Mono:pixelsize=16" */
+                const char *osc50_set2 = "printf '\\033]50;Liberation Mono:pixelsize=16\\007'\n";
+                send_all(ft_extra[0], osc50_set2, strlen(osc50_set2));
+                printf("  Sent OSC 50 font set: Liberation Mono:pixelsize=16\n");
+
+                /* Drain and verify raw passthrough */
+                char ft_buf[2048];
+                memset(ft_buf, 0, sizeof(ft_buf));
+                int ft_total = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    int n = read_with_timeout(ft_extra[1], ft_buf + ft_total,
+                                              sizeof(ft_buf) - ft_total - 1, 200);
+                    if (n > 0) ft_total += n;
+                    else break;
+                }
+                printf("  Output (hex, first 80 bytes): ");
+                for (int i = 0; i < ft_total && i < 80; i++)
+                    printf("%02x ", (unsigned char)ft_buf[i]);
+                printf("\n");
+
+                const char *exp_osc50_1 = "\033]50;Mono:size=14\007";
+                const char *exp_osc50_2 = "\033]50;Liberation Mono:pixelsize=16\007";
+                CHECK(strstr(ft_buf, exp_osc50_1) != NULL,
+                      "Phase 7: OSC 50 font set (Mono:size=14) passthrough",
+                      "raw OSC 50 sequence not found in output");
+                CHECK(strstr(ft_buf, exp_osc50_2) != NULL,
+                      "Phase 7: OSC 50 font set (Liberation Mono:pixelsize=16) passthrough",
+                      "raw OSC 50 sequence not found in output");
+
+                /* Exit shell and drain ExitStatus */
+                send_all(ft_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(ft_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(ft_extra[i]);
+                close(ft_init_fd);
+                close(ft_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 22 (Phase 7): OSC 50 font query passthrough ---- */
+    /* Verify that OSC 50 ; ? (query font) passes through the raw PTY.
+     * A real terminal emulator would respond with the current font name,
+     * but the mock host has no terminal emulator — we just verify the
+     * query sequence passes through unchanged. */
+    printf("\n[host] Step 22: Phase 7 OSC 50 font query passthrough...\n");
+    {
+        int fq_init_fd = -1, fq_control_fd = -1;
+        if (setup_bridge_session(&fq_init_fd, &fq_control_fd, 24, 80, 22, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup font query session\n");
+            CHECK(0, "Phase 7: font query session setup", "connect failed");
+        } else {
+            int fq_extra[5];
+            int fq_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                fq_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (fq_extra[i] < 0) { fq_extra_ok = 0; break; }
+            }
+
+            if (!fq_extra_ok) {
+                CHECK(0, "Phase 7: font query extra sockets", "connect failed");
+                close(fq_init_fd); close(fq_control_fd);
+                for (int i = 0; i < 5; i++) if (fq_extra[i] >= 0) close(fq_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* OSC 50 ; ? : Query current font (xterm extension).
+                 * ESC ] 5 0 ; ? BEL */
+                const char *osc50_query = "printf '\\033]50;?\\007'\n";
+                send_all(fq_extra[0], osc50_query, strlen(osc50_query));
+                printf("  Sent OSC 50 font query (ESC]50;? BEL)\n");
+
+                /* Drain and verify raw passthrough */
+                char fq_buf[512];
+                memset(fq_buf, 0, sizeof(fq_buf));
+                int fq_total = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    int n = read_with_timeout(fq_extra[1], fq_buf + fq_total,
+                                              sizeof(fq_buf) - fq_total - 1, 200);
+                    if (n > 0) fq_total += n;
+                    else break;
+                }
+                printf("  Output (hex, first 40 bytes): ");
+                for (int i = 0; i < fq_total && i < 40; i++)
+                    printf("%02x ", (unsigned char)fq_buf[i]);
+                printf("\n");
+
+                const char *exp_osc50_q = "\033]50;?\007";
+                CHECK(strstr(fq_buf, exp_osc50_q) != NULL,
+                      "Phase 7: OSC 50 font query (ESC]50;?) passthrough",
+                      "raw OSC 50 query sequence not found in output");
+
+                /* Exit shell and drain ExitStatus */
+                send_all(fq_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(fq_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(fq_extra[i]);
+                close(fq_init_fd);
+                close(fq_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 23 (Phase 7): OSC 50 font traffic + grandchild PTY drain ---- */
+    /* Combined test: send OSC 50 font-setting sequences, then fork a
+     * grandchild holding the PTY slave and exit the shell. The bridge
+     * must drain the PTY with the 200ms poll timeout (not block forever)
+     * and send ExitStatus despite the grandchild holding the slave.
+     * This verifies that OSC 50 font traffic does not interfere with
+     * the Phase 4 drain fix. */
+    printf("\n[host] Step 23: Phase 7 OSC 50 font traffic + grandchild PTY drain timeout...\n");
+    {
+        int fc_init_fd = -1, fc_control_fd = -1;
+        if (setup_bridge_session(&fc_init_fd, &fc_control_fd, 24, 80, 23, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup font+grandchild session\n");
+            CHECK(0, "Phase 7: font+grandchild session setup", "connect failed");
+        } else {
+            int fc_extra[5];
+            int fc_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                fc_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (fc_extra[i] < 0) { fc_extra_ok = 0; break; }
+            }
+
+            if (!fc_extra_ok) {
+                CHECK(0, "Phase 7: font+grandchild extra sockets", "connect failed");
+                close(fc_init_fd); close(fc_control_fd);
+                for (int i = 0; i < 5; i++) if (fc_extra[i] >= 0) close(fc_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* Send multiple OSC 50 font-setting sequences to generate
+                 * font-related escape traffic through the PTY. */
+                const char *font_cmds[] = {
+                    "printf '\\033]50;Mono:size=12\\007'\n",
+                    "printf '\\033]50;Mono:size=14\\007'\n",
+                    "printf '\\033]50;Mono:size=16\\007'\n",
+                    "printf '\\033]50;Mono:size=18\\007'\n",
+                    "printf '\\033]50;Mono:size=14\\007'\n",  /* back to 14 */
+                };
+                for (int i = 0; i < 5; i++) {
+                    send_all(fc_extra[0], font_cmds[i], strlen(font_cmds[i]));
+                }
+                printf("  Sent 5 OSC 50 font-setting sequences (size 12→14→16→18→14)\n");
+
+                /* Drain font traffic output */
+                char fc_buf[2048];
+                memset(fc_buf, 0, sizeof(fc_buf));
+                for (int attempt = 0; attempt < 10; attempt++) {
+                    int n = read_with_timeout(fc_extra[1], fc_buf, sizeof(fc_buf) - 1, 300);
+                    if (n <= 0) break;
+                }
+
+                /* Fork grandchild holding PTY slave, then exit shell */
+                const char *bg_cmd = "sleep 60 &\n";
+                send_all(fc_extra[0], bg_cmd, strlen(bg_cmd));
+                printf("  Sent '%s' to fork grandchild holding PTY slave\n", bg_cmd);
+
+                /* Drain job control output */
+                memset(fc_buf, 0, sizeof(fc_buf));
+                for (int attempt = 0; attempt < 10; attempt++) {
+                    int n = read_with_timeout(fc_extra[1], fc_buf, sizeof(fc_buf) - 1, 300);
+                    if (n <= 0) break;
+                }
+
+                /* Exit shell — grandchild still holds PTY slave */
+                send_all(fc_extra[0], "exit\n", 5);
+                printf("  Sent 'exit' — shell exits, grandchild still holds PTY slave\n");
+
+                /* Drain remaining stdout */
+                memset(fc_buf, 0, sizeof(fc_buf));
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    int n = read_with_timeout(fc_extra[1], fc_buf, sizeof(fc_buf) - 1, 200);
+                    if (n <= 0) break;
+                }
+
+                /* Read ExitStatus — should arrive within a few seconds
+                 * despite the grandchild holding the PTY slave. */
+                int got_fc_exit = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    void *msg = recv_message(fc_control_fd, &hdr);
+                    if (!msg) { usleep(100000); continue; }
+                    struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
+                    if (mhdr->MessageType == LxInitMessageExitStatus) {
+                        got_fc_exit = 1;
+                    }
+                    free(msg);
+                    if (got_fc_exit) break;
+                }
+
+                CHECK(got_fc_exit,
+                      "Phase 7: ExitStatus received after OSC 50 font traffic + grandchild (drain timeout works)",
+                      "not received — bridge may be hung in drain loop after font traffic");
+
+                for (int i = 0; i < 5; i++) close(fc_extra[i]);
+                close(fc_init_fd);
+                close(fc_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 24 (Phase 7): New session after font + grandchild test ---- */
+    printf("\n[host] Step 24: Phase 7 new session after font + grandchild test (verify no deadlock)...\n");
+    {
+        int f2_init_fd = -1, f2_control_fd = -1;
+        if (setup_bridge_session(&f2_init_fd, &f2_control_fd, 24, 80, 24, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup post-font session (bridge may be deadlocked)\n");
+            CHECK(0, "Phase 7: new session after font + grandchild test", "connect failed (deadlock?)");
+        } else {
+            int f2_extra[5];
+            int f2_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                f2_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (f2_extra[i] < 0) { f2_extra_ok = 0; break; }
+            }
+
+            if (!f2_extra_ok) {
+                CHECK(0, "Phase 7: post-font extra sockets", "connect failed");
+                close(f2_init_fd); close(f2_control_fd);
+                for (int i = 0; i < 5; i++) if (f2_extra[i] >= 0) close(f2_extra[i]);
+            } else {
+                CHECK(1, "Phase 7: new session accepted after font + grandchild test (no deadlock)", "ok");
+
+                /* Quick echo test to confirm the session is fully functional */
+                usleep(300000);
+                const char *echo_cmd = "echo font_test_ok\n";
+                send_all(f2_extra[0], echo_cmd, strlen(echo_cmd));
+
+                char f2_out[4096];
+                memset(f2_out, 0, sizeof(f2_out));
+                int f2_total = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    int n = read_with_timeout(f2_extra[1], f2_out + f2_total,
+                                              sizeof(f2_out) - f2_total - 1, 200);
+                    if (n > 0) f2_total += n;
+                    else break;
+                }
+                printf("  Console output: '%s'\n", f2_out);
+                CHECK(strstr(f2_out, "font_test_ok") != NULL,
+                      "Phase 7: console I/O works after font + grandchild test",
+                      "output='%s'", f2_out);
+
+                /* Send exit and close */
+                send_all(f2_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(f2_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(f2_extra[i]);
+                close(f2_init_fd);
+                close(f2_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 25 (Phase 8): OSC 11 set background color (rgb: format) + OSC 111 reset ---- */
+    /* Verify that OSC 11 (set background color) and OSC 111 (reset background
+     * color) escape sequences pass through the raw PTY unchanged. The bridge
+     * sniffer should also detect these in its log output. */
+    printf("\n[host] Step 25: Phase 8 OSC 11 set (rgb:) + OSC 111 reset passthrough...\n");
+    {
+        int bg_init_fd = -1, bg_control_fd = -1;
+        if (setup_bridge_session(&bg_init_fd, &bg_control_fd, 24, 80, 25, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup bg color test session\n");
+            CHECK(0, "Phase 8: bg color test session setup", "connect failed");
+        } else {
+            int bg_extra[5];
+            int bg_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                bg_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (bg_extra[i] < 0) { bg_extra_ok = 0; break; }
+            }
+
+            if (!bg_extra_ok) {
+                CHECK(0, "Phase 8: bg color extra sockets", "connect failed");
+                close(bg_init_fd); close(bg_control_fd);
+                for (int i = 0; i < 5; i++) if (bg_extra[i] >= 0) close(bg_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* OSC 11: Set background to rgb:1e/1e/2e (dark) */
+                const char *osc11_set1 = "printf '\\033]11;rgb:1e/1e/2e\\007'\n";
+                send_all(bg_extra[0], osc11_set1, strlen(osc11_set1));
+                printf("  Sent OSC 11 set: rgb:1e/1e/2e\n");
+
+                /* OSC 11: Change background to rgb:f3/8b/ae (light) */
+                const char *osc11_set2 = "printf '\\033]11;rgb:f3/8b/ae\\007'\n";
+                send_all(bg_extra[0], osc11_set2, strlen(osc11_set2));
+                printf("  Sent OSC 11 set: rgb:f3/8b/ae\n");
+
+                /* OSC 111: Reset background color */
+                const char *osc111_reset = "printf '\\033]111\\007'\n";
+                send_all(bg_extra[0], osc111_reset, strlen(osc111_reset));
+                printf("  Sent OSC 111 reset\n");
+
+                /* Drain and verify raw passthrough */
+                char bg_buf[2048];
+                memset(bg_buf, 0, sizeof(bg_buf));
+                int bg_total = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    int n = read_with_timeout(bg_extra[1], bg_buf + bg_total,
+                                              sizeof(bg_buf) - bg_total - 1, 200);
+                    if (n > 0) bg_total += n;
+                    else break;
+                }
+                printf("  Output (hex, first 80 bytes): ");
+                for (int i = 0; i < bg_total && i < 80; i++)
+                    printf("%02x ", (unsigned char)bg_buf[i]);
+                printf("\n");
+
+                const char *exp_osc11_1 = "\033]11;rgb:1e/1e/2e\007";
+                const char *exp_osc11_2 = "\033]11;rgb:f3/8b/ae\007";
+                const char *exp_osc111 = "\033]111\007";
+                CHECK(strstr(bg_buf, exp_osc11_1) != NULL,
+                      "Phase 8: OSC 11 set (rgb:1e/1e/2e) passthrough",
+                      "raw OSC 11 sequence not found");
+                CHECK(strstr(bg_buf, exp_osc11_2) != NULL,
+                      "Phase 8: OSC 11 set (rgb:f3/8b/ae) passthrough",
+                      "raw OSC 11 sequence not found");
+                CHECK(strstr(bg_buf, exp_osc111) != NULL,
+                      "Phase 8: OSC 111 reset passthrough",
+                      "raw OSC 111 sequence not found");
+
+                /* Exit shell and drain ExitStatus */
+                send_all(bg_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(bg_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(bg_extra[i]);
+                close(bg_init_fd);
+                close(bg_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 26 (Phase 8): OSC 11 set (#RRGGBB format) + OSC 11 query ---- */
+    /* Verify hex color format and query sequence passthrough. */
+    printf("\n[host] Step 26: Phase 8 OSC 11 set (#RRGGBB) + OSC 11 query passthrough...\n");
+    {
+        int hg_init_fd = -1, hg_control_fd = -1;
+        if (setup_bridge_session(&hg_init_fd, &hg_control_fd, 24, 80, 26, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup hex color test session\n");
+            CHECK(0, "Phase 8: hex color test session setup", "connect failed");
+        } else {
+            int hg_extra[5];
+            int hg_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                hg_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (hg_extra[i] < 0) { hg_extra_ok = 0; break; }
+            }
+
+            if (!hg_extra_ok) {
+                CHECK(0, "Phase 8: hex color extra sockets", "connect failed");
+                close(hg_init_fd); close(hg_control_fd);
+                for (int i = 0; i < 5; i++) if (hg_extra[i] >= 0) close(hg_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* OSC 11: Set background using #RRGGBB format */
+                const char *osc11_hex = "printf '\\033]11;#1e1e2e\\007'\n";
+                send_all(hg_extra[0], osc11_hex, strlen(osc11_hex));
+                printf("  Sent OSC 11 set: #1e1e2e\n");
+
+                /* OSC 11;? : Query current background color */
+                const char *osc11_query = "printf '\\033]11;?\\007'\n";
+                send_all(hg_extra[0], osc11_query, strlen(osc11_query));
+                printf("  Sent OSC 11 query (ESC]11;? BEL)\n");
+
+                /* Drain and verify raw passthrough */
+                char hg_buf[512];
+                memset(hg_buf, 0, sizeof(hg_buf));
+                int hg_total = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    int n = read_with_timeout(hg_extra[1], hg_buf + hg_total,
+                                              sizeof(hg_buf) - hg_total - 1, 200);
+                    if (n > 0) hg_total += n;
+                    else break;
+                }
+                printf("  Output (hex, first 60 bytes): ");
+                for (int i = 0; i < hg_total && i < 60; i++)
+                    printf("%02x ", (unsigned char)hg_buf[i]);
+                printf("\n");
+
+                const char *exp_hex = "\033]11;#1e1e2e\007";
+                const char *exp_query = "\033]11;?\007";
+                CHECK(strstr(hg_buf, exp_hex) != NULL,
+                      "Phase 8: OSC 11 set (#1e1e2e hex format) passthrough",
+                      "raw OSC 11 hex sequence not found");
+                CHECK(strstr(hg_buf, exp_query) != NULL,
+                      "Phase 8: OSC 11 query (ESC]11;?) passthrough",
+                      "raw OSC 11 query sequence not found");
+
+                /* Exit shell and drain ExitStatus */
+                send_all(hg_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(hg_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(hg_extra[i]);
+                close(hg_init_fd);
+                close(hg_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 27 (Phase 8): OSC 11 traffic + grandchild PTY drain ---- */
+    /* Combined test: send multiple OSC 11 background color changes, then fork
+     * a grandchild holding the PTY slave and exit the shell. The bridge must
+     * drain the PTY with the 200ms poll timeout and send ExitStatus despite
+     * the grandchild holding the slave. This verifies that OSC 11 sniffing
+     * does not interfere with the Phase 4 drain fix. */
+    printf("\n[host] Step 27: Phase 8 OSC 11 traffic + grandchild PTY drain timeout...\n");
+    {
+        int bc_init_fd = -1, bc_control_fd = -1;
+        if (setup_bridge_session(&bc_init_fd, &bc_control_fd, 24, 80, 27, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup bg+grandchild session\n");
+            CHECK(0, "Phase 8: bg+grandchild session setup", "connect failed");
+        } else {
+            int bc_extra[5];
+            int bc_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                bc_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (bc_extra[i] < 0) { bc_extra_ok = 0; break; }
+            }
+
+            if (!bc_extra_ok) {
+                CHECK(0, "Phase 8: bg+grandchild extra sockets", "connect failed");
+                close(bc_init_fd); close(bc_control_fd);
+                for (int i = 0; i < 5; i++) if (bc_extra[i] >= 0) close(bc_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* Send multiple OSC 11 background color changes */
+                const char *bg_cmds[] = {
+                    "printf '\\033]11;rgb:11/11/11\\007'\n",
+                    "printf '\\033]11;rgb:22/22/22\\007'\n",
+                    "printf '\\033]11;rgb:33/33/33\\007'\n",
+                    "printf '\\033]11;rgb:44/44/44\\007'\n",
+                    "printf '\\033]11;rgb:55/55/55\\007'\n",
+                };
+                for (int i = 0; i < 5; i++) {
+                    send_all(bc_extra[0], bg_cmds[i], strlen(bg_cmds[i]));
+                }
+                printf("  Sent 5 OSC 11 background color changes\n");
+
+                /* Drain bg traffic output */
+                char bc_buf[2048];
+                memset(bc_buf, 0, sizeof(bc_buf));
+                for (int attempt = 0; attempt < 10; attempt++) {
+                    int n = read_with_timeout(bc_extra[1], bc_buf, sizeof(bc_buf) - 1, 300);
+                    if (n <= 0) break;
+                }
+
+                /* Fork grandchild holding PTY slave, then exit shell */
+                const char *bg_cmd = "sleep 60 &\n";
+                send_all(bc_extra[0], bg_cmd, strlen(bg_cmd));
+                printf("  Sent '%s' to fork grandchild holding PTY slave\n", bg_cmd);
+
+                /* Drain job control output */
+                memset(bc_buf, 0, sizeof(bc_buf));
+                for (int attempt = 0; attempt < 10; attempt++) {
+                    int n = read_with_timeout(bc_extra[1], bc_buf, sizeof(bc_buf) - 1, 300);
+                    if (n <= 0) break;
+                }
+
+                /* Exit shell — grandchild still holds PTY slave */
+                send_all(bc_extra[0], "exit\n", 5);
+                printf("  Sent 'exit' — shell exits, grandchild still holds PTY slave\n");
+
+                /* Drain remaining stdout */
+                memset(bc_buf, 0, sizeof(bc_buf));
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    int n = read_with_timeout(bc_extra[1], bc_buf, sizeof(bc_buf) - 1, 200);
+                    if (n <= 0) break;
+                }
+
+                /* Read ExitStatus — should arrive despite grandchild */
+                int got_bc_exit = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    void *msg = recv_message(bc_control_fd, &hdr);
+                    if (!msg) { usleep(100000); continue; }
+                    struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
+                    if (mhdr->MessageType == LxInitMessageExitStatus) {
+                        got_bc_exit = 1;
+                    }
+                    free(msg);
+                    if (got_bc_exit) break;
+                }
+
+                CHECK(got_bc_exit,
+                      "Phase 8: ExitStatus received after OSC 11 traffic + grandchild (drain timeout works)",
+                      "not received — bridge may be hung in drain loop after OSC 11 traffic");
+
+                for (int i = 0; i < 5; i++) close(bc_extra[i]);
+                close(bc_init_fd);
+                close(bc_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 28 (Phase 8): New session after OSC 11 + grandchild test ---- */
+    printf("\n[host] Step 28: Phase 8 new session after OSC 11 + grandchild test (verify no deadlock)...\n");
+    {
+        int b2_init_fd = -1, b2_control_fd = -1;
+        if (setup_bridge_session(&b2_init_fd, &b2_control_fd, 24, 80, 28, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup post-OSC11 session (bridge may be deadlocked)\n");
+            CHECK(0, "Phase 8: new session after OSC 11 + grandchild test", "connect failed (deadlock?)");
+        } else {
+            int b2_extra[5];
+            int b2_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                b2_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (b2_extra[i] < 0) { b2_extra_ok = 0; break; }
+            }
+
+            if (!b2_extra_ok) {
+                CHECK(0, "Phase 8: post-OSC11 extra sockets", "connect failed");
+                close(b2_init_fd); close(b2_control_fd);
+                for (int i = 0; i < 5; i++) if (b2_extra[i] >= 0) close(b2_extra[i]);
+            } else {
+                CHECK(1, "Phase 8: new session accepted after OSC 11 + grandchild test (no deadlock)", "ok");
+
+                /* Quick echo test to confirm the session is fully functional */
+                usleep(300000);
+                const char *echo_cmd = "echo bgcolor_test_ok\n";
+                send_all(b2_extra[0], echo_cmd, strlen(echo_cmd));
+
+                char b2_out[4096];
+                memset(b2_out, 0, sizeof(b2_out));
+                int b2_total = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    int n = read_with_timeout(b2_extra[1], b2_out + b2_total,
+                                              sizeof(b2_out) - b2_total - 1, 200);
+                    if (n > 0) b2_total += n;
+                    else break;
+                }
+                printf("  Console output: '%s'\n", b2_out);
+                CHECK(strstr(b2_out, "bgcolor_test_ok") != NULL,
+                      "Phase 8: console I/O works after OSC 11 + grandchild test",
+                      "output='%s'", b2_out);
+
+                /* Send exit and close */
+                send_all(b2_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(b2_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(b2_extra[i]);
+                close(b2_init_fd);
+                close(b2_control_fd);
             }
         }
     }
