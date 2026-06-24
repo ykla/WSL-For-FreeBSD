@@ -116,6 +116,13 @@ typedef struct LX_INIT_CREATE_PROCESS_COMMON {
     char Buffer[];
 } LX_INIT_CREATE_PROCESS_COMMON;
 
+/* CreateProcess flags (from lxinitshared.h LX_INIT_CREATE_PROCESS_FLAGS) */
+#define LxInitCreateProcessFlagsStdInConsole    0x1
+#define LxInitCreateProcessFlagsStdOutConsole   0x2
+#define LxInitCreateProcessFlagsStdErrConsole   0x4
+#define LxInitCreateProcessFlagsElevated        0x8
+#define LxInitCreateProcessFlagsInteropEnabled  0x10
+
 /* CreateProcessUtilityVm (host -> guest, type 8) */
 typedef struct LX_INIT_CREATE_PROCESS_UTILITY_VM {
     struct MESSAGE_HEADER Header;

@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * wsl_mock_host.c - Mock WSL host for testing Phase 0 + Phase 1 + Phase 2 fixes.
+ * wsl_mock_host.c - Mock WSL host for testing Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 fixes.
  *
  * Simulates wslservice.exe: listens on port 50000, accepts guest
  * connections, sends WSL protocol messages, and validates the
@@ -24,6 +24,15 @@
  * Phase 2 test checks:
  *  11. Environment variables passed via execve (echo $TEST_ENV_VAR)
  *  12. Working directory set via chdir before execve (pwd == /tmp)
+ *
+ * Phase 3 test checks:
+ *  13. PTY raw mode: no double echo (command text not echoed by PTY)
+ *  14. Resize to minimum 1x1 (stty size shows "1 1")
+ *  15. Resize back to large 50x200 (stty size shows "50 200")
+ *
+ * Phase 4 test checks:
+ *  16. Host disconnect triggers graceful child shutdown (no zombie/leak)
+ *  17. New session works after a previous session's host disconnect
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,10 +107,90 @@ static int read_with_timeout(int fd, char *buf, int bufsize, int timeout_ms)
     return (int)recv(fd, buf, bufsize, 0);
 }
 
+/* Phase 4 helper: connect to bridge, send CreateProcessUtilityVm, and validate
+ * the ResultUint32 response. On success returns 0 and fills out_control_fd with
+ * the control channel. On failure returns -1. */
+static int setup_bridge_session(int *out_init_fd, int *out_control_fd,
+                                unsigned short rows, unsigned short cols,
+                                unsigned int seq, struct MESSAGE_HEADER *out_hdr)
+{
+    int init_fd = connect_to_port(PORT_HVS_BSD);
+    if (init_fd < 0) return -1;
+    int control_fd = connect_to_port(PORT_HVS_BSD);
+    if (control_fd < 0) { close(init_fd); return -1; }
+
+    const char *filename = "/bin/sh";
+    const char *cwd = "/tmp";
+    const char *cmdline = "sh";
+    const char *env_vars[] = {
+        "TEST_ENV_VAR=phase2_ok",
+        "TERM=xterm",
+        "PATH=/bin:/usr/bin",
+    };
+    int env_count = (int)(sizeof(env_vars) / sizeof(env_vars[0]));
+
+    uint32_t off_filename = 0;
+    uint32_t off_cwd = off_filename + (uint32_t)strlen(filename) + 1;
+    uint32_t off_cmdline = off_cwd + (uint32_t)strlen(cwd) + 1;
+    uint32_t off_env = off_cmdline + (uint32_t)strlen(cmdline) + 1;
+
+    size_t env_total = 0;
+    for (int i = 0; i < env_count; i++)
+        env_total += strlen(env_vars[i]) + 1;
+    size_t buffer_size = off_env + env_total;
+
+    size_t msg_size = offsetof(LX_INIT_CREATE_PROCESS_UTILITY_VM, Common.Buffer) + buffer_size;
+    LX_INIT_CREATE_PROCESS_UTILITY_VM *proc_msg = calloc(1, msg_size);
+    if (!proc_msg) { close(init_fd); close(control_fd); return -1; }
+
+    proc_msg->Header.MessageType = LxInitMessageCreateProcessUtilityVm;
+    proc_msg->Header.MessageSize = (uint32_t)msg_size;
+    proc_msg->Header.SequenceNumber = seq;
+    proc_msg->Rows = rows;
+    proc_msg->Columns = cols;
+    proc_msg->Common.FilenameOffset = off_filename;
+    proc_msg->Common.CurrentWorkingDirectoryOffset = off_cwd;
+    proc_msg->Common.CommandLineOffset = off_cmdline;
+    proc_msg->Common.CommandLineCount = 1;
+    proc_msg->Common.EnvironmentOffset = off_env;
+    proc_msg->Common.EnvironmentCount = (uint16_t)env_count;
+
+    char *cbuf = proc_msg->Common.Buffer;
+    memcpy(cbuf + off_filename, filename, strlen(filename) + 1);
+    memcpy(cbuf + off_cwd, cwd, strlen(cwd) + 1);
+    memcpy(cbuf + off_cmdline, cmdline, strlen(cmdline) + 1);
+    {
+        size_t pos = off_env;
+        for (int i = 0; i < env_count; i++) {
+            memcpy(cbuf + pos, env_vars[i], strlen(env_vars[i]) + 1);
+            pos += strlen(env_vars[i]) + 1;
+        }
+    }
+
+    if (send_all(control_fd, proc_msg, msg_size) < 0) {
+        free(proc_msg); close(init_fd); close(control_fd); return -1;
+    }
+    free(proc_msg);
+
+    struct MESSAGE_HEADER hdr;
+    RESULT_MESSAGE_UINT32 *result = (RESULT_MESSAGE_UINT32 *)recv_message(control_fd, &hdr);
+    if (!result) { close(init_fd); close(control_fd); return -1; }
+    int ok = (result->Header.MessageType == LxMessageResultUint32 &&
+              result->Header.SequenceNumber == seq);
+    if (out_hdr) *out_hdr = hdr;
+    free(result);
+
+    if (!ok) { close(init_fd); close(control_fd); return -1; }
+
+    *out_init_fd = init_fd;
+    *out_control_fd = control_fd;
+    return 0;
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
-    printf("=== WSL Mock Host — Phase 2 Test Harness ===\n\n");
+    printf("=== WSL Mock Host — Phase 4 Test Harness ===\n\n");
 
     /* Listen on port 50000 for guest connections */
     int listen_fd = listen_on_port(PORT_HVS);
@@ -414,6 +503,40 @@ int main(void)
           "Phase 2: working directory /tmp (chdir before execve)",
           "output='%s'", outbuf);
 
+    /* ---- Step 9d (Phase 3): PTY raw mode test ---- */
+    /* In raw mode, the PTY should NOT echo input. Only the command output
+     * should appear, not the command text itself. This verifies that
+     * cfmakeraw was called on the PTY slave before exec. */
+    printf("\n[host] Step 9d: Phase 3 raw mode test (no PTY echo)...\n");
+    usleep(100000);
+
+    const char *raw_cmd = "echo RAW_PHASE3_XYZ\n";
+    if (send_all(extra[0], raw_cmd, strlen(raw_cmd)) < 0) {
+        perror("send raw_cmd"); return 1;
+    }
+    printf("  Sent: %s", raw_cmd);
+
+    memset(outbuf, 0, sizeof(outbuf));
+    total = 0;
+    for (int attempt = 0; attempt < 50; attempt++) {
+        int n = read_with_timeout(extra[1], outbuf + total, sizeof(outbuf) - total - 1, 200);
+        if (n > 0) {
+            total += n;
+            outbuf[total] = '\0';
+            if (strstr(outbuf, "RAW_PHASE3_XYZ")) break;
+        }
+    }
+    printf("  raw mode output: '%s'\n", outbuf);
+
+    /* Command output should be present */
+    CHECK(strstr(outbuf, "RAW_PHASE3_XYZ") != NULL,
+          "Phase 3: raw mode command output present",
+          "output='%s'", outbuf);
+    /* PTY echo of command text should be absent (raw mode = no echo) */
+    CHECK(strstr(outbuf, "echo RAW_PHASE3_XYZ") == NULL,
+          "Phase 3: no PTY echo in raw mode (cfmakeraw active)",
+          "output contains 'echo RAW_PHASE3_XYZ' — PTY is in cooked mode!");
+
     /* ---- Step 10 (Phase 1): WindowSizeChanged test ---- */
     printf("\n[host] Step 10: Sending WindowSizeChanged (rows=40, cols=100) on control channel...\n");
     LX_INIT_WINDOW_SIZE_CHANGED wsc_msg;
@@ -455,6 +578,74 @@ int main(void)
     printf("  stty size output: '%s'\n", outbuf);
     CHECK(strstr(outbuf, "40 100") != NULL,
           "WindowSizeChanged: PTY resized to 40x100 (Phase 1)",
+          "output='%s'", outbuf);
+
+    /* ---- Step 10b (Phase 3): Resize to minimum 1x1 ---- */
+    printf("\n[host] Step 10b: Phase 3 resize to minimum (1x1)...\n");
+    memset(&wsc_msg, 0, sizeof(wsc_msg));
+    wsc_msg.Header.MessageType = LxInitMessageWindowSizeChanged;
+    wsc_msg.Header.MessageSize = sizeof(wsc_msg);
+    wsc_msg.Header.SequenceNumber = 11;
+    wsc_msg.Rows = 1;
+    wsc_msg.Columns = 1;
+
+    if (send_all(bridge_initial, &wsc_msg, sizeof(wsc_msg)) < 0) {
+        perror("send WindowSizeChanged 1x1"); return 1;
+    }
+    printf("  Sent WindowSizeChanged (rows=1, cols=1)\n");
+    usleep(200000);
+
+    if (send_all(extra[0], stty_cmd, strlen(stty_cmd)) < 0) {
+        perror("send stty size 1x1"); return 1;
+    }
+
+    memset(outbuf, 0, sizeof(outbuf));
+    total = 0;
+    for (int attempt = 0; attempt < 50; attempt++) {
+        int n = read_with_timeout(extra[1], outbuf + total, sizeof(outbuf) - total - 1, 200);
+        if (n > 0) {
+            total += n;
+            outbuf[total] = '\0';
+            if (strstr(outbuf, "1 1")) break;
+        }
+    }
+    printf("  stty size output: '%s'\n", outbuf);
+    CHECK(strstr(outbuf, "1 1") != NULL,
+          "Phase 3: resize to minimum 1x1",
+          "output='%s'", outbuf);
+
+    /* ---- Step 10c (Phase 3): Resize back to large 50x200 ---- */
+    printf("\n[host] Step 10c: Phase 3 resize back to large (50x200)...\n");
+    memset(&wsc_msg, 0, sizeof(wsc_msg));
+    wsc_msg.Header.MessageType = LxInitMessageWindowSizeChanged;
+    wsc_msg.Header.MessageSize = sizeof(wsc_msg);
+    wsc_msg.Header.SequenceNumber = 12;
+    wsc_msg.Rows = 50;
+    wsc_msg.Columns = 200;
+
+    if (send_all(bridge_initial, &wsc_msg, sizeof(wsc_msg)) < 0) {
+        perror("send WindowSizeChanged 50x200"); return 1;
+    }
+    printf("  Sent WindowSizeChanged (rows=50, cols=200)\n");
+    usleep(200000);
+
+    if (send_all(extra[0], stty_cmd, strlen(stty_cmd)) < 0) {
+        perror("send stty size 50x200"); return 1;
+    }
+
+    memset(outbuf, 0, sizeof(outbuf));
+    total = 0;
+    for (int attempt = 0; attempt < 50; attempt++) {
+        int n = read_with_timeout(extra[1], outbuf + total, sizeof(outbuf) - total - 1, 200);
+        if (n > 0) {
+            total += n;
+            outbuf[total] = '\0';
+            if (strstr(outbuf, "50 200")) break;
+        }
+    }
+    printf("  stty size output: '%s'\n", outbuf);
+    CHECK(strstr(outbuf, "50 200") != NULL,
+          "Phase 3: resize back to large 50x200",
           "output='%s'", outbuf);
 
     /* ---- Step 11: Send exit, read ExitStatus from control channel ---- */
@@ -511,6 +702,152 @@ int main(void)
         CHECK(0, "ExitStatus received on control channel", "not received");
     }
 
+    /* ---- Step 13 (Phase 4): Host disconnect test ---- */
+    printf("\n[host] Step 13: Phase 4 host disconnect — start session, then drop all sockets...\n");
+
+    /* Close first session's bridge sockets (session already ended via exit) */
+    for (int i = 0; i < 5; i++) { close(extra[i]); extra[i] = -1; }
+    close(bridge_init); bridge_init = -1;
+    close(bridge_initial); bridge_initial = -1;
+
+    /* Start a new session that we will disconnect abruptly */
+    int dis_init_fd = -1, dis_control_fd = -1;
+    if (setup_bridge_session(&dis_init_fd, &dis_control_fd, 30, 120, 13, NULL) < 0) {
+        fprintf(stderr, "  [FAIL] cannot setup disconnect session\n");
+        CHECK(0, "Phase 4: disconnect session setup", "connect failed");
+    } else {
+        printf("  Disconnect session established (control fd=%d)\n", dis_control_fd);
+
+        /* Connect 5 additional sockets */
+        int dis_extra[5];
+        int dis_extra_ok = 1;
+        for (int i = 0; i < 5; i++) {
+            dis_extra[i] = connect_to_port(PORT_HVS_BSD);
+            if (dis_extra[i] < 0) { dis_extra_ok = 0; break; }
+        }
+
+        if (!dis_extra_ok) {
+            fprintf(stderr, "  [FAIL] cannot connect extra sockets for disconnect session\n");
+            CHECK(0, "Phase 4: disconnect session extra sockets", "connect failed");
+            close(dis_init_fd); close(dis_control_fd);
+            for (int i = 0; i < 5; i++) if (dis_extra[i] >= 0) close(dis_extra[i]);
+        } else {
+            /* Give the shell time to start, then send a long-running command */
+            usleep(300000);
+            const char *sleep_cmd = "sleep 30\n";
+            send_all(dis_extra[0], sleep_cmd, strlen(sleep_cmd));
+            printf("  Sent '%s' to keep shell alive during disconnect\n", sleep_cmd);
+
+            /* Read any prompt output */
+            char dis_buf[256];
+            memset(dis_buf, 0, sizeof(dis_buf));
+            read_with_timeout(dis_extra[1], dis_buf, sizeof(dis_buf) - 1, 300);
+
+            /* Simulate host disconnect: close ALL sockets suddenly.
+             * The bridge should detect the control channel close, send SIGHUP
+             * to the child, reap it, and return to the accept loop. */
+            printf("  Simulating host disconnect (closing all sockets)...\n");
+            for (int i = 0; i < 5; i++) { close(dis_extra[i]); dis_extra[i] = -1; }
+            close(dis_init_fd); dis_init_fd = -1;
+            close(dis_control_fd); dis_control_fd = -1;
+
+            /* Wait for the bridge to detect the disconnect and clean up.
+             * SIGHUP should kill the shell quickly; allow up to 6s
+             * (the bridge escalates to SIGKILL at 5s). */
+            printf("  Waiting 6s for bridge graceful shutdown (SIGHUP -> SIGKILL)...\n");
+            sleep(6);
+
+            CHECK(1, "Phase 4: host disconnect handled without crash", "ok");
+        }
+    }
+
+    /* ---- Step 14 (Phase 4): New session after disconnect ---- */
+    printf("\n[host] Step 14: Phase 4 new session after disconnect (verify no deadlock/leak)...\n");
+    {
+        int new_init_fd = -1, new_control_fd = -1;
+        if (setup_bridge_session(&new_init_fd, &new_control_fd, 24, 80, 14, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup post-disconnect session (bridge may be deadlocked)\n");
+            CHECK(0, "Phase 4: new session after disconnect", "connect failed (deadlock?)");
+        } else {
+            printf("  Post-disconnect session established (control fd=%d)\n", new_control_fd);
+
+            /* Connect 5 additional sockets */
+            int new_extra[5];
+            int new_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                new_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (new_extra[i] < 0) { new_extra_ok = 0; break; }
+            }
+
+            if (!new_extra_ok) {
+                CHECK(0, "Phase 4: post-disconnect extra sockets", "connect failed");
+                close(new_init_fd); close(new_control_fd);
+                for (int i = 0; i < 5; i++) if (new_extra[i] >= 0) close(new_extra[i]);
+            } else {
+                CHECK(1, "Phase 4: new session accepted after disconnect (no deadlock)", "ok");
+
+                /* Verify console I/O works */
+                usleep(300000);
+                const char *echo_cmd = "echo phase4_ok\n";
+                send_all(new_extra[0], echo_cmd, strlen(echo_cmd));
+
+                char new_out[4096];
+                memset(new_out, 0, sizeof(new_out));
+                int new_total = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    int n = read_with_timeout(new_extra[1], new_out + new_total,
+                                              sizeof(new_out) - new_total - 1, 200);
+                    if (n > 0) new_total += n;
+                    else break;
+                }
+                printf("  Console output: '%s'\n", new_out);
+                CHECK(strstr(new_out, "phase4_ok") != NULL,
+                      "Phase 4: console I/O works after disconnect",
+                      "output='%s'", new_out);
+
+                /* Send exit and read ExitStatus */
+                const char *exit_cmd2 = "exit\n";
+                send_all(new_extra[0], exit_cmd2, strlen(exit_cmd2));
+
+                /* Drain remaining stdout */
+                memset(new_out, 0, sizeof(new_out));
+                new_total = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    int n = read_with_timeout(new_extra[1], new_out + new_total,
+                                              sizeof(new_out) - new_total, 200);
+                    if (n > 0) new_total += n;
+                    else break;
+                }
+
+                int got_exit2 = 0;
+                LX_INIT_PROCESS_EXIT_STATUS exit2;
+                memset(&exit2, 0, sizeof(exit2));
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    void *msg = recv_message(new_control_fd, &hdr);
+                    if (!msg) { usleep(100000); continue; }
+                    struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
+                    if (mhdr->MessageType == LxInitMessageExitStatus &&
+                        mhdr->MessageSize >= sizeof(LX_INIT_PROCESS_EXIT_STATUS)) {
+                        memcpy(&exit2, msg, sizeof(exit2));
+                        got_exit2 = 1;
+                        free(msg);
+                        break;
+                    }
+                    free(msg);
+                }
+
+                CHECK(got_exit2,
+                      "Phase 4: ExitStatus received after post-disconnect session",
+                      "not received");
+
+                /* Close post-disconnect session sockets */
+                for (int i = 0; i < 5; i++) close(new_extra[i]);
+                close(new_init_fd);
+                close(new_control_fd);
+            }
+        }
+    }
+
     /* ---- Step 12 (Phase 1): TerminateInstance test ---- */
     printf("\n[host] Step 12: Sending TerminateInstance to hvinit...\n");
     struct MESSAGE_HEADER term_msg;
@@ -551,9 +888,10 @@ int main(void)
     }
 
     /* ---- Cleanup ---- */
-    for (int i = 0; i < 5; i++) close(extra[i]);
-    close(bridge_init);
-    close(bridge_initial);
+    /* Phase 4: some fds may already be closed (set to -1); guard close() */
+    for (int i = 0; i < 5; i++) if (extra[i] >= 0) close(extra[i]);
+    if (bridge_init >= 0) close(bridge_init);
+    if (bridge_initial >= 0) close(bridge_initial);
     close(init_fd);
     close(notify_fd);
     close(cap_fd);

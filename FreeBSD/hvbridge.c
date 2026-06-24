@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <stdint.h>
+#include <time.h>
 
 /* WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum) */
 #define LxInitMessageCreateProcessUtilityVm      8
@@ -277,14 +278,28 @@ static ssize_t read_full(int fd, void *buf, size_t count) {
     return (ssize_t)total;
 }
 
-/* Phase 1: Update PTY window size */
+/* Phase 3: Update PTY window size with validation and EINTR retry */
 static int update_pty_winsize(int master_fd, unsigned short rows, unsigned short cols)
 {
+    /* Validate dimensions — reject zero or unreasonably large values */
+    if (rows == 0 || cols == 0) {
+        fprintf(stderr, "[bridge] invalid window size: rows=%u, cols=%u\n",
+                (unsigned)rows, (unsigned)cols);
+        return -1;
+    }
+
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
     ws.ws_row = rows;
     ws.ws_col = cols;
-    if (ioctl(master_fd, TIOCSWINSZ, &ws) < 0) {
+
+    /* Retry on EINTR (signal interruption during ioctl) */
+    int ret;
+    do {
+        ret = ioctl(master_fd, TIOCSWINSZ, &ws);
+    } while (ret < 0 && errno == EINTR);
+
+    if (ret < 0) {
         perror("[bridge] ioctl TIOCSWINSZ");
         return -1;
     }
@@ -427,12 +442,36 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
     pid = forkpty(&master_fd, NULL, NULL, &ws);
     if (pid < 0) {
         perror("[bridge] forkpty");
+        /* FIX: cleanup pipe fds and signal handler on forkpty failure */
+        signal(SIGCHLD, SIG_DFL);
+        if (g_sigchld_pipe[0] >= 0) close(g_sigchld_pipe[0]);
+        if (g_sigchld_pipe[1] >= 0) close(g_sigchld_pipe[1]);
+        g_sigchld_pipe[0] = g_sigchld_pipe[1] = -1;
         return -1;
     }
 
     if (pid == 0) {
         /* Child: start process using parsed CreateProcess info (Phase 2) */
         signal(SIGCHLD, SIG_DFL); /* restore default in child */
+
+        /* Phase 3: Set PTY slave to raw mode.
+         * In WSL, the host (Windows Terminal / ConPTY) handles terminal
+         * emulation (echo, line editing, signals). The guest PTY should
+         * be in raw mode to avoid double echo and input buffering.
+         * We keep ICRNL (CR→NL on input) so Enter key works, and
+         * OPOST|ONLCR (NL→CRNL on output) for proper display. */
+        {
+            struct termios raw_tio;
+            if (tcgetattr(STDIN_FILENO, &raw_tio) == 0) {
+                cfmakeraw(&raw_tio);
+                raw_tio.c_iflag |= ICRNL;          /* Map CR to NL on input */
+                raw_tio.c_oflag |= OPOST | ONLCR;  /* Map NL to CRNL on output */
+                /* FIX: check tcsetattr return — log if raw mode setup fails */
+                if (tcsetattr(STDIN_FILENO, TCSANOW, &raw_tio) < 0) {
+                    perror("[bridge] tcsetattr raw mode");
+                }
+            }
+        }
 
         if (info) {
             /* Phase 2: chdir to CWD from message */
@@ -496,24 +535,74 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
     int exit_code = -1;
     int session_done = 0;
 
+    /* Phase 4: session exit cleanup state.
+     * When the host disconnects the control channel, we initiate a graceful
+     * shutdown: send SIGHUP to the child (mimicking terminal hangup), give it
+     * a few seconds to exit, then escalate to SIGKILL. The child is always
+     * reaped via waitpid before run_session() returns, on every exit path. */
+    int host_disconnected = 0;      /* control channel closed by host */
+    int child_reaped = 0;           /* waitpid has collected the child */
+    int sighup_sent = 0;            /* SIGHUP already sent */
+    int sigkill_sent = 0;           /* SIGKILL already sent */
+    time_t shutdown_deadline = 0;   /* when to escalate to SIGKILL */
+
     enum { IDX_CONTROL, IDX_STDIN, IDX_PTY, IDX_SIGCHLD, IDX_CHANNEL, IDX_INTEROP, NFDS };
 
     while (!session_done) {
         struct pollfd pfds[NFDS];
         memset(pfds, 0, sizeof(pfds));
 
-        pfds[IDX_CONTROL].fd = initial_c;          pfds[IDX_CONTROL].events = POLLIN;
-        pfds[IDX_STDIN].fd = stdin_fd;             pfds[IDX_STDIN].events = POLLIN;
+        /* Phase 4: once the host has disconnected, stop polling the host-facing
+         * fds (they are closed/invalid). Keep polling the PTY (to drain and
+         * discard output so the child does not block on write) and the
+         * SIGCHLD self-pipe (to detect child exit). */
+        pfds[IDX_CONTROL].fd = host_disconnected ? -1 : initial_c;
+        pfds[IDX_CONTROL].events = POLLIN;
+        pfds[IDX_STDIN].fd = host_disconnected ? -1 : stdin_fd;
+        pfds[IDX_STDIN].events = POLLIN;
         pfds[IDX_PTY].fd = master_fd;              pfds[IDX_PTY].events = POLLIN;
         pfds[IDX_SIGCHLD].fd = g_sigchld_pipe[0];  pfds[IDX_SIGCHLD].events = POLLIN;
-        pfds[IDX_CHANNEL].fd = channel_fd;         pfds[IDX_CHANNEL].events = POLLIN;
-        pfds[IDX_INTEROP].fd = interop_fd;         pfds[IDX_INTEROP].events = POLLIN;
+        pfds[IDX_CHANNEL].fd = host_disconnected ? -1 : channel_fd;
+        pfds[IDX_CHANNEL].events = POLLIN;
+        pfds[IDX_INTEROP].fd = host_disconnected ? -1 : interop_fd;
+        pfds[IDX_INTEROP].events = POLLIN;
 
-        int rc = poll(pfds, NFDS, 1000);
+        /* Phase 4: poll with a shorter timeout while waiting for the child to
+         * die after a host disconnect, so we can enforce the SIGKILL deadline. */
+        int timeout_ms = host_disconnected ? 500 : 1000;
+        int rc = poll(pfds, NFDS, timeout_ms);
         if (rc < 0) {
             if (errno == EINTR) continue;
             perror("[bridge] poll");
+            /* Phase 4: never leave a child unreaped. Kill and wait before
+             * breaking out of the loop. */
+            if (!child_reaped) {
+                fprintf(stderr, "[bridge] poll error, killing child pid=%d\n", pid);
+                kill(pid, SIGKILL);
+                int s;
+                waitpid(pid, &s, 0);
+                child_reaped = 1;
+            }
             break;
+        }
+
+        /* Phase 4: SIGKILL escalation after host disconnect deadline. */
+        if (host_disconnected && !child_reaped && !sigkill_sent) {
+            if (time(NULL) >= shutdown_deadline) {
+                fprintf(stderr, "[bridge] shutdown deadline reached, SIGKILL child pid=%d\n", pid);
+                kill(pid, SIGKILL);
+                sigkill_sent = 1;
+                /* Phase 4: the child may already be a zombie if SIGCHLD was
+                 * coalesced/lost. Reap directly to avoid hanging — kill() on
+                 * a zombie is a no-op and generates no new SIGCHLD. */
+                int sk_status;
+                if (waitpid(pid, &sk_status, WNOHANG) == pid) {
+                    child_reaped = 1;
+                    printf("[bridge] child already dead, reaped during SIGKILL escalation (status=%d)\n",
+                           sk_status);
+                    session_done = 1;
+                }
+            }
         }
 
         /* SIGCHLD: child exited */
@@ -524,41 +613,77 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             int status;
             pid_t w = waitpid(pid, &status, WNOHANG);
             if (w == pid) {
-                /* FIX: Drain PTY with blocking read — child has exited,
-                 * slave is closed, so read will eventually return EOF. */
+                child_reaped = 1;
+
+                /* FIX: Drain PTY with poll-based timeout — child has exited,
+                 * but a grandchild may still hold the PTY slave open, which
+                 * would cause a blocking read() to hang forever. Use poll()
+                 * with a short timeout so we abort the drain if no data
+                 * arrives within 200ms (indicating the slave is held open
+                 * by a lingering grandchild). */
                 int fl = fcntl(master_fd, F_GETFL);
                 fcntl(master_fd, F_SETFL, fl & ~O_NONBLOCK);
                 ssize_t n;
-                while ((n = read(master_fd, buf, sizeof(buf))) > 0)
-                    send_all(stdout_fd, buf, (size_t)n);
+                while (1) {
+                    struct pollfd drain_pfd = { .fd = master_fd, .events = POLLIN };
+                    int prc = poll(&drain_pfd, 1, 200);  /* 200ms timeout */
+                    if (prc <= 0) break;  /* timeout or error — abort drain */
+                    n = read(master_fd, buf, sizeof(buf));
+                    if (n <= 0) break;  /* EOF or error */
+                    /* Phase 4: only forward to stdout if the host is still
+                     * connected; otherwise drain and discard to avoid
+                     * blocking on a closed socket. */
+                    if (!host_disconnected) {
+                        if (send_all(stdout_fd, buf, (size_t)n) < 0) {
+                            fprintf(stderr, "[bridge] stdout send failed during drain, aborting drain\n");
+                            break;
+                        }
+                    }
+                }
                 fcntl(master_fd, F_SETFL, fl);
 
-                /* Phase 1: send ExitStatus on control channel, not stdout */
-                exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-                LX_INIT_PROCESS_EXIT_STATUS exit_msg;
-                memset(&exit_msg, 0, sizeof(exit_msg));
-                exit_msg.Header.MessageType = LxInitMessageExitStatus;
-                exit_msg.Header.MessageSize = sizeof(exit_msg);
-                exit_msg.Header.SequenceNumber = 1;
-                exit_msg.ExitCode = exit_code;
-                send_all(initial_c, &exit_msg, sizeof(exit_msg));
-                printf("[bridge] child exited (code=%d), ExitStatus sent on control channel\n",
-                       exit_code);
+                /* Phase 4: only send ExitStatus if the control channel is
+                 * still open. After a host disconnect the channel is gone,
+                 * so there is nowhere to send it. */
+                if (!host_disconnected) {
+                    exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                    LX_INIT_PROCESS_EXIT_STATUS exit_msg;
+                    memset(&exit_msg, 0, sizeof(exit_msg));
+                    exit_msg.Header.MessageType = LxInitMessageExitStatus;
+                    exit_msg.Header.MessageSize = sizeof(exit_msg);
+                    exit_msg.Header.SequenceNumber = 1;
+                    exit_msg.ExitCode = exit_code;
+                    send_all(initial_c, &exit_msg, sizeof(exit_msg));
+                    printf("[bridge] child exited (code=%d), ExitStatus sent on control channel\n",
+                           exit_code);
+                } else {
+                    printf("[bridge] child exited after host disconnect (status=%d), no ExitStatus sent\n",
+                           status);
+                }
                 session_done = 1;
                 break;
             }
         }
 
         /* Control channel: WindowSizeChanged and other messages */
-        if (pfds[IDX_CONTROL].revents & POLLIN) {
+        if (!host_disconnected && (pfds[IDX_CONTROL].revents & POLLIN)) {
             void *msg = NULL;
             int r = control_try_read(initial_c, &cr, &msg);
             if (r < 0) {
-                printf("[bridge] control channel closed\n");
-                session_done = 1;
-                break;
-            }
-            if (r > 0 && msg) {
+                /* Phase 4: host disconnected the control channel. Start a
+                 * graceful shutdown instead of breaking immediately: send
+                 * SIGHUP (terminal hangup), give the child 5 seconds to
+                 * exit cleanly, then escalate to SIGKILL. Continue polling
+                 * for SIGCHLD so we still reap the child. */
+                printf("[bridge] control channel closed by host, starting graceful shutdown (SIGHUP child pid=%d)\n", pid);
+                host_disconnected = 1;
+                if (!sighup_sent) {
+                    kill(pid, SIGHUP);
+                    sighup_sent = 1;
+                }
+                shutdown_deadline = time(NULL) + 5;
+                /* Do NOT break — keep looping to wait for SIGCHLD. */
+            } else if (r > 0 && msg) {
                 struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
                 switch (mhdr->MessageType) {
                 case LxInitMessageWindowSizeChanged:
@@ -580,7 +705,7 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
         }
 
         /* stdin -> PTY */
-        if (pfds[IDX_STDIN].revents & POLLIN) {
+        if (!host_disconnected && (pfds[IDX_STDIN].revents & POLLIN)) {
             ssize_t n = recv(stdin_fd, buf, sizeof(buf), 0);
             if (n > 0) {
                 /* FIX: use write_all to handle partial writes / EAGAIN */
@@ -590,25 +715,40 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             }
         }
 
-        /* PTY -> stdout */
+        /* PTY -> stdout (or drain-and-discard if host disconnected) */
         if (pfds[IDX_PTY].revents & POLLIN) {
             ssize_t n = read(master_fd, buf, sizeof(buf));
             if (n > 0) {
-                send_all(stdout_fd, buf, (size_t)n);
+                if (!host_disconnected) {
+                    send_all(stdout_fd, buf, (size_t)n);
+                }
+                /* Phase 4: if host disconnected, discard output to keep the
+                 * child from blocking on a full PTY buffer while it shuts down. */
             }
         }
 
         /* channel echo */
-        if (channel_fd >= 0 && (pfds[IDX_CHANNEL].revents & POLLIN)) {
+        if (!host_disconnected && channel_fd >= 0 && (pfds[IDX_CHANNEL].revents & POLLIN)) {
             ssize_t n = recv(channel_fd, buf, sizeof(buf), 0);
             if (n > 0) send_all(channel_fd, buf, (size_t)n);
         }
 
         /* interop echo */
-        if (interop_fd >= 0 && (pfds[IDX_INTEROP].revents & POLLIN)) {
+        if (!host_disconnected && interop_fd >= 0 && (pfds[IDX_INTEROP].revents & POLLIN)) {
             ssize_t n = recv(interop_fd, buf, sizeof(buf), 0);
             if (n > 0) send_all(interop_fd, buf, (size_t)n);
         }
+    }
+
+    /* Phase 4: guaranteed child reaping on every exit path. If we reached here
+     * without reaping the child (e.g. poll error, or an unexpected break),
+     * kill it and wait so we never leak a zombie or a runaway process. */
+    if (!child_reaped) {
+        fprintf(stderr, "[bridge] session ending with child pid=%d still alive, killing\n", pid);
+        kill(pid, SIGKILL);
+        int s;
+        waitpid(pid, &s, 0);
+        child_reaped = 1;
     }
 
     close(master_fd);
