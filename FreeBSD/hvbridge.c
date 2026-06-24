@@ -197,6 +197,53 @@ static void free_create_process_info(struct create_process_info *info)
     free(info);
 }
 
+/* Phase 5: Ensure terminal color environment defaults are present.
+ * If TERM is not set, default to "xterm-256color" (matching the WSL host
+ * default in wslservice.idl / DistributionRegistration.h). If COLORTERM is
+ * not set, add "truecolor" to enable 24-bit color detection by modern
+ * applications (ls, grep, vim, etc.). */
+static void ensure_env_defaults(struct create_process_info *info)
+{
+    if (!info) return;
+
+    /* Count existing entries */
+    size_t count = 0;
+    if (info->envp) {
+        while (info->envp[count]) count++;
+    }
+
+    /* Check for TERM and COLORTERM prefixes */
+    int has_term = 0, has_colorterm = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (strncmp(info->envp[i], "TERM=", 5) == 0)
+            has_term = 1;
+        if (strncmp(info->envp[i], "COLORTERM=", 10) == 0)
+            has_colorterm = 1;
+    }
+
+    int to_add = 0;
+    if (!has_term) to_add++;
+    if (!has_colorterm) to_add++;
+    if (to_add == 0) return;
+
+    /* Reallocate envp: count + to_add + 1 (NULL terminator) */
+    char **new_envp = realloc(info->envp, (count + to_add + 1) * sizeof(char *));
+    if (!new_envp) return;  /* allocation failure — proceed with existing env */
+    info->envp = new_envp;
+
+    if (!has_term) {
+        info->envp[count] = strdup("TERM=xterm-256color");
+        printf("[bridge] injected default TERM=xterm-256color\n");
+        count++;
+    }
+    if (!has_colorterm) {
+        info->envp[count] = strdup("COLORTERM=truecolor");
+        printf("[bridge] injected default COLORTERM=truecolor\n");
+        count++;
+    }
+    info->envp[count] = NULL;
+}
+
 static void sigchld_handler(int sig)
 {
     (void)sig;
@@ -845,6 +892,9 @@ int main(void) {
         /* Phase 2: parse CreateProcess info (filename, cwd, argv, envp) */
         struct create_process_info *proc_info =
             parse_create_process_info(g_initial_message, g_initial_message_size);
+
+        /* Phase 5: inject terminal color env defaults (TERM, COLORTERM) */
+        ensure_env_defaults(proc_info);
 
         /* Accept 5 additional sockets: stdin/stdout/stderr/channel/interop */
         int client_sockets[NUM_ADDITIONAL_SOCKETS];

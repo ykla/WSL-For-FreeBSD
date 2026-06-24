@@ -35,6 +35,13 @@
  *  17. New session works after a previous session's host disconnect
  *  18. Grandchild holding PTY slave does not hang drain (poll timeout works)
  *  19. New session works after grandchild PTY inheritance test
+ *
+ * Phase 5 test checks:
+ *  20. TERM env var passed through from host (not overwritten)
+ *  21. COLORTERM=truecolor injected by bridge when not set by host
+ *  22. ANSI basic color (16-color) passthrough through raw PTY
+ *  23. ANSI 256-color passthrough through raw PTY
+ *  24. ANSI truecolor (24-bit) passthrough through raw PTY
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,7 +199,7 @@ static int setup_bridge_session(int *out_init_fd, int *out_control_fd,
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
-    printf("=== WSL Mock Host — Phase 4 Test Harness ===\n\n");
+    printf("=== WSL Mock Host — Phase 5 Test Harness ===\n\n");
 
     /* Listen on port 50000 for guest connections */
     int listen_fd = listen_on_port(PORT_HVS);
@@ -649,6 +656,118 @@ int main(void)
     CHECK(strstr(outbuf, "50 200") != NULL,
           "Phase 3: resize back to large 50x200",
           "output='%s'", outbuf);
+
+    /* ---- Step 10d (Phase 5): TERM env var passed through from host ---- */
+    printf("\n[host] Step 10d: Phase 5 TERM env var verification...\n");
+    {
+        /* The mock host sends TERM=xterm. The bridge should NOT overwrite
+         * it with xterm-256color since TERM is already set. */
+        const char *cmd = "echo TERM_IS_$TERM\n";
+        send_all(extra[0], cmd, strlen(cmd));
+
+        memset(outbuf, 0, sizeof(outbuf));
+        total = 0;
+        for (int attempt = 0; attempt < 30; attempt++) {
+            int n = read_with_timeout(extra[1], outbuf + total, sizeof(outbuf) - total, 200);
+            if (n > 0) total += n;
+            else break;
+        }
+        printf("  Output: '%s'\n", outbuf);
+        CHECK(strstr(outbuf, "TERM_IS_xterm") != NULL,
+              "Phase 5: TERM passed through from host (not overwritten)",
+              "output='%s'", outbuf);
+    }
+
+    /* ---- Step 10e (Phase 5): COLORTERM injected by bridge ---- */
+    printf("\n[host] Step 10e: Phase 5 COLORTERM injection verification...\n");
+    {
+        /* The mock host does NOT send COLORTERM. The bridge should inject
+         * COLORTERM=truecolor for 24-bit color detection. */
+        const char *cmd = "echo CT_IS_$COLORTERM\n";
+        send_all(extra[0], cmd, strlen(cmd));
+
+        memset(outbuf, 0, sizeof(outbuf));
+        total = 0;
+        for (int attempt = 0; attempt < 30; attempt++) {
+            int n = read_with_timeout(extra[1], outbuf + total, sizeof(outbuf) - total, 200);
+            if (n > 0) total += n;
+            else break;
+        }
+        printf("  Output: '%s'\n", outbuf);
+        CHECK(strstr(outbuf, "CT_IS_truecolor") != NULL,
+              "Phase 5: COLORTERM=truecolor injected by bridge",
+              "output='%s'", outbuf);
+    }
+
+    /* ---- Step 10f (Phase 5): ANSI basic color (16-color) passthrough ---- */
+    printf("\n[host] Step 10f: Phase 5 ANSI basic color passthrough...\n");
+    {
+        /* Send: printf '\033[31mRED\033[0m'
+         * The PTY is in raw mode (Phase 3), so ANSI escape codes should
+         * pass through unchanged. We verify the raw ESC[31m...ESC[0m
+         * sequence appears in the output. */
+        const char *cmd = "printf '\\033[31mRED\\033[0m'\n";
+        send_all(extra[0], cmd, strlen(cmd));
+
+        memset(outbuf, 0, sizeof(outbuf));
+        total = 0;
+        for (int attempt = 0; attempt < 30; attempt++) {
+            int n = read_with_timeout(extra[1], outbuf + total, sizeof(outbuf) - total, 200);
+            if (n > 0) total += n;
+            else break;
+        }
+        /* Look for raw ESC[31mRED ESC[0m sequence */
+        const char *expected = "\033[31mRED\033[0m";
+        printf("  Output (hex): ");
+        for (int i = 0; i < total && i < 40; i++)
+            printf("%02x ", (unsigned char)outbuf[i]);
+        printf("\n");
+        CHECK(strstr(outbuf, expected) != NULL,
+              "Phase 5: ANSI basic color (red) passthrough",
+              "expected ESC[31mRED ESC[0m in output");
+    }
+
+    /* ---- Step 10g (Phase 5): ANSI 256-color passthrough ---- */
+    printf("\n[host] Step 10g: Phase 5 ANSI 256-color passthrough...\n");
+    {
+        /* Send: printf '\033[38;5;196mC256\033[0m'
+         * 38;5;196 = foreground color 196 (bright red) in 256-color mode */
+        const char *cmd = "printf '\\033[38;5;196mC256\\033[0m'\n";
+        send_all(extra[0], cmd, strlen(cmd));
+
+        memset(outbuf, 0, sizeof(outbuf));
+        total = 0;
+        for (int attempt = 0; attempt < 30; attempt++) {
+            int n = read_with_timeout(extra[1], outbuf + total, sizeof(outbuf) - total, 200);
+            if (n > 0) total += n;
+            else break;
+        }
+        const char *expected = "\033[38;5;196mC256\033[0m";
+        CHECK(strstr(outbuf, expected) != NULL,
+              "Phase 5: ANSI 256-color passthrough",
+              "expected ESC[38;5;196mC256 ESC[0m in output");
+    }
+
+    /* ---- Step 10h (Phase 5): ANSI truecolor (24-bit) passthrough ---- */
+    printf("\n[host] Step 10h: Phase 5 ANSI truecolor (24-bit) passthrough...\n");
+    {
+        /* Send: printf '\033[38;2;255;0;0mTC24\033[0m'
+         * 38;2;255;0;0 = foreground RGB(255,0,0) in truecolor mode */
+        const char *cmd = "printf '\\033[38;2;255;0;0mTC24\\033[0m'\n";
+        send_all(extra[0], cmd, strlen(cmd));
+
+        memset(outbuf, 0, sizeof(outbuf));
+        total = 0;
+        for (int attempt = 0; attempt < 30; attempt++) {
+            int n = read_with_timeout(extra[1], outbuf + total, sizeof(outbuf) - total, 200);
+            if (n > 0) total += n;
+            else break;
+        }
+        const char *expected = "\033[38;2;255;0;0mTC24\033[0m";
+        CHECK(strstr(outbuf, expected) != NULL,
+              "Phase 5: ANSI truecolor (24-bit) passthrough",
+              "expected ESC[38;2;255;0;0mTC24 ESC[0m in output");
+    }
 
     /* ---- Step 11: Send exit, read ExitStatus from control channel ---- */
     printf("\n[host] Step 11: Sending 'exit', waiting for ExitStatus on control channel...\n");
