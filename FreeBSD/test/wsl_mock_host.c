@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * wsl_mock_host.c - Mock WSL host for testing Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 fixes.
+ * wsl_mock_host.c - Mock WSL host for testing Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 fixes.
  *
  * Simulates wslservice.exe: listens on port 50000, accepts guest
  * connections, sends WSL protocol messages, and validates the
@@ -42,6 +42,14 @@
  *  22. ANSI basic color (16-color) passthrough through raw PTY
  *  23. ANSI 256-color passthrough through raw PTY
  *  24. ANSI truecolor (24-bit) passthrough through raw PTY
+ *  25. OSC color theme switching (palette/fg/bg set + reset) passthrough
+ *      combined with grandchild PTY drain timeout (ExitStatus still received)
+ *  26. New session works after color theme + grandchild combined test
+ *
+ * Phase 6 test checks:
+ *  27. Guest→host window size notification: stty resize inside guest triggers
+ *      WindowSizeChanged(10) on control channel (TIOCGWINSZ polling)
+ *  28. Host→guest resize does NOT trigger feedback notification (loop prevention)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -199,7 +207,7 @@ static int setup_bridge_session(int *out_init_fd, int *out_control_fd,
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
-    printf("=== WSL Mock Host — Phase 5 Test Harness ===\n\n");
+    printf("=== WSL Mock Host — Phase 6 Test Harness ===\n\n");
 
     /* Listen on port 50000 for guest connections */
     int listen_fd = listen_on_port(PORT_HVS);
@@ -1125,6 +1133,447 @@ int main(void)
                 for (int i = 0; i < 5; i++) close(gc2_extra[i]);
                 close(gc2_init_fd);
                 close(gc2_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 17 (Phase 5): Color theme switching + grandchild PTY drain timeout ---- */
+    /* Combined test: send OSC color theme switching sequences (palette/fg/bg),
+     * verify raw passthrough through the PTY, then fork a grandchild holding
+     * the PTY slave and exit the shell. The bridge must drain the PTY with
+     * the 200ms poll timeout (not block forever) and send ExitStatus even
+     * though the grandchild keeps the slave open. This verifies that color
+     * theme switching traffic does not interfere with the Phase 4 drain fix. */
+    printf("\n[host] Step 17: Phase 5 color theme switching + grandchild PTY drain timeout...\n");
+    {
+        int ct_init_fd = -1, ct_control_fd = -1;
+        if (setup_bridge_session(&ct_init_fd, &ct_control_fd, 24, 80, 17, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup color theme session\n");
+            CHECK(0, "Phase 5: color theme session setup", "connect failed");
+        } else {
+            int ct_extra[5];
+            int ct_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                ct_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (ct_extra[i] < 0) { ct_extra_ok = 0; break; }
+            }
+
+            if (!ct_extra_ok) {
+                CHECK(0, "Phase 5: color theme session extra sockets", "connect failed");
+                close(ct_init_fd); close(ct_control_fd);
+                for (int i = 0; i < 5; i++) if (ct_extra[i] >= 0) close(ct_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* Send OSC palette change: ESC]4;0;rgb:1e/1e/2e BEL
+                 * Sets palette index 0 (black) to RGB(30,30,46) — a dark
+                 * color typical of "Dracula"-style themes. */
+                const char *osc_palette = "printf '\\033]4;0;rgb:1e/1e/2e\\007'\n";
+                send_all(ct_extra[0], osc_palette, strlen(osc_palette));
+                printf("  Sent OSC palette change (index 0 -> rgb:1e/1e/2e)\n");
+
+                /* Send OSC foreground change: ESC]10;rgb:f3/8b/ae BEL
+                 * Sets foreground to RGB(243,139,174) — a pinkish color. */
+                const char *osc_fg = "printf '\\033]10;rgb:f3/8b/ae\\007'\n";
+                send_all(ct_extra[0], osc_fg, strlen(osc_fg));
+                printf("  Sent OSC foreground change (-> rgb:f3/8b/ae)\n");
+
+                /* Send OSC background change: ESC]11;rgb:1e/1e/2e BEL */
+                const char *osc_bg = "printf '\\033]11;rgb:1e/1e/2e\\007'\n";
+                send_all(ct_extra[0], osc_bg, strlen(osc_bg));
+                printf("  Sent OSC background change (-> rgb:1e/1e/2e)\n");
+
+                /* Drain and verify all three OSC sequences passed through raw */
+                char ct_buf[2048];
+                memset(ct_buf, 0, sizeof(ct_buf));
+                int ct_total = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    int n = read_with_timeout(ct_extra[1], ct_buf + ct_total,
+                                              sizeof(ct_buf) - ct_total - 1, 200);
+                    if (n > 0) ct_total += n;
+                    else break;
+                }
+                printf("  Output (hex, first 80 bytes): ");
+                for (int i = 0; i < ct_total && i < 80; i++)
+                    printf("%02x ", (unsigned char)ct_buf[i]);
+                printf("\n");
+
+                /* Expected raw OSC sequences (with BEL terminator 0x07) */
+                const char *exp_palette = "\033]4;0;rgb:1e/1e/2e\007";
+                const char *exp_fg = "\033]10;rgb:f3/8b/ae\007";
+                const char *exp_bg = "\033]11;rgb:1e/1e/2e\007";
+                CHECK(strstr(ct_buf, exp_palette) != NULL,
+                      "Phase 5: OSC palette change (ESC]4;0;...) passthrough",
+                      "raw OSC sequence not found in output");
+                CHECK(strstr(ct_buf, exp_fg) != NULL,
+                      "Phase 5: OSC foreground change (ESC]10;...) passthrough",
+                      "raw OSC sequence not found in output");
+                CHECK(strstr(ct_buf, exp_bg) != NULL,
+                      "Phase 5: OSC background change (ESC]11;...) passthrough",
+                      "raw OSC sequence not found in output");
+
+                /* Send OSC reset sequences and verify passthrough */
+                const char *osc_reset_palette = "printf '\\033]104\\007'\n";
+                const char *osc_reset_fg = "printf '\\033]110\\007'\n";
+                const char *osc_reset_bg = "printf '\\033]111\\007'\n";
+                send_all(ct_extra[0], osc_reset_palette, strlen(osc_reset_palette));
+                send_all(ct_extra[0], osc_reset_fg, strlen(osc_reset_fg));
+                send_all(ct_extra[0], osc_reset_bg, strlen(osc_reset_bg));
+                printf("  Sent OSC reset sequences (104/110/111)\n");
+
+                memset(ct_buf, 0, sizeof(ct_buf));
+                ct_total = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    int n = read_with_timeout(ct_extra[1], ct_buf + ct_total,
+                                              sizeof(ct_buf) - ct_total - 1, 200);
+                    if (n > 0) ct_total += n;
+                    else break;
+                }
+                const char *exp_rst_pal = "\033]104\007";
+                const char *exp_rst_fg = "\033]110\007";
+                const char *exp_rst_bg = "\033]111\007";
+                CHECK(strstr(ct_buf, exp_rst_pal) != NULL,
+                      "Phase 5: OSC palette reset (ESC]104) passthrough",
+                      "raw OSC reset sequence not found");
+                CHECK(strstr(ct_buf, exp_rst_fg) != NULL,
+                      "Phase 5: OSC foreground reset (ESC]110) passthrough",
+                      "raw OSC reset sequence not found");
+                CHECK(strstr(ct_buf, exp_rst_bg) != NULL,
+                      "Phase 5: OSC background reset (ESC]111) passthrough",
+                      "raw OSC reset sequence not found");
+
+                /* Now fork a grandchild that holds the PTY slave open, then
+                 * exit the shell. This is the critical combined test: after
+                 * extensive OSC color theme traffic, the bridge must still
+                 * correctly drain the PTY with the 200ms poll timeout and
+                 * deliver ExitStatus despite the grandchild holding the slave. */
+                const char *bg_cmd = "sleep 60 &\n";
+                send_all(ct_extra[0], bg_cmd, strlen(bg_cmd));
+                printf("  Sent '%s' to fork grandchild holding PTY slave\n", bg_cmd);
+
+                /* Drain job control output */
+                memset(ct_buf, 0, sizeof(ct_buf));
+                for (int attempt = 0; attempt < 10; attempt++) {
+                    int n = read_with_timeout(ct_extra[1], ct_buf, sizeof(ct_buf) - 1, 300);
+                    if (n <= 0) break;
+                }
+
+                /* Exit shell — grandchild still holds PTY slave */
+                const char *exit_cmd = "exit\n";
+                send_all(ct_extra[0], exit_cmd, strlen(exit_cmd));
+                printf("  Sent 'exit' — shell exits, grandchild still holds PTY slave\n");
+
+                /* Drain remaining stdout */
+                memset(ct_buf, 0, sizeof(ct_buf));
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    int n = read_with_timeout(ct_extra[1], ct_buf, sizeof(ct_buf) - 1, 200);
+                    if (n <= 0) break;
+                }
+
+                /* Read ExitStatus from control channel. With the Phase 4 drain
+                 * timeout fix, ExitStatus should arrive within a few seconds
+                 * even though the grandchild holds the PTY slave. Without the
+                 * fix, the bridge would hang forever in the blocking drain
+                 * loop after processing all the OSC color traffic. */
+                int got_ct_exit = 0;
+                LX_INIT_PROCESS_EXIT_STATUS ct_exit_status;
+                memset(&ct_exit_status, 0, sizeof(ct_exit_status));
+
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    void *msg = recv_message(ct_control_fd, &hdr);
+                    if (!msg) { usleep(100000); continue; }
+                    struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
+                    if (mhdr->MessageType == LxInitMessageExitStatus &&
+                        mhdr->MessageSize >= sizeof(LX_INIT_PROCESS_EXIT_STATUS)) {
+                        memcpy(&ct_exit_status, msg, sizeof(ct_exit_status));
+                        got_ct_exit = 1;
+                        free(msg);
+                        break;
+                    }
+                    free(msg);
+                }
+
+                CHECK(got_ct_exit,
+                      "Phase 5: ExitStatus received after color theme switching + grandchild (drain timeout works)",
+                      "not received — bridge may be hung in drain loop after OSC traffic");
+
+                if (got_ct_exit) {
+                    printf("  ExitStatus received: ExitCode=%d\n", ct_exit_status.ExitCode);
+                }
+
+                /* Close session sockets. The orphaned grandchild (sleep 60)
+                 * will be cleaned up when the test process exits. */
+                for (int i = 0; i < 5; i++) close(ct_extra[i]);
+                close(ct_init_fd);
+                close(ct_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 18 (Phase 5): New session after color theme + grandchild test ---- */
+    printf("\n[host] Step 18: Phase 5 new session after color theme + grandchild test (verify no deadlock)...\n");
+    {
+        int ct2_init_fd = -1, ct2_control_fd = -1;
+        if (setup_bridge_session(&ct2_init_fd, &ct2_control_fd, 24, 80, 18, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup post-color-theme session (bridge may be deadlocked)\n");
+            CHECK(0, "Phase 5: new session after color theme + grandchild test", "connect failed (deadlock?)");
+        } else {
+            int ct2_extra[5];
+            int ct2_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                ct2_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (ct2_extra[i] < 0) { ct2_extra_ok = 0; break; }
+            }
+
+            if (!ct2_extra_ok) {
+                CHECK(0, "Phase 5: post-color-theme extra sockets", "connect failed");
+                close(ct2_init_fd); close(ct2_control_fd);
+                for (int i = 0; i < 5; i++) if (ct2_extra[i] >= 0) close(ct2_extra[i]);
+            } else {
+                CHECK(1, "Phase 5: new session accepted after color theme + grandchild test (no deadlock)", "ok");
+
+                /* Quick echo test to confirm the session is fully functional */
+                usleep(300000);
+                const char *echo_cmd = "echo color_theme_ok\n";
+                send_all(ct2_extra[0], echo_cmd, strlen(echo_cmd));
+
+                char ct2_out[4096];
+                memset(ct2_out, 0, sizeof(ct2_out));
+                int ct2_total = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    int n = read_with_timeout(ct2_extra[1], ct2_out + ct2_total,
+                                              sizeof(ct2_out) - ct2_total - 1, 200);
+                    if (n > 0) ct2_total += n;
+                    else break;
+                }
+                printf("  Console output: '%s'\n", ct2_out);
+                CHECK(strstr(ct2_out, "color_theme_ok") != NULL,
+                      "Phase 5: console I/O works after color theme + grandchild test",
+                      "output='%s'", ct2_out);
+
+                /* Send exit and close */
+                send_all(ct2_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(ct2_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(ct2_extra[i]);
+                close(ct2_init_fd);
+                close(ct2_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 19 (Phase 6): Guest→host window size notification ---- */
+    /* Change the terminal size from inside the guest using stty. The bridge
+     * detects the change via periodic TIOCGWINSZ polling and sends a
+     * WindowSizeChanged(10) message to the host on the control channel. */
+    printf("\n[host] Step 19: Phase 6 guest→host window size notification (stty resize)...\n");
+    {
+        int ws_init_fd = -1, ws_control_fd = -1;
+        if (setup_bridge_session(&ws_init_fd, &ws_control_fd, 24, 80, 19, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup window size notification session\n");
+            CHECK(0, "Phase 6: notification session setup", "connect failed");
+        } else {
+            int ws_extra[5];
+            int ws_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                ws_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (ws_extra[i] < 0) { ws_extra_ok = 0; break; }
+            }
+
+            if (!ws_extra_ok) {
+                CHECK(0, "Phase 6: notification session extra sockets", "connect failed");
+                close(ws_init_fd); close(ws_control_fd);
+                for (int i = 0; i < 5; i++) if (ws_extra[i] >= 0) close(ws_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* Change the terminal size from inside the guest using stty.
+                 * This calls ioctl(slave_fd, TIOCSWINSZ) on the PTY slave,
+                 * which changes the kernel's winsize. The bridge detects
+                 * this via periodic TIOCGWINSZ polling (every 1s) and sends
+                 * a WindowSizeChanged(10) message to the host. */
+                const char *stty_cmd = "stty rows 50 cols 100\n";
+                send_all(ws_extra[0], stty_cmd, strlen(stty_cmd));
+                printf("  Sent '%s' to change terminal size inside guest\n", stty_cmd);
+
+                /* Drain shell output (stty produces no output, but prompt may) */
+                char ws_buf[512];
+                for (int attempt = 0; attempt < 10; attempt++) {
+                    int n = read_with_timeout(ws_extra[1], ws_buf, sizeof(ws_buf) - 1, 200);
+                    if (n <= 0) break;
+                }
+
+                /* Wait for the bridge to detect the size change and send a
+                 * WindowSizeChanged(10) on the control channel. The bridge
+                 * checks every 1 second, so wait up to 5 seconds. Use select
+                 * to avoid blocking in recv_message when no data is available. */
+                int got_ws_notify = 0;
+                unsigned short notify_rows = 0, notify_cols = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    fd_set rfds;
+                    FD_ZERO(&rfds);
+                    FD_SET(ws_control_fd, &rfds);
+                    struct timeval tv = {0, 100000};  /* 100ms */
+                    int rc = select(ws_control_fd + 1, &rfds, NULL, NULL, &tv);
+                    if (rc > 0) {
+                        void *msg = recv_message(ws_control_fd, &hdr);
+                        if (msg) {
+                            struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
+                            if (mhdr->MessageType == LxInitMessageWindowSizeChanged &&
+                                mhdr->MessageSize >= sizeof(LX_INIT_WINDOW_SIZE_CHANGED)) {
+                                LX_INIT_WINDOW_SIZE_CHANGED *wsc =
+                                    (LX_INIT_WINDOW_SIZE_CHANGED *)msg;
+                                notify_rows = wsc->Rows;
+                                notify_cols = wsc->Columns;
+                                got_ws_notify = 1;
+                                free(msg);
+                                break;
+                            }
+                            free(msg);
+                        }
+                    }
+                }
+
+                CHECK(got_ws_notify,
+                      "Phase 6: WindowSizeChanged received from guest after stty resize",
+                      "not received — bridge may not be polling TIOCGWINSZ");
+                if (got_ws_notify) {
+                    printf("  Received WindowSizeChanged: rows=%u, cols=%u\n",
+                           notify_rows, notify_cols);
+                    CHECK(notify_rows == 50,
+                          "Phase 6: notified rows==50 (guest stty rows 50)",
+                          "got %u", notify_rows);
+                    CHECK(notify_cols == 100,
+                          "Phase 6: notified cols==100 (guest stty cols 100)",
+                          "got %u", notify_cols);
+                }
+
+                /* Exit shell and drain ExitStatus */
+                send_all(ws_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(ws_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(ws_extra[i]);
+                close(ws_init_fd);
+                close(ws_control_fd);
+            }
+        }
+    }
+
+    /* ---- Step 20 (Phase 6): Host→guest resize then verify no feedback loop ---- */
+    /* Send a host→guest WindowSizeChanged, then verify the bridge does NOT
+     * send a WindowSizeChanged back (feedback loop prevention). The bridge
+     * updates its tracked size when applying a host-initiated resize, so the
+     * next TIOCGWINSZ poll sees the same size and suppresses notification. */
+    printf("\n[host] Step 20: Phase 6 host→guest resize then verify no feedback loop...\n");
+    {
+        int fb_init_fd = -1, fb_control_fd = -1;
+        if (setup_bridge_session(&fb_init_fd, &fb_control_fd, 24, 80, 20, NULL) < 0) {
+            fprintf(stderr, "  [FAIL] cannot setup feedback loop test session\n");
+            CHECK(0, "Phase 6: feedback loop session setup", "connect failed");
+        } else {
+            int fb_extra[5];
+            int fb_extra_ok = 1;
+            for (int i = 0; i < 5; i++) {
+                fb_extra[i] = connect_to_port(PORT_HVS_BSD);
+                if (fb_extra[i] < 0) { fb_extra_ok = 0; break; }
+            }
+
+            if (!fb_extra_ok) {
+                CHECK(0, "Phase 6: feedback loop extra sockets", "connect failed");
+                close(fb_init_fd); close(fb_control_fd);
+                for (int i = 0; i < 5; i++) if (fb_extra[i] >= 0) close(fb_extra[i]);
+            } else {
+                usleep(300000);
+
+                /* Send a host→guest WindowSizeChanged(10) on the control
+                 * channel. The bridge should apply it to the PTY via
+                 * TIOCSWINSZ and update its tracked size. The next
+                 * TIOCGWINSZ poll should see the same size, so NO
+                 * notification should be sent back to the host. */
+                LX_INIT_WINDOW_SIZE_CHANGED host_wsc;
+                memset(&host_wsc, 0, sizeof(host_wsc));
+                host_wsc.Header.MessageType = LxInitMessageWindowSizeChanged;
+                host_wsc.Header.MessageSize = sizeof(host_wsc);
+                host_wsc.Header.SequenceNumber = 201;
+                host_wsc.Rows = 30;
+                host_wsc.Columns = 120;
+                send_all(fb_control_fd, &host_wsc, sizeof(host_wsc));
+                printf("  Sent host→guest WindowSizeChanged: rows=30, cols=120\n");
+
+                /* Wait for the bridge to apply the resize */
+                usleep(500000);
+
+                /* Verify the PTY size was actually changed by querying stty */
+                const char *stty_size_cmd = "stty size\n";
+                send_all(fb_extra[0], stty_size_cmd, strlen(stty_size_cmd));
+
+                char fb_buf[512];
+                memset(fb_buf, 0, sizeof(fb_buf));
+                int fb_total = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    int n = read_with_timeout(fb_extra[1], fb_buf + fb_total,
+                                              sizeof(fb_buf) - fb_total - 1, 200);
+                    if (n > 0) fb_total += n;
+                    else break;
+                }
+                printf("  stty size output: '%s'\n", fb_buf);
+                /* stty size outputs "rows cols" (e.g. "30 120") */
+                CHECK(strstr(fb_buf, "30 120") != NULL,
+                      "Phase 6: host→guest resize applied to PTY (stty size shows 30 120)",
+                      "output='%s'", fb_buf);
+
+                /* Wait 3 seconds (3 poll cycles) to verify NO feedback
+                 * notification is sent back on the control channel. If the
+                 * feedback loop prevention is working, the bridge should NOT
+                 * send a WindowSizeChanged message after a host-initiated
+                 * resize. Use select to check for data without blocking. */
+                int feedback_detected = 0;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    fd_set rfds;
+                    FD_ZERO(&rfds);
+                    FD_SET(fb_control_fd, &rfds);
+                    struct timeval tv = {0, 100000};  /* 100ms */
+                    int rc = select(fb_control_fd + 1, &rfds, NULL, NULL, &tv);
+                    if (rc > 0) {
+                        /* Data arrived on control channel — check if it's
+                         * a WindowSizeChanged (feedback) */
+                        void *msg = recv_message(fb_control_fd, &hdr);
+                        if (msg) {
+                            struct MESSAGE_HEADER *mhdr =
+                                (struct MESSAGE_HEADER *)msg;
+                            if (mhdr->MessageType == LxInitMessageWindowSizeChanged) {
+                                feedback_detected = 1;
+                                printf("  Unexpected feedback WindowSizeChanged received!\n");
+                            }
+                            free(msg);
+                            if (feedback_detected) break;
+                        }
+                    }
+                }
+
+                CHECK(!feedback_detected,
+                      "Phase 6: no feedback notification after host→guest resize (loop prevention works)",
+                      "unexpected WindowSizeChanged received from guest");
+
+                /* Exit shell and drain ExitStatus */
+                send_all(fb_extra[0], "exit\n", 5);
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    void *msg = recv_message(fb_control_fd, &hdr);
+                    if (msg) { free(msg); break; }
+                    usleep(100000);
+                }
+
+                for (int i = 0; i < 5; i++) close(fb_extra[i]);
+                close(fb_init_fd);
+                close(fb_control_fd);
             }
         }
     }

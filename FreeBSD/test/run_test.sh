@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "============================================"
-echo "  WSL-For-FreeBSD Phase 5 Test Runner"
+echo "  WSL-For-FreeBSD Phase 6 Test Runner"
 echo "============================================"
 echo ""
 
@@ -73,7 +73,7 @@ wait 2>/dev/null || true
 echo ""
 if [ $HOST_EXIT -eq 0 ]; then
     echo "============================================"
-    echo "  RESULT: ALL PHASE 5 TESTS PASSED"
+    echo "  RESULT: ALL PHASE 6 TESTS PASSED"
     echo "============================================"
 else
     echo "============================================"

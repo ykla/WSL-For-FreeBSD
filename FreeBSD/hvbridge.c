@@ -232,14 +232,20 @@ static void ensure_env_defaults(struct create_process_info *info)
     info->envp = new_envp;
 
     if (!has_term) {
-        info->envp[count] = strdup("TERM=xterm-256color");
-        printf("[bridge] injected default TERM=xterm-256color\n");
-        count++;
+        char *s = strdup("TERM=xterm-256color");
+        if (s) {
+            info->envp[count] = s;
+            printf("[bridge] injected default TERM=xterm-256color\n");
+            count++;
+        }
     }
     if (!has_colorterm) {
-        info->envp[count] = strdup("COLORTERM=truecolor");
-        printf("[bridge] injected default COLORTERM=truecolor\n");
-        count++;
+        char *s = strdup("COLORTERM=truecolor");
+        if (s) {
+            info->envp[count] = s;
+            printf("[bridge] injected default COLORTERM=truecolor\n");
+            count++;
+        }
     }
     info->envp[count] = NULL;
 }
@@ -351,6 +357,29 @@ static int update_pty_winsize(int master_fd, unsigned short rows, unsigned short
         return -1;
     }
     return 0;
+}
+
+/* Phase 6: Send a WindowSizeChanged(10) message to the host on the control
+ * channel. Used for guest→host notification when the PTY size changes inside
+ * the guest (e.g. user runs 'stty rows 50 cols 100'). The host can then
+ * resize its pseudoconsole to match. This mirrors the reverse-direction
+ * notification in WSL's binfmt.cpp relay path. */
+static void notify_host_window_size(int control_fd, unsigned short rows,
+                                    unsigned short cols)
+{
+    LX_INIT_WINDOW_SIZE_CHANGED msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.Header.MessageType = LxInitMessageWindowSizeChanged;
+    msg.Header.MessageSize = sizeof(msg);
+    msg.Header.SequenceNumber = 0;  /* guest-initiated, no host seq to echo */
+    msg.Rows = rows;
+    msg.Columns = cols;
+    if (send_all(control_fd, &msg, sizeof(msg)) < 0) {
+        fprintf(stderr, "[bridge] failed to send WindowSizeChanged to host\n");
+    } else {
+        printf("[bridge] sent WindowSizeChanged to host: rows=%u, cols=%u\n",
+               rows, cols);
+    }
 }
 
 int receive_initial_message(int sock_fd)
@@ -593,6 +622,17 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
     int sigkill_sent = 0;           /* SIGKILL already sent */
     time_t shutdown_deadline = 0;   /* when to escalate to SIGKILL */
 
+    /* Phase 6: Track last-known window size for guest→host notification.
+     * When a program inside the guest changes the terminal size (e.g. stty),
+     * the bridge detects it via periodic TIOCGWINSZ polling and sends a
+     * WindowSizeChanged(10) message to the host on the control channel.
+     * tracked_rows/cols are updated both after host-initiated changes
+     * (to suppress feedback) and after guest-initiated changes (to track
+     * the new state). */
+    unsigned short tracked_rows = ws.ws_row;
+    unsigned short tracked_cols = ws.ws_col;
+    time_t last_size_check = time(NULL);
+
     enum { IDX_CONTROL, IDX_STDIN, IDX_PTY, IDX_SIGCHLD, IDX_CHANNEL, IDX_INTEROP, NFDS };
 
     while (!session_done) {
@@ -633,9 +673,15 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             break;
         }
 
+        /* Cache current time once per loop iteration for all time-based
+         * checks (SIGKILL deadline, window size poll). Avoids redundant
+         * time() syscalls — under heavy I/O the poll loop can wake up
+         * thousands of times per second. */
+        time_t now = time(NULL);
+
         /* Phase 4: SIGKILL escalation after host disconnect deadline. */
         if (host_disconnected && !child_reaped && !sigkill_sent) {
-            if (time(NULL) >= shutdown_deadline) {
+            if (now >= shutdown_deadline) {
                 fprintf(stderr, "[bridge] shutdown deadline reached, SIGKILL child pid=%d\n", pid);
                 kill(pid, SIGKILL);
                 sigkill_sent = 1;
@@ -648,6 +694,31 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                     printf("[bridge] child already dead, reaped during SIGKILL escalation (status=%d)\n",
                            sk_status);
                     session_done = 1;
+                }
+            }
+        }
+
+        /* Phase 6: Guest→host window size notification.
+         * Periodically poll the PTY size via TIOCGWINSZ. If the size changed
+         * since the last check (e.g. user ran 'stty rows 50'), send a
+         * WindowSizeChanged(10) message to the host on the control channel.
+         * This is the reverse of the host→guest direction (Phase 3).
+         * The bridge parent cannot receive SIGWINCH (it's not in the child's
+         * process group), so polling is the reliable detection mechanism.
+         * Check at most once per second to minimize overhead. */
+        if (!host_disconnected && now - last_size_check >= 1) {
+            last_size_check = now;
+            struct winsize cur_ws;
+            if (ioctl(master_fd, TIOCGWINSZ, &cur_ws) == 0) {
+                if (cur_ws.ws_row != tracked_rows ||
+                    cur_ws.ws_col != tracked_cols) {
+                    printf("[bridge] guest-side window size changed: %ux%u -> %ux%u, notifying host\n",
+                           tracked_cols, tracked_rows,
+                           cur_ws.ws_col, cur_ws.ws_row);
+                    tracked_rows = cur_ws.ws_row;
+                    tracked_cols = cur_ws.ws_col;
+                    notify_host_window_size(initial_c, cur_ws.ws_row,
+                                            cur_ws.ws_col);
                 }
             }
         }
@@ -740,6 +811,12 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                         printf("[bridge] WindowSizeChanged: rows=%u, cols=%u\n",
                                wsc->Rows, wsc->Columns);
                         update_pty_winsize(master_fd, wsc->Rows, wsc->Columns);
+                        /* Phase 6: update tracking to suppress feedback loop.
+                         * The size change was host-initiated, so the next
+                         * TIOCGWINSZ poll will see the new size and should
+                         * NOT send a notification back to the host. */
+                        tracked_rows = wsc->Rows;
+                        tracked_cols = wsc->Columns;
                     }
                     break;
                 default:
