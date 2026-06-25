@@ -160,9 +160,33 @@ typedef struct LX_GNS_RESULT {
 
 /* E3: Global flag controlling /etc/resolv.conf generation.
  * Set from wsl.conf [network] generateResolvConf (default true).
- * When false, gns_handle_network_information() skips writing resolv.conf.
- * Declared as non-static so hvinit_tcp.c / hvinit.c can set it via extern. */
+ * When false, gns_handle_network_information() skips writing resolv.conf. */
 static int g_generate_resolvconf = 1;
+
+#ifndef GNS_RESOLVCONF_PATH_DEFAULT
+#define GNS_RESOLVCONF_PATH_DEFAULT "/etc/resolv.conf"
+#endif
+
+/* Configurable resolv.conf target (default /etc/resolv.conf).
+ * Tests set this via gns_set_resolvconf_path() when WSL_TEST_ROOT is set. */
+static char g_resolvconf_path[256] = GNS_RESOLVCONF_PATH_DEFAULT;
+
+static inline void gns_set_resolvconf_path(const char *path)
+{
+    if (path && path[0]) {
+        strncpy(g_resolvconf_path, path, sizeof(g_resolvconf_path) - 1);
+        g_resolvconf_path[sizeof(g_resolvconf_path) - 1] = '\0';
+    } else {
+        strncpy(g_resolvconf_path, GNS_RESOLVCONF_PATH_DEFAULT,
+                sizeof(g_resolvconf_path) - 1);
+        g_resolvconf_path[sizeof(g_resolvconf_path) - 1] = '\0';
+    }
+}
+
+static inline const char *gns_get_resolvconf_path(void)
+{
+    return g_resolvconf_path;
+}
 
 /* ---- Helper: reliable send/recv (duplicated from wsl_protocol.h to keep
  *      this header self-contained for the production hvinit.c build). ---- */
@@ -267,17 +291,16 @@ static inline int gns_handle_network_information(void *msg_buf, size_t msg_size)
      * When false, skip writing /etc/resolv.conf — the guest keeps
      * its existing resolv.conf (user-managed or pre-configured). */
     if (!g_generate_resolvconf) {
-        printf("[gns] generateResolvConf=false, skipping /etc/resolv.conf write\n");
-        free((void *)file_header);
-        free((void *)file_contents);
+        printf("[gns] generateResolvConf=false, skipping %s write\n",
+               g_resolvconf_path);
         return 0;
     }
 
-    /* Write /etc/resolv.conf */
-    const char *resolv_path = "/etc/resolv.conf";
+    /* Write resolv.conf (path configurable for test harness) */
+    const char *resolv_path = g_resolvconf_path;
     FILE *fp = fopen(resolv_path, "w");
     if (!fp) {
-        perror("[gns] fopen /etc/resolv.conf");
+        fprintf(stderr, "[gns] fopen %s: %s\n", resolv_path, strerror(errno));
         return -1;
     }
     if (file_contents) {
@@ -289,7 +312,7 @@ static inline int gns_handle_network_information(void *msg_buf, size_t msg_size)
             fputc('\n', fp);
     }
     if (fclose(fp) != 0) {
-        perror("[gns] fclose /etc/resolv.conf");
+        fprintf(stderr, "[gns] fclose %s: %s\n", resolv_path, strerror(errno));
         return -1;
     }
     printf("[gns] wrote %s\n", resolv_path);

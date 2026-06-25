@@ -32,6 +32,7 @@ unsigned char   hvs_zero[sizeof(struct sockaddr) -
 };
 
 #define PORT_HVS              50000  // same port for all connections
+#define PORT_HVS_GNS          50001  // GNS engine channel
 #define PORT_HVS_BSD          60000
 
 // WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum)
@@ -325,6 +326,61 @@ static void initialize_filesystems(void)
 /* ---- Phase 1: Signal handling ---- */
 static int g_sigchld_pipe[2];
 
+/* C1: GNS engine child process */
+static pid_t g_gns_pid = -1;
+
+static int hv_connect(unsigned int port);
+
+static void gns_configure_test_paths(void)
+{
+    const char *test_root = getenv("WSL_TEST_ROOT");
+    if (test_root && test_root[0]) {
+        char path[512];
+        int n = snprintf(path, sizeof(path), "%s/resolv.conf", test_root);
+        if (n > 0 && (size_t)n < sizeof(path)) {
+            gns_set_resolvconf_path(path);
+            printf("[init] WSL_TEST_ROOT: resolv.conf -> %s\n", path);
+        }
+    }
+}
+
+static void gns_stop_engine(void)
+{
+    if (g_gns_pid > 0) {
+        kill(g_gns_pid, SIGTERM);
+        waitpid(g_gns_pid, NULL, 0);
+        printf("[init] GNS engine stopped (pid=%d)\n", (int)g_gns_pid);
+        g_gns_pid = -1;
+    }
+}
+
+static void gns_start_engine(int cap_fd, int notify_fd, int init_fd)
+{
+    int gns_fd = hv_connect(PORT_HVS_GNS);
+    if (gns_fd < 0) {
+        fprintf(stderr, "[init] GNS channel connect failed (non-fatal)\n");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("[init] gns fork");
+        close(gns_fd);
+        return;
+    }
+    if (pid == 0) {
+        close(cap_fd);
+        if (notify_fd >= 0) close(notify_fd);
+        close(init_fd);
+        gns_engine_loop(gns_fd);
+        _exit(0);
+    }
+
+    close(gns_fd);
+    g_gns_pid = pid;
+    printf("[init] GNS engine started (pid=%d)\n", (int)pid);
+}
+
 static void sigchld_handler(int sig)
 {
     (void)sig;
@@ -375,7 +431,10 @@ static void handle_terminate_instance(int init_fd, MESSAGE_HEADER *hdr)
     printf("[init] sent TerminateInstance response (seq=%u, result=0)\n",
            hdr->SequenceNumber);
 
-    /* 2. Unmount tracked filesystems in reverse order */
+    /* 2. Stop GNS engine child */
+    gns_stop_engine();
+
+    /* 3. Unmount tracked filesystems in reverse order */
     if (g_mounted_count > 0) {
         printf("[init] unmounting %d filesystem(s)...\n", g_mounted_count);
         int unmounted = fs_unmount_all();
@@ -735,6 +794,8 @@ static int hv_connect(unsigned int port) {
 }
 
 int main(void) {
+    gns_configure_test_paths();
+
     /* Phase 1: Initialize filesystems before handshake */
     initialize_filesystems();
 
@@ -1026,6 +1087,9 @@ if (r2 <= 0) {
     send_oobe_result(init_fd, 0, oobe_uid);
 }
 
+/* C1: Start GNS engine on dedicated channel (parallel to event loop) */
+gns_start_engine(cap_fd, notify_fd, init_fd);
+
 // --- 7. Receive and echo LX_INIT_CREATE_PROCESS_UTILITY_VM ---
 // handle_create_process_utility_vm(init_fd);
 
@@ -1045,6 +1109,7 @@ if (r2 <= 0) {
     }
 
     /* Clean up (only reached if event loop exits) */
+    gns_stop_engine();
     close(cap_fd);
     if (notify_fd >= 0) close(notify_fd);
     if (init_fd >= 0) close(init_fd);

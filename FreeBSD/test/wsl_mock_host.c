@@ -70,6 +70,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
+#include <poll.h>
+#include <sys/stat.h>
 
 #include "wsl_protocol.h"
 
@@ -236,12 +238,32 @@ static int setup_bridge_session(int *out_init_fd, int *out_control_fd,
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
-    printf("=== WSL Mock Host — Phase 8 Test Harness ===\n\n");
+    printf("=== WSL Mock Host — Phase 9 Test Harness ===\n\n");
+
+    /* Configure resolv.conf test path when WSL_TEST_ROOT is set */
+    {
+        const char *test_root = getenv("WSL_TEST_ROOT");
+        if (test_root && test_root[0]) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/resolv.conf", test_root);
+            gns_set_resolvconf_path(path);
+            printf("[host] WSL_TEST_ROOT: resolv.conf -> %s\n", path);
+        }
+    }
 
     /* Listen on port 50000 for guest connections */
     int listen_fd = listen_on_port(PORT_HVS);
     if (listen_fd < 0) { fprintf(stderr, "FATAL: cannot listen on %d\n", PORT_HVS); return 1; }
     printf("[host] listening on port %d\n", PORT_HVS);
+
+    /* C1: Listen on port 50001 for GNS engine channel */
+    int gns_listen_fd = listen_on_port(PORT_HVS_GNS);
+    if (gns_listen_fd < 0) {
+        fprintf(stderr, "FATAL: cannot listen on GNS port %d\n", PORT_HVS_GNS);
+        return 1;
+    }
+    printf("[host] listening on GNS port %d\n", PORT_HVS_GNS);
+    int gns_fd = -1;
 
     /* ---- Step 1: Accept capability channel ---- */
     printf("\n[host] Step 1: Waiting for GuestCapabilities...\n");
@@ -456,6 +478,108 @@ int main(void)
             CHECK(1, "F1: No duplicate OobeResult (data is from later steps)", "");
         } else {
             CHECK(1, "F1: No duplicate OobeResult (poll result=%d)", "", rc);
+        }
+    }
+
+    /* ---- Step 74 (Phase 9 / C1): Accept GNS engine channel ---- */
+    printf("\n[host] Step 74: Waiting for GNS channel connection on port %d...\n",
+           PORT_HVS_GNS);
+    {
+        for (int attempt = 0; attempt < 50 && gns_fd < 0; attempt++) {
+            struct pollfd pfd = { .fd = gns_listen_fd, .events = POLLIN };
+            if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+                gns_fd = accept(gns_listen_fd, NULL, NULL);
+                break;
+            }
+        }
+        CHECK(gns_fd >= 0, "C1: GNS channel connected from guest", "timeout");
+        if (gns_fd >= 0)
+            printf("  GNS channel connected (fd=%d)\n", gns_fd);
+    }
+
+    /* ---- Step 75 (Phase 9 / C3): InterfaceConfiguration ---- */
+    printf("\n[host] Step 75: Sending InterfaceConfiguration (type=53)...\n");
+    {
+        const char *content =
+#ifdef __FreeBSD__
+            "interface=lo0\nup\n";
+#else
+            "interface=lo\nup\n";
+#endif
+        size_t content_len = strlen(content) + 1;
+        size_t msg_size = sizeof(LX_GNS_INTERFACE_CONFIGURATION) + content_len;
+        LX_GNS_INTERFACE_CONFIGURATION *ic = calloc(1, msg_size);
+        if (!ic) {
+            CHECK(0, "C3: InterfaceConfiguration alloc", "oom");
+        } else {
+            ic->Header.MessageType = LxGnsMessageInterfaceConfiguration;
+            ic->Header.MessageSize = (unsigned int)msg_size;
+            ic->Header.SequenceNumber = 750;
+            memcpy(ic->Content, content, content_len);
+
+            int sent = send_all(gns_fd, ic, msg_size);
+            CHECK(sent == 0, "C3: InterfaceConfiguration sent",
+                  "send returned %d", sent);
+            free(ic);
+
+            if (sent == 0) {
+                LX_GNS_RESULT *gns_resp =
+                    (LX_GNS_RESULT *)recv_message(gns_fd, &hdr);
+                if (gns_resp) {
+                    printf("  Received: type=%u, seq=%u, Result=%d\n",
+                           gns_resp->Header.MessageType,
+                           gns_resp->Header.SequenceNumber,
+                           gns_resp->Result);
+                    CHECK(gns_resp->Header.MessageType == LxGnsMessageResult,
+                          "C3: response MessageType==54 (LxGnsMessageResult)",
+                          "got %u", gns_resp->Header.MessageType);
+                    CHECK(gns_resp->Header.SequenceNumber == 750,
+                          "C3: response seq echoed (750)",
+                          "got %u", gns_resp->Header.SequenceNumber);
+                    CHECK(gns_resp->Result == 0,
+                          "C3: InterfaceConfiguration Result==0 (success)",
+                          "got %d", gns_resp->Result);
+                    free(gns_resp);
+                } else {
+                    CHECK(0, "C3: InterfaceConfiguration response received",
+                          "no response");
+                }
+            }
+        }
+    }
+
+    /* ---- Step 76: C3 round-trip marker (keeps step numbering contiguous) ---- */
+    printf("\n[host] Step 76: C3 InterfaceConfiguration round-trip complete\n");
+    CHECK(gns_fd >= 0, "C3: GNS channel still open after InterfaceConfiguration", "");
+
+    /* ---- Step 77 (Phase 9 / C1): GNS NoOp message ---- */
+    printf("\n[host] Step 77: Sending GNS NoOp (type=71)...\n");
+    {
+        struct MESSAGE_HEADER noop;
+        memset(&noop, 0, sizeof(noop));
+        noop.MessageType = LxGnsMessageNoOp;
+        noop.MessageSize = sizeof(noop);
+        noop.SequenceNumber = 771;
+
+        int sent = send_all(gns_fd, &noop, sizeof(noop));
+        CHECK(sent == 0, "C1: GNS NoOp sent", "send returned %d", sent);
+
+        if (sent == 0) {
+            LX_GNS_RESULT *gns_resp =
+                (LX_GNS_RESULT *)recv_message(gns_fd, &hdr);
+            if (gns_resp) {
+                CHECK(gns_resp->Header.MessageType == LxGnsMessageResult,
+                      "C1: NoOp response MessageType==54",
+                      "got %u", gns_resp->Header.MessageType);
+                CHECK(gns_resp->Header.SequenceNumber == 771,
+                      "C1: NoOp response seq echoed (771)",
+                      "got %u", gns_resp->Header.SequenceNumber);
+                CHECK(gns_resp->Result == 0,
+                      "C1: NoOp Result==0", "got %d", gns_resp->Result);
+                free(gns_resp);
+            } else {
+                CHECK(0, "C1: NoOp response received", "no response");
+            }
         }
     }
 
@@ -2331,6 +2455,36 @@ int main(void)
              * checking the guest didn't disconnect (send a follow-up query). */
             printf("  NetworkInformation sent (no response expected)\n");
             CHECK(1, "NetworkInformation processed (no crash)", "");
+
+            /* Verify resolv.conf was written when WSL_TEST_ROOT is set */
+            {
+                const char *test_root = getenv("WSL_TEST_ROOT");
+                if (test_root && test_root[0]) {
+                    char resolv_path[512];
+                    snprintf(resolv_path, sizeof(resolv_path),
+                             "%s/resolv.conf", test_root);
+                    FILE *rf = NULL;
+                    for (int retry = 0; retry < 30 && !rf; retry++) {
+                        rf = fopen(resolv_path, "r");
+                        if (!rf)
+                            usleep(100000);
+                    }
+                    CHECK(rf != NULL, "C2: resolv.conf written to WSL_TEST_ROOT",
+                          "cannot open %s", resolv_path);
+                    if (rf) {
+                        char line[256];
+                        int has_nameserver = 0;
+                        while (fgets(line, sizeof(line), rf)) {
+                            if (strstr(line, "nameserver 8.8.8.8"))
+                                has_nameserver = 1;
+                        }
+                        fclose(rf);
+                        CHECK(has_nameserver,
+                              "C2: resolv.conf contains nameserver 8.8.8.8",
+                              "content missing expected DNS entry");
+                    }
+                }
+            }
         }
     }
 
@@ -3993,6 +4147,9 @@ int main(void)
     close(init_fd);
     close(notify_fd);
     close(cap_fd);
+    close(listen_fd);
+    if (gns_fd >= 0) close(gns_fd);
+    close(gns_listen_fd);
 
     /* ---- Summary ---- */
     printf("\n=== Test Summary ===\n");

@@ -62,6 +62,61 @@ static int g_wsl_conf_parsed = 0;
 /* Phase 1: SIGCHLD self-pipe */
 static int g_sigchld_pipe[2] = {-1, -1};
 
+/* C1: GNS engine child process */
+static pid_t g_gns_pid = -1;
+
+static int hv_connect(unsigned int port);
+
+static void gns_configure_test_paths(void)
+{
+    const char *test_root = getenv("WSL_TEST_ROOT");
+    if (test_root && test_root[0]) {
+        char path[512];
+        int n = snprintf(path, sizeof(path), "%s/resolv.conf", test_root);
+        if (n > 0 && (size_t)n < sizeof(path)) {
+            gns_set_resolvconf_path(path);
+            printf("[init] WSL_TEST_ROOT: resolv.conf -> %s\n", path);
+        }
+    }
+}
+
+static void gns_stop_engine(void)
+{
+    if (g_gns_pid > 0) {
+        kill(g_gns_pid, SIGTERM);
+        waitpid(g_gns_pid, NULL, 0);
+        printf("[init] GNS engine stopped (pid=%d)\n", (int)g_gns_pid);
+        g_gns_pid = -1;
+    }
+}
+
+static void gns_start_engine(int cap_fd, int notify_fd, int init_fd)
+{
+    int gns_fd = hv_connect(PORT_HVS_GNS);
+    if (gns_fd < 0) {
+        fprintf(stderr, "[init] GNS channel connect failed (non-fatal)\n");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("[init] gns fork");
+        close(gns_fd);
+        return;
+    }
+    if (pid == 0) {
+        close(cap_fd);
+        if (notify_fd >= 0) close(notify_fd);
+        close(init_fd);
+        gns_engine_loop(gns_fd);
+        _exit(0);
+    }
+
+    close(gns_fd);
+    g_gns_pid = pid;
+    printf("[init] GNS engine started (pid=%d)\n", (int)pid);
+}
+
 /* F2: Track mounted filesystems for graceful unmount on shutdown.
  * Each entry records the mount point path. Unmount happens in reverse
  * order (last mounted = first unmounted). */
@@ -204,18 +259,21 @@ static void handle_terminate_instance(int init_fd, struct MESSAGE_HEADER *hdr)
     printf("[init] sent TerminateInstance response (seq=%u, result=0)\n",
            hdr->SequenceNumber);
 
-    /* 2. Unmount tracked filesystems in reverse order */
+    /* 2. Stop GNS engine child */
+    gns_stop_engine();
+
+    /* 3. Unmount tracked filesystems in reverse order */
     if (g_mounted_count > 0) {
         printf("[init] unmounting %d filesystem(s)...\n", g_mounted_count);
         int unmounted = fs_unmount_all();
         printf("[init] unmounted %d/%d filesystem(s)\n", unmounted, g_mounted_count);
     }
 
-    /* 3. Sync to flush all pending writes */
+    /* 4. Sync to flush all pending writes */
     sync();
     printf("[init] sync complete, exiting\n");
 
-    /* 4. Exit */
+    /* 5. Exit */
     exit(0);
 }
 
@@ -507,6 +565,7 @@ static void send_create_session_response(int init_fd, unsigned int port, unsigne
 int main(void)
 {
     printf("[init] hvinit_tcp starting (pid=%d)\n", getpid());
+    gns_configure_test_paths();
 
     /* 1. Capability channel: connect and send GuestCapabilities */
     int cap_fd = hv_connect(PORT_HVS);
@@ -796,6 +855,9 @@ int main(void)
     fs_track_mount("/proc");
     fs_track_mount("/run");
 
+    /* C1: Start GNS engine on dedicated channel (parallel to event loop) */
+    gns_start_engine(cap_fd, notify_fd, init_fd);
+
     printf("[init] entering event loop\n");
     /* Phase 1: event loop replaces pause() */
     event_loop(init_fd, notify_fd);
@@ -813,6 +875,7 @@ int main(void)
     }
 
     /* Clean up (only reached if event loop exits) */
+    gns_stop_engine();
     close(cap_fd);
     if (notify_fd >= 0) close(notify_fd);
     if (init_fd >= 0) close(init_fd);

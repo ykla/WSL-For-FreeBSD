@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 #
-# run_test.sh - Orchestrate the Phase 0 test: start hvbridge + hvinit,
+# run_test.sh - Orchestrate the Phase 9 test: start hvbridge + hvinit,
 #               then run the mock host to validate all protocol fixes.
 #
 # Usage: ./run_test.sh
@@ -11,9 +11,16 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Test-scoped etc directory for resolv.conf writes (avoids /etc permission issues)
+export WSL_TEST_ROOT="${WSL_TEST_ROOT:-/tmp/wsl_test_etc}"
+mkdir -p "$WSL_TEST_ROOT"
+rm -f "$WSL_TEST_ROOT/resolv.conf"
+
 echo "============================================"
-echo "  WSL-For-FreeBSD Phase 8 Test Runner"
+echo "  WSL-For-FreeBSD Phase 9 Test Runner"
 echo "============================================"
+echo ""
+echo "[runner] WSL_TEST_ROOT=$WSL_TEST_ROOT"
 echo ""
 
 # Make sure binaries are built
@@ -40,7 +47,7 @@ echo "[runner]   pid=$BRIDGE_PID"
 # Give hvbridge time to start listening
 sleep 0.3
 
-# Step 2: Start wsl_mock_host (listens on port 50000) in background
+# Step 2: Start wsl_mock_host (listens on port 50000/50001) in background
 # It will accept connections from hvinit, then connect to hvbridge.
 echo "[runner] Starting wsl_mock_host (mock host)..."
 ./wsl_mock_host &
@@ -73,7 +80,7 @@ wait 2>/dev/null || true
 echo ""
 if [ $HOST_EXIT -eq 0 ]; then
     echo "============================================"
-    echo "  RESULT: ALL PHASE 8 TESTS PASSED"
+    echo "  RESULT: ALL PHASE 9 TESTS PASSED"
     echo "============================================"
 else
     echo "============================================"

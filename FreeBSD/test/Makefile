@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 #
-# Makefile for WSL-For-FreeBSD Phase 0 local test harness.
+# Makefile for WSL-For-FreeBSD Phase 9 local test harness.
 #
 # Usage:
 #   make          # build all test binaries
@@ -13,12 +13,16 @@ LDFLAGS = -lutil
 
 BINARIES = wsl_mock_host hvinit_tcp hvbridge_tcp
 
+GNS_HEADERS = ../gns_engine.h ../binfmt_handler.h ../interop_server.h
+
 all: $(BINARIES)
 
-wsl_mock_host: wsl_mock_host.c wsl_protocol.h ../config_parser.h ../wsl_conf_parser.h ../timezone_handler.h ../network_config.h ../drvfs_mount.h
+wsl_mock_host: wsl_mock_host.c wsl_protocol.h ../config_parser.h ../wsl_conf_parser.h \
+               ../timezone_handler.h ../network_config.h ../drvfs_mount.h $(GNS_HEADERS)
 	$(CC) $(CFLAGS) -o $@ wsl_mock_host.c $(LDFLAGS)
 
-hvinit_tcp: hvinit_tcp.c wsl_protocol.h ../config_parser.h ../wsl_conf_parser.h ../timezone_handler.h ../network_config.h ../drvfs_mount.h ../gns_engine.h
+hvinit_tcp: hvinit_tcp.c wsl_protocol.h ../config_parser.h ../wsl_conf_parser.h \
+            ../timezone_handler.h ../network_config.h ../drvfs_mount.h $(GNS_HEADERS)
 	$(CC) $(CFLAGS) -o $@ hvinit_tcp.c
 
 hvbridge_tcp: hvbridge_tcp.c wsl_protocol.h ../interop_server.h

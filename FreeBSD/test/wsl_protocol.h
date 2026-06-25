@@ -19,6 +19,7 @@
 
 /* ---- Port constants ---- */
 #define PORT_HVS              50000  /* hvinit -> host (capability/notify/init) */
+#define PORT_HVS_GNS          50001  /* hvinit -> host (GNS engine channel) */
 #define PORT_HVS_BSD          60000  /* hvbridge listen port (session/interop) */
 
 /* ---- WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum) ---- */
