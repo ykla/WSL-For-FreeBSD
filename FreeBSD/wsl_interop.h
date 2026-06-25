@@ -612,11 +612,14 @@ static inline int wsl_interop_run_io_relay(int listen_fd, int timeout_ms)
 
     volatile int stop_flag = 0;
 
-    /* Fork a child to relay stdout (remote → local STDOUT_FILENO) */
+    /* Fork a child to relay stdout (local STDOUT_FILENO → remote stdout_net).
+     * direction=0 means local→remote: read from STDOUT_FILENO (Windows proc
+     * output), write to stdout_net (sent to host). */
     pid_t stdout_pid = fork();
     if (stdout_pid == 0) {
-        /* Child: relay stdout. Exit when host closes stdout_net. */
-        wsl_interop_relay_pair(STDOUT_FILENO, stdout_net, 1, &stop_flag);
+        /* Child: relay stdout. Exit when STDOUT_FILENO reaches EOF
+         * (Windows process closed its stdout). */
+        wsl_interop_relay_pair(STDOUT_FILENO, stdout_net, 0, &stop_flag);
         _exit(0);
     }
     if (stdout_pid < 0) {
@@ -627,11 +630,13 @@ static inline int wsl_interop_run_io_relay(int listen_fd, int timeout_ms)
         return -1;
     }
 
-    /* Fork a child to relay stderr (remote → local STDERR_FILENO) */
+    /* Fork a child to relay stderr (local STDERR_FILENO → remote stderr_net).
+     * direction=0 means local→remote: read from STDERR_FILENO, write to
+     * stderr_net. */
     pid_t stderr_pid = fork();
     if (stderr_pid == 0) {
-        /* Child: relay stderr. Exit when host closes stderr_net. */
-        wsl_interop_relay_pair(STDERR_FILENO, stderr_net, 1, &stop_flag);
+        /* Child: relay stderr. Exit when STDERR_FILENO reaches EOF. */
+        wsl_interop_relay_pair(STDERR_FILENO, stderr_net, 0, &stop_flag);
         _exit(0);
     }
     if (stderr_pid < 0) {
@@ -646,10 +651,11 @@ static inline int wsl_interop_run_io_relay(int listen_fd, int timeout_ms)
         return -1;
     }
 
-    /* Parent: relay stdin (local STDIN_FILENO → remote stdin_net).
-     * This blocks until the host closes the stdin connection or local
-     * stdin reaches EOF. */
-    wsl_interop_relay_pair(STDIN_FILENO, stdin_net, 0, &stop_flag);
+    /* Parent: relay stdin (remote stdin_net → local STDIN_FILENO).
+     * direction=1 means remote→local: read from stdin_net (host side),
+     * write to STDIN_FILENO (the Windows process's stdin).
+     * This blocks until the host closes the stdin connection. */
+    wsl_interop_relay_pair(STDIN_FILENO, stdin_net, 1, &stop_flag);
 
     /* Signal children to stop and reap them */
     stop_flag = 1;
