@@ -1272,7 +1272,9 @@ static inline char *gns_extract_content(void *msg_buf, size_t msg_size)
 
 /* PortMappingRequest(56): host asks guest to create/remove a port mapping.
  * JSON payload: {"Port":<n>,"Protocol":"tcp|udp","Remove":false,...}
- * Response: LX_GNS_RESULT(54) with Result=0 on success. */
+ * Group B: Executes pfctl/iptables to allow/deny port forwarding.
+ *   FreeBSD: pfctl with rdr/port rules
+ *   Linux:   iptables -A/-D INPUT -p <proto> --dport <port> -j ACCEPT */
 static inline int gns_handle_port_mapping_request(int gns_fd, void *msg_buf,
                                                    size_t msg_size,
                                                    unsigned int seq)
@@ -1284,16 +1286,66 @@ static inline int gns_handle_port_mapping_request(int gns_fd, void *msg_buf,
     }
     long port = gns_json_get_int(content, "Port", 0);
     int remove = gns_json_get_bool(content, "Remove", 0);
-    printf("[gns] PortMappingRequest: port=%ld remove=%d\n", port, remove);
-    /* On FreeBSD, port mappings would be configured via pfctl/ipfw.
-     * Acknowledge -- the host treats Result==0 as success. */
-    gns_send_result(gns_fd, seq, 0, "port mapping ack");
+    char protocol[16] = {0};
+    gns_json_get_string(content, "Protocol", protocol, sizeof(protocol));
+
+    printf("[gns] PortMappingRequest: port=%ld proto=%s remove=%d\n",
+           port, protocol, remove);
+
+    int result = 0;
+    const char *note = "port mapping applied";
+    if (port > 0 && port <= 65535) {
+        const char *proto = (protocol[0] && strcmp(protocol, "any") != 0) ? protocol : "tcp";
+        char cmd[256];
+#ifdef __FreeBSD__
+        /* FreeBSD: use pfctl to add/remove a port redirect rule via a temp anchor.
+         * For simplicity, we use a direct pfctl command to modify the anchor. */
+        if (remove) {
+            snprintf(cmd, sizeof(cmd),
+                     "echo 'rdr pass inet proto %s from any to any port %ld -> "
+                     "127.0.0.1 port %ld' | pfctl -a wsl_portmap -f - 2>/dev/null",
+                     proto, port, port);
+        } else {
+            /* Add rule: redirect incoming traffic on this port to localhost */
+            snprintf(cmd, sizeof(cmd),
+                     "pfctl -a wsl_portmap -Fr 2>/dev/null; "
+                     "echo 'rdr pass inet proto %s from any to any port %ld -> "
+                     "127.0.0.1 port %ld' | pfctl -a wsl_portmap -f - 2>/dev/null",
+                     proto, port, port);
+        }
+#else
+        /* Linux: use iptables to allow incoming traffic on the port.
+         * -A = append rule, -D = delete rule */
+        if (remove) {
+            snprintf(cmd, sizeof(cmd),
+                     "iptables -D INPUT -p %s --dport %ld -j ACCEPT 2>/dev/null",
+                     proto, port);
+        } else {
+            /* Try to add; if the rule already exists, delete then add */
+            snprintf(cmd, sizeof(cmd),
+                     "iptables -C INPUT -p %s --dport %ld -j ACCEPT 2>/dev/null && "
+                     "iptables -D INPUT -p %s --dport %ld -j ACCEPT 2>/dev/null; "
+                     "iptables -A INPUT -p %s --dport %ld -j ACCEPT 2>/dev/null",
+                     proto, port, proto, port, proto, port);
+        }
+#endif
+        printf("[gns] running: %s\n", cmd);
+        int rc = gns_run_cmd(cmd);
+        if (rc != 0) {
+            printf("[gns] PortMapping: command failed (rc=%d) — non-fatal\n", rc);
+            note = "port mapping failed (non-fatal)";
+        }
+    }
+    gns_send_result(gns_fd, seq, result, note);
     free(content);
     return 0;
 }
 
 /* SetPortListener(58): host configures a port listener for relay.
- * JSON payload: {"Family":2,"Port":<n>,"Address":"127.0.0.1",...} */
+ * JSON payload: {"Family":2,"Port":<n>,"Address":"127.0.0.1",...}
+ * Group B: Opens a firewall rule to allow inbound traffic on the port.
+ *   FreeBSD: pfctl add rule for the port
+ *   Linux:   iptables -A INPUT -p tcp --dport <port> -j ACCEPT */
 static inline int gns_handle_set_port_listener(int gns_fd, void *msg_buf,
                                                 size_t msg_size,
                                                 unsigned int seq)
@@ -1305,10 +1357,38 @@ static inline int gns_handle_set_port_listener(int gns_fd, void *msg_buf,
     }
     long port = gns_json_get_int(content, "Port", 0);
     long family = gns_json_get_int(content, "Family", 2);
-    printf("[gns] SetPortListener: family=%ld port=%ld\n", family, port);
-    /* Actual listener setup is handled by StartSocketRelay on the init
-     * channel. Here we just acknowledge. */
-    gns_send_result(gns_fd, seq, 0, "listener set");
+    char address[64] = {0};
+    gns_json_get_string(content, "Address", address, sizeof(address));
+    printf("[gns] SetPortListener: family=%ld port=%ld addr=%s\n",
+           family, port, address);
+
+    int result = 0;
+    const char *note = "listener configured";
+    if (port > 0 && port <= 65535) {
+        char cmd[256];
+#ifdef __FreeBSD__
+        /* FreeBSD: add a pass rule for this port via pf anchor */
+        const char *pf_proto = (family == 2) ? "tcp" : "udp";
+        snprintf(cmd, sizeof(cmd),
+                 "echo 'pass in proto %s from any to any port %ld' | "
+                 "pfctl -a wsl_listener -f - 2>/dev/null",
+                 pf_proto, port);
+#else
+        /* Linux: iptables rule to allow this port */
+        const char *proto = (family == 2) ? "tcp" : "udp";
+        snprintf(cmd, sizeof(cmd),
+                 "iptables -C INPUT -p %s --dport %ld -j ACCEPT 2>/dev/null || "
+                 "iptables -A INPUT -p %s --dport %ld -j ACCEPT 2>/dev/null",
+                 proto, port, proto, port);
+#endif
+        printf("[gns] running: %s\n", cmd);
+        int rc = gns_run_cmd(cmd);
+        if (rc != 0) {
+            printf("[gns] SetPortListener: command failed (rc=%d) — non-fatal\n", rc);
+            note = "listener config failed (non-fatal)";
+        }
+    }
+    gns_send_result(gns_fd, seq, result, note);
     free(content);
     return 0;
 }
@@ -1346,7 +1426,9 @@ static inline int gns_handle_listener_relay(int gns_fd, void *msg_buf,
  * Reference: src/linux/init/GnsEngine.cpp, GnsNetwork.cpp */
 
 /* CreateDeviceRequest(62): host asks guest to create a network device.
- * JSON payload: {"Name":"eth0","Type":"veth","MAC":"...",...} */
+ * JSON payload: {"Name":"eth0","Type":"veth","MAC":"...",...}
+ * Group A: Executes ifconfig <name> create on FreeBSD, falls back to
+ * ip link add on Linux (creates a veth pair for the test harness). */
 static inline int gns_handle_create_device(int gns_fd, void *msg_buf,
                                             size_t msg_size, unsigned int seq)
 {
@@ -1358,14 +1440,36 @@ static inline int gns_handle_create_device(int gns_fd, void *msg_buf,
     char name[64] = {0};
     gns_json_get_string(content, "Name", name, sizeof(name));
     printf("[gns] CreateDeviceRequest: name=%s\n", name);
-    /* On FreeBSD: ifconfig <name> create */
-    gns_send_result(gns_fd, seq, 0, "device created");
+
+    int result = 0;
+    const char *note = "device created";
+    if (name[0]) {
+        char cmd[192];
+#ifdef __FreeBSD__
+        snprintf(cmd, sizeof(cmd), "ifconfig %s create 2>/dev/null", name);
+#else
+        /* Linux fallback: create a veth pair (test0 <-> test0-peer) and
+         * bring one side up. The -peer side is left dangling (host-facing). */
+        snprintf(cmd, sizeof(cmd),
+                 "ip link add %s type veth peer name %s-peer 2>/dev/null && "
+                 "ip link set %s up 2>/dev/null",
+                 name, name, name);
+#endif
+        printf("[gns] running: %s\n", cmd);
+        int rc = gns_run_cmd(cmd);
+        if (rc != 0) {
+            printf("[gns] CreateDevice: command failed (rc=%d) — non-fatal\n", rc);
+            note = "device create failed (non-fatal)";
+        }
+    }
+    gns_send_result(gns_fd, seq, result, note);
     free(content);
     return 0;
 }
 
 /* ModifyGuestDeviceSettingRequest(63): modify device settings.
- * JSON payload: {"Name":"eth0","Setting":"mtu","Value":"1500",...} */
+ * JSON payload: {"Name":"eth0","Setting":"mtu","Value":"1500",...}
+ * Group A: Executes ifconfig <name> <setting> <value> on FreeBSD. */
 static inline int gns_handle_modify_device_setting(int gns_fd, void *msg_buf,
                                                     size_t msg_size,
                                                     unsigned int seq)
@@ -1376,15 +1480,48 @@ static inline int gns_handle_modify_device_setting(int gns_fd, void *msg_buf,
         return -1;
     }
     char name[64] = {0};
+    char setting[32] = {0};
+    char value[64] = {0};
     gns_json_get_string(content, "Name", name, sizeof(name));
-    printf("[gns] ModifyGuestDeviceSetting: name=%s\n", name);
-    gns_send_result(gns_fd, seq, 0, "device modified");
+    gns_json_get_string(content, "Setting", setting, sizeof(setting));
+    gns_json_get_string(content, "Value", value, sizeof(value));
+    printf("[gns] ModifyGuestDeviceSetting: name=%s setting=%s value=%s\n",
+           name, setting, value);
+
+    int result = 0;
+    const char *note = "device modified";
+    if (name[0] && setting[0] && value[0]) {
+        char cmd[192];
+#ifdef __FreeBSD__
+        snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s 2>/dev/null",
+                 name, setting, value);
+#else
+        /* Linux fallback: ip link set dev <name> <setting> <value> */
+        if (strcmp(setting, "mtu") == 0) {
+            snprintf(cmd, sizeof(cmd),
+                     "ip link set dev %s mtu %s 2>/dev/null", name, value);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "ip link set dev %s %s %s 2>/dev/null", name, setting, value);
+        }
+#endif
+        printf("[gns] running: %s\n", cmd);
+        int rc = gns_run_cmd(cmd);
+        if (rc != 0) {
+            printf("[gns] ModifyDeviceSetting: command failed (rc=%d) — non-fatal\n", rc);
+            note = "device modify failed (non-fatal)";
+        }
+    }
+    gns_send_result(gns_fd, seq, result, note);
     free(content);
     return 0;
 }
 
 /* LoopbackRoutesRequest(64): configure loopback routes.
- * JSON payload: {"Action":"add","Destination":"127.0.0.0/8",...} */
+ * JSON payload: {"Action":"add|remove","Destination":"127.0.0.0/8",...}
+ * Group A: Executes route add/delete for loopback routes.
+ *   FreeBSD: route add/del <dest> -interface lo0
+ *   Linux:   ip route add/del <dest> dev lo */
 static inline int gns_handle_loopback_routes(int gns_fd, void *msg_buf,
                                               size_t msg_size,
                                               unsigned int seq)
@@ -1394,14 +1531,42 @@ static inline int gns_handle_loopback_routes(int gns_fd, void *msg_buf,
         gns_send_result(gns_fd, seq, -1, "no content");
         return -1;
     }
-    printf("[gns] LoopbackRoutesRequest: %s\n", content);
-    gns_send_result(gns_fd, seq, 0, "loopback routes ack");
+    char action[16] = {0};
+    char dest[80] = {0};
+    gns_json_get_string(content, "Action", action, sizeof(action));
+    gns_json_get_string(content, "Destination", dest, sizeof(dest));
+    printf("[gns] LoopbackRoutesRequest: action=%s dest=%s\n", action, dest);
+
+    int result = 0;
+    const char *note = "loopback route applied";
+    if (action[0] && dest[0]) {
+        char cmd[256];
+        int is_del = (strcmp(action, "remove") == 0 || strcmp(action, "del") == 0 ||
+                      strcmp(action, "delete") == 0);
+#ifdef __FreeBSD__
+        snprintf(cmd, sizeof(cmd), "route %s %s -interface lo0 2>/dev/null",
+                 is_del ? "delete" : "add", dest);
+#else
+        snprintf(cmd, sizeof(cmd), "ip route %s %s dev lo 2>/dev/null",
+                 is_del ? "del" : "add", dest);
+#endif
+        printf("[gns] running: %s\n", cmd);
+        int rc = gns_run_cmd(cmd);
+        if (rc != 0) {
+            printf("[gns] LoopbackRoutes: command failed (rc=%d) — non-fatal\n", rc);
+            note = "loopback route failed (non-fatal)";
+        }
+    }
+    gns_send_result(gns_fd, seq, result, note);
     free(content);
     return 0;
 }
 
 /* DeviceSettingRequest(65): query device settings.
- * JSON payload: {"Name":"eth0","Setting":"mtu"} */
+ * JSON payload: {"Name":"eth0","Setting":"mtu"}
+ * Group A: Reads the current setting value from the system.
+ *   FreeBSD: ifconfig <name> | grep mtu
+ *   Linux:   cat /sys/class/net/<name>/mtu or ip link show <name> */
 static inline int gns_handle_device_setting(int gns_fd, void *msg_buf,
                                              size_t msg_size,
                                              unsigned int seq)
@@ -1412,9 +1577,69 @@ static inline int gns_handle_device_setting(int gns_fd, void *msg_buf,
         return -1;
     }
     char name[64] = {0};
+    char setting[32] = {0};
     gns_json_get_string(content, "Name", name, sizeof(name));
-    printf("[gns] DeviceSettingRequest: name=%s\n", name);
-    gns_send_result(gns_fd, seq, 0, "device setting");
+    gns_json_get_string(content, "Setting", setting, sizeof(setting));
+    printf("[gns] DeviceSettingRequest: name=%s setting=%s\n", name, setting);
+
+    int result = 0;
+    char note[128] = "device setting queried";
+    if (name[0] && setting[0]) {
+        char cmd[256];
+        char value_buf[64] = {0};
+#ifdef __FreeBSD__
+        /* FreeBSD: ifconfig <name> | grep <setting> */
+        snprintf(cmd, sizeof(cmd),
+                 "ifconfig %s 2>/dev/null | grep -i %s | head -1", name, setting);
+        printf("[gns] running: %s\n", cmd);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            if (fgets(value_buf, sizeof(value_buf), fp)) {
+                /* Strip trailing newline */
+                size_t len = strlen(value_buf);
+                while (len > 0 && (value_buf[len-1] == '\n' || value_buf[len-1] == '\r'))
+                    value_buf[--len] = '\0';
+            }
+            pclose(fp);
+        }
+#else
+        /* Linux: prefer /sys/class/net/<name>/<setting> for simple values */
+        if (strcmp(setting, "mtu") == 0) {
+            snprintf(cmd, sizeof(cmd), "/sys/class/net/%s/mtu", name);
+            FILE *fp = fopen(cmd, "r");
+            if (fp) {
+                if (fgets(value_buf, sizeof(value_buf), fp)) {
+                    size_t len = strlen(value_buf);
+                    while (len > 0 && (value_buf[len-1] == '\n' || value_buf[len-1] == '\r'))
+                        value_buf[--len] = '\0';
+                }
+                fclose(fp);
+            }
+        } else {
+            /* Fallback: ip link show <name> | grep <setting> */
+            snprintf(cmd, sizeof(cmd),
+                     "ip link show %s 2>/dev/null | grep -i %s | head -1", name, setting);
+            printf("[gns] running: %s\n", cmd);
+            FILE *fp = popen(cmd, "r");
+            if (fp) {
+                if (fgets(value_buf, sizeof(value_buf), fp)) {
+                    size_t len = strlen(value_buf);
+                    while (len > 0 && (value_buf[len-1] == '\n' || value_buf[len-1] == '\r'))
+                        value_buf[--len] = '\0';
+                }
+                pclose(fp);
+            }
+        }
+#endif
+        if (value_buf[0]) {
+            printf("[gns] DeviceSetting result: %s\n", value_buf);
+            snprintf(note, sizeof(note), "%s=%s", setting, value_buf);
+        } else {
+            printf("[gns] DeviceSetting: could not read %s for %s\n", setting, name);
+            snprintf(note, sizeof(note), "%s not found", setting);
+        }
+    }
+    gns_send_result(gns_fd, seq, result, note);
     free(content);
     return 0;
 }
@@ -1482,7 +1707,10 @@ static inline int gns_handle_if_state_change(int gns_fd, void *msg_buf,
  * Reference: src/linux/init/GnsNetFilter.cpp */
 
 /* GlobalNetFilter(72): set global firewall rules.
- * JSON payload: {"Action":"add|remove|flush","Rules":"..."} */
+ * JSON payload: {"Action":"add|remove|flush","Rules":"pass in all"}
+ * Group B: Executes pfctl/iptables to manage global firewall rules.
+ *   FreeBSD: pfctl -a wsl_global -f <rules> or pfctl -a wsl_global -Fr
+ *   Linux:   iptables -A/-D/-F INPUT with rules */
 static inline int gns_handle_global_netfilter(int gns_fd, void *msg_buf,
                                                size_t msg_size,
                                                unsigned int seq)
@@ -1492,15 +1720,62 @@ static inline int gns_handle_global_netfilter(int gns_fd, void *msg_buf,
         gns_send_result(gns_fd, seq, -1, "no content");
         return -1;
     }
-    printf("[gns] GlobalNetFilter: %s\n", content);
-    /* On FreeBSD: pfctl -f <rules> or pfctl -d / pfctl -e */
-    gns_send_result(gns_fd, seq, 0, "global netfilter ack");
+    char action[16] = {0};
+    char rules_str[512] = {0};
+    gns_json_get_string(content, "Action", action, sizeof(action));
+    gns_json_get_string(content, "Rules", rules_str, sizeof(rules_str));
+    printf("[gns] GlobalNetFilter: action=%s rules=%s\n", action, rules_str);
+
+    int result = 0;
+    const char *note = "global netfilter applied";
+    if (action[0]) {
+        char cmd[512];
+        if (strcmp(action, "flush") == 0) {
+#ifdef __FreeBSD__
+            snprintf(cmd, sizeof(cmd), "pfctl -a wsl_global -Fr 2>/dev/null");
+#else
+            snprintf(cmd, sizeof(cmd), "iptables -F INPUT 2>/dev/null");
+#endif
+        } else if (strcmp(action, "remove") == 0 && rules_str[0]) {
+#ifdef __FreeBSD__
+            snprintf(cmd, sizeof(cmd),
+                     "echo '%s' | pfctl -a wsl_global -f - 2>/dev/null", rules_str);
+#else
+            /* iptables: try to delete matching rules */
+            snprintf(cmd, sizeof(cmd),
+                     "iptables -D INPUT %s 2>/dev/null", rules_str);
+#endif
+        } else if (rules_str[0]) {
+            /* add/update */
+#ifdef __FreeBSD__
+            snprintf(cmd, sizeof(cmd),
+                     "echo '%s' | pfctl -a wsl_global -f - 2>/dev/null", rules_str);
+#else
+            /* iptables: append rule (idempotent via -C check) */
+            snprintf(cmd, sizeof(cmd),
+                     "iptables -C INPUT %s 2>/dev/null || iptables -A INPUT %s 2>/dev/null",
+                     rules_str, rules_str);
+#endif
+        } else {
+            snprintf(cmd, sizeof(cmd), "true"); /* no-op */
+        }
+        printf("[gns] running: %s\n", cmd);
+        int rc = gns_run_cmd(cmd);
+        if (rc != 0) {
+            printf("[gns] GlobalNetFilter: command failed (rc=%d) — non-fatal\n", rc);
+            note = "global netfilter failed (non-fatal)";
+        }
+    }
+    gns_send_result(gns_fd, seq, result, note);
     free(content);
     return 0;
 }
 
 /* InterfaceNetFilter(73): set per-interface firewall rules.
- * JSON payload: {"Name":"eth0","Action":"add","Rules":"..."} */
+ * JSON payload: {"Name":"eth0","Action":"add","Rules":"pass in all"}
+ * Group B: Executes pfctl/iptables for per-interface firewall rules.
+ *   FreeBSD: pf rules with 'on <iface>'
+ *   Linux:   iptables -A INPUT -i <iface> <rules> */
 static inline int gns_handle_interface_netfilter(int gns_fd, void *msg_buf,
                                                   size_t msg_size,
                                                   unsigned int seq)
@@ -1511,9 +1786,59 @@ static inline int gns_handle_interface_netfilter(int gns_fd, void *msg_buf,
         return -1;
     }
     char name[64] = {0};
+    char action[16] = {0};
+    char rules_str[512] = {0};
     gns_json_get_string(content, "Name", name, sizeof(name));
-    printf("[gns] InterfaceNetFilter: name=%s\n", name);
-    gns_send_result(gns_fd, seq, 0, "interface netfilter ack");
+    gns_json_get_string(content, "Action", action, sizeof(action));
+    gns_json_get_string(content, "Rules", rules_str, sizeof(rules_str));
+    printf("[gns] InterfaceNetFilter: name=%s action=%s rules=%s\n",
+           name, action, rules_str);
+
+    int result = 0;
+    const char *note = "interface netfilter applied";
+    if (name[0] && action[0]) {
+        char cmd[512];
+        if (strcmp(action, "flush") == 0) {
+#ifdef __FreeBSD__
+            snprintf(cmd, sizeof(cmd),
+                     "pfctl -a wsl_iface_%s -Fr 2>/dev/null", name);
+#else
+            snprintf(cmd, sizeof(cmd),
+                     "iptables -F INPUT 2>/dev/null");
+#endif
+        } else if (strcmp(action, "remove") == 0 && rules_str[0]) {
+#ifdef __FreeBSD__
+            snprintf(cmd, sizeof(cmd),
+                     "echo 'block in on %s' | pfctl -a wsl_iface_%s -f - 2>/dev/null",
+                     name, name);
+#else
+            snprintf(cmd, sizeof(cmd),
+                     "iptables -D INPUT -i %s %s 2>/dev/null", name, rules_str);
+#endif
+        } else if (rules_str[0]) {
+            /* add/update */
+#ifdef __FreeBSD__
+            snprintf(cmd, sizeof(cmd),
+                     "echo '%s on %s' | pfctl -a wsl_iface_%s -f - 2>/dev/null",
+                     rules_str, name, name);
+#else
+            /* iptables: append rule with -i <iface> */
+            snprintf(cmd, sizeof(cmd),
+                     "iptables -C INPUT -i %s %s 2>/dev/null || "
+                     "iptables -A INPUT -i %s %s 2>/dev/null",
+                     name, rules_str, name, rules_str);
+#endif
+        } else {
+            snprintf(cmd, sizeof(cmd), "true"); /* no-op */
+        }
+        printf("[gns] running: %s\n", cmd);
+        int rc = gns_run_cmd(cmd);
+        if (rc != 0) {
+            printf("[gns] InterfaceNetFilter: command failed (rc=%d) — non-fatal\n", rc);
+            note = "interface netfilter failed (non-fatal)";
+        }
+    }
+    gns_send_result(gns_fd, seq, result, note);
     free(content);
     return 0;
 }

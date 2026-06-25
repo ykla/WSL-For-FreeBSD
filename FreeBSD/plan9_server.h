@@ -360,6 +360,9 @@ static bool plan9_is_running(void)
  * =========================================================================== */
 #else /* !__FreeBSD__ */
 
+#include <sys/stat.h>
+#include <dirent.h>
+
 /* 9P message types (subset for stub) */
 #define P9_TVERSION 100
 #define P9_RVERSION 101
@@ -387,6 +390,99 @@ static bool plan9_is_running(void)
 
 #define P9_QID_DIR  0x80
 #define P9_MAXMSIZE 65536
+
+/* ---- Fid-to-fd mapping table (Group C: real file I/O) ----
+ * Each Plan9 fid maps to a real file descriptor and a path relative
+ * to the server root directory. This replaces the previous stub
+ * behavior (empty responses) with actual file system operations. */
+#define MAX_FID_MAP 64
+
+struct fid_entry {
+    uint32_t fid;
+    int fd;           /* OS file descriptor, -1 = unused slot */
+    uint64_t qpath;   /* unique QID path for this fid */
+    uint8_t  qtype;   /* P9_QID_DIR (0x80) for directories, 0 for files */
+    char path[512];   /* relative path from g_root_path, "" for root */
+};
+
+static struct fid_entry g_fid_map[MAX_FID_MAP];
+static int g_fid_count = 0;
+static int g_rootfd = -1;       /* open fd for the root directory */
+static uint64_t g_next_qpath = 2; /* 1 = root, 2+ = dynamically assigned */
+static char g_root_path[256];   /* temp directory path for the Plan9 root */
+
+/* Find a fid entry. Returns NULL if not found. */
+static struct fid_entry *fid_find(uint32_t fid)
+{
+    for (int i = 0; i < MAX_FID_MAP; i++) {
+        if (g_fid_map[i].fd >= 0 && g_fid_map[i].fid == fid)
+            return &g_fid_map[i];
+    }
+    return NULL;
+}
+
+/* Add a new fid entry. Returns NULL if table is full. */
+static struct fid_entry *fid_add(uint32_t fid, int fd, uint64_t qpath,
+                                  uint8_t qtype, const char *path)
+{
+    for (int i = 0; i < MAX_FID_MAP; i++) {
+        if (g_fid_map[i].fd < 0) {
+            g_fid_map[i].fid = fid;
+            g_fid_map[i].fd = fd;
+            g_fid_map[i].qpath = qpath;
+            g_fid_map[i].qtype = qtype;
+            if (path)
+                snprintf(g_fid_map[i].path, sizeof(g_fid_map[i].path), "%s", path);
+            else
+                g_fid_map[i].path[0] = '\0';
+            g_fid_count++;
+            return &g_fid_map[i];
+        }
+    }
+    return NULL;
+}
+
+/* Remove and close a fid entry. */
+static void fid_remove(uint32_t fid)
+{
+    for (int i = 0; i < MAX_FID_MAP; i++) {
+        if (g_fid_map[i].fd >= 0 && g_fid_map[i].fid == fid) {
+            close(g_fid_map[i].fd);
+            g_fid_map[i].fd = -1;
+            g_fid_map[i].fid = 0;
+            g_fid_count--;
+            return;
+        }
+    }
+}
+
+/* Replace an existing fid entry's fd/path, keeping the same fid.
+ * Used by Tlcreate/Tlopen when the same fid is reused for a new file.
+ * Returns the entry pointer, or NULL if the fid was not found. */
+static struct fid_entry *fid_replace(uint32_t fid, int fd, uint64_t qpath,
+                                      uint8_t qtype, const char *path)
+{
+    for (int i = 0; i < MAX_FID_MAP; i++) {
+        if (g_fid_map[i].fd >= 0 && g_fid_map[i].fid == fid) {
+            close(g_fid_map[i].fd);
+            g_fid_map[i].fd = fd;
+            g_fid_map[i].qpath = qpath;
+            g_fid_map[i].qtype = qtype;
+            if (path)
+                snprintf(g_fid_map[i].path, sizeof(g_fid_map[i].path), "%s", path);
+            else
+                g_fid_map[i].path[0] = '\0';
+            return &g_fid_map[i];
+        }
+    }
+    return NULL;
+}
+
+/* Assign a new unique qpath. */
+static uint64_t fid_next_qpath(void)
+{
+    return g_next_qpath++;
+}
 
 /* Read exactly n bytes from fd. Returns 0 on success, -1 on error/EOF. */
 static int p9_readn(int fd, void *buf, size_t n)
@@ -515,6 +611,34 @@ static int p9_handle_request(int fd)
     uint8_t *body = rest + 3;
     size_t body_len = remaining - 3;
 
+    /* Helper: pack a QID into buf (13 bytes). */
+    #define P9_PACK_QID(buf, qtype, qversion, qpath) do { \
+        (buf)[0] = (uint8_t)(qtype); \
+        p9_put32((buf) + 1, (qversion)); \
+        p9_put64((buf) + 5, (qpath)); \
+    } while(0)
+
+    /* Helper: build a 9P2000.L stat from struct stat + fid_entry.
+     * Writes into stat_buf (must be >= 256 bytes), returns total length. */
+    #define P9_BUILD_STAT(stat_buf, entry, st) do { \
+        uint8_t *_p = (stat_buf) + 2; /* skip size, fill later */ \
+        uint16_t _type = S_ISDIR((st).st_mode) ? 1 : 0; \
+        const char *_name = (entry)->path[0] ? (entry)->path : "/"; \
+        p9_put16(_p, _type); _p += 2; \
+        p9_put32(_p, (uint32_t)(st).st_dev); _p += 4; \
+        P9_PACK_QID(_p, (entry)->qtype, 0, (entry)->qpath); _p += 13; \
+        p9_put32(_p, (uint32_t)(st).st_mode); _p += 4; \
+        p9_put32(_p, (uint32_t)(st).st_atime); _p += 4; \
+        p9_put32(_p, (uint32_t)(st).st_mtime); _p += 4; \
+        p9_put64(_p, (uint64_t)(st).st_size); _p += 8; \
+        _p += p9_put_string(_p, _name); \
+        _p += p9_put_string(_p, "root"); \
+        _p += p9_put_string(_p, "wheel"); \
+        _p += p9_put_string(_p, "root"); \
+        size_t _slen = (size_t)(_p - (stat_buf)); \
+        p9_put16((stat_buf), (uint16_t)(_slen - 2)); \
+    } while(0)
+
     switch (msg_type) {
     case P9_TVERSION: {
         /* body: msize[4] version[s] */
@@ -525,7 +649,6 @@ static int p9_handle_request(int fd)
                               | ((uint32_t)body[3] << 24);
         uint32_t msize = client_msize < P9_MAXMSIZE ? client_msize : P9_MAXMSIZE;
 
-        /* Respond with 9P2000.L (downgrade from 9P2000.W if requested) */
         uint8_t resp[256];
         p9_put32(resp, msize);
         size_t slen = p9_put_string(resp + 4, "9P2000.L");
@@ -534,118 +657,321 @@ static int p9_handle_request(int fd)
         break;
     }
     case P9_TATTACH: {
-        /* body: fid[4] afid[4] uname[s] aname[s] [n_uname[4]] */
-        /* Respond with root QID: type=DIR(0x80), version=0, path=1 */
+        /* body: fid[4] afid[4] uname[s] aname[s] [n_uname[4]]
+         * C2: Open the real root directory and map the fid to it. */
+        uint32_t fid = 0;
+        if (body_len >= 4) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+        }
+        int root_dup = dup(g_rootfd);
+        if (root_dup < 0) {
+            p9_send_error(fd, tag, "dup root failed");
+            break;
+        }
+        if (!fid_add(fid, root_dup, 1, P9_QID_DIR, "")) {
+            close(root_dup);
+            p9_send_error(fd, tag, "fid table full");
+            break;
+        }
         uint8_t qid[13];
-        qid[0] = P9_QID_DIR;  /* directory */
-        p9_put32(qid + 1, 0);  /* version */
-        p9_put64(qid + 5, 1);  /* path = 1 (root) */
+        P9_PACK_QID(qid, P9_QID_DIR, 0, 1);
         p9_send_response(fd, P9_RATTACH, tag, qid, 13);
-        printf("[plan9-stub] Tattach → Rattach (root qid: dir, path=1)\n");
+        printf("[plan9-stub] Tattach: fid=%u → Rattach (root dir)\n", fid);
         break;
     }
     case P9_TSTAT: {
-        /* body: fid[4] */
-        /* Respond with minimal stat for root directory.
-         * Stat format: size[2] type[2] dev[4] qid[13] mode[4]
-         *              atime[4] mtime[4] length[8] name[s]
-         *              uid[s] gid[s] muid[s] */
-        uint8_t stat[256];
-        uint8_t *p = stat + 2; /* skip size, fill later */
-
-        p9_put16(p, 0);    p += 2;  /* type (0 = file) */
-        p9_put32(p, 0);    p += 4;  /* dev */
-        p[0] = P9_QID_DIR; p += 1;  /* qid.type */
-        p9_put32(p, 0);    p += 4;  /* qid.version */
-        p9_put64(p, 1);    p += 8;  /* qid.path */
-        p9_put32(p, 0040755); p += 4; /* mode (dir+rwxr-xr-x) */
-        p9_put32(p, 0);    p += 4;  /* atime */
-        p9_put32(p, 0);    p += 4;  /* mtime */
-        p9_put64(p, 0);    p += 8;  /* length */
-        p += p9_put_string(p, "/");     /* name */
-        p += p9_put_string(p, "root");  /* uid */
-        p += p9_put_string(p, "wheel"); /* gid */
-        p += p9_put_string(p, "root");  /* muid */
-
-        size_t stat_len = (size_t)(p - stat);
-        p9_put16(stat, (uint16_t)(stat_len - 2)); /* size field (excludes size itself) */
-
-        /* Rstat body: stat_size[2] + stat[stat_len] */
-        uint8_t resp[260];
-        p9_put16(resp, (uint16_t)stat_len);
-        memcpy(resp + 2, stat, stat_len);
-        p9_send_response(fd, P9_RSTAT, tag, resp, 2 + stat_len);
-        printf("[plan9-stub] Tstat → Rstat (root dir, mode=0755)\n");
+        /* body: fid[4]
+         * C6: Build real stat from fstat() on the fid's fd. */
+        uint32_t fid = 0;
+        if (body_len >= 4) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+        }
+        struct fid_entry *entry = fid_find(fid);
+        if (!entry) { p9_send_error(fd, tag, "unknown fid"); break; }
+        struct stat st;
+        if (fstat(entry->fd, &st) < 0) {
+            p9_send_error(fd, tag, "fstat failed");
+            break;
+        }
+        uint8_t stat_buf[512];
+        P9_BUILD_STAT(stat_buf, entry, st);
+        /* stat_buf already has the 2-byte size prefix required by 9P2000.L.
+         * stat_len is the full stat size (including the 2-byte prefix). */
+        size_t stat_len = (size_t)stat_buf[0] | ((size_t)stat_buf[1] << 8);
+        stat_len += 2;
+        p9_send_response(fd, P9_RSTAT, tag, stat_buf, stat_len);
+        printf("[plan9-stub] Tstat: fid=%u path=%s → Rstat (mode=0%o)\n",
+               fid, entry->path, (unsigned)st.st_mode & 07777);
         break;
     }
     case P9_TWALK: {
-        /* body: fid[4] newfid[4] nwname[2] nwname*(wname[s]) */
-        /* For stub: if nwname==0, clone fid (return 0 qids).
-         * If nwname>0, return 0 walked (walk failed gracefully). */
+        /* body: fid[4] newfid[4] nwname[2] nwname*(wname[s])
+         * C3: Real walk using openat(). If nwname==0, clone the fid
+         * (dup fd). Otherwise walk each component from the parent fid. */
+        uint32_t fid = 0, newfid = 0;
         uint16_t nwname = 0;
         if (body_len >= 10) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+            newfid = (uint32_t)body[4]
+                   | ((uint32_t)body[5] << 8)
+                   | ((uint32_t)body[6] << 16)
+                   | ((uint32_t)body[7] << 24);
             nwname = (uint16_t)body[8] | ((uint16_t)body[9] << 8);
         }
-        /* Rwalk body: nwqid[2] + nwqid*qid[13] */
-        uint8_t resp[2];
-        p9_put16(resp, 0); /* 0 qids walked */
-        p9_send_response(fd, P9_RWALK, tag, resp, 2);
-        printf("[plan9-stub] Twalk: nwname=%u → Rwalk (0 qids)\n", nwname);
+
+        if (nwname == 0) {
+            /* Clone: dup the parent fid's fd */
+            struct fid_entry *parent = fid_find(fid);
+            if (!parent) { p9_send_error(fd, tag, "unknown fid"); break; }
+            int newfd = dup(parent->fd);
+            if (newfd < 0) { p9_send_error(fd, tag, "dup failed"); break; }
+            if (!fid_add(newfid, newfd, parent->qpath, parent->qtype, parent->path)) {
+                close(newfd);
+                p9_send_error(fd, tag, "fid table full");
+                break;
+            }
+            uint8_t resp[2];
+            p9_put16(resp, 0); /* 0 qids for clone */
+            p9_send_response(fd, P9_RWALK, tag, resp, 2);
+            printf("[plan9-stub] Twalk: clone fid=%u → newfid=%u\n", fid, newfid);
+            break;
+        }
+
+        /* Walk each component using openat() */
+        struct fid_entry *parent = fid_find(fid);
+        if (!parent) { p9_send_error(fd, tag, "unknown fid"); break; }
+
+        int cur_fd = parent->fd;
+        char cur_path[512];
+        snprintf(cur_path, sizeof(cur_path), "%s", parent->path);
+
+        uint8_t qids[13 * 16]; /* up to 16 qids */
+        uint16_t nwqid = 0;
+        size_t pos = 10; /* body offset: fid[4] newfid[4] nwname[2] */
+
+        for (uint16_t i = 0; i < nwname; i++) {
+            if (pos + 2 > body_len) break;
+            uint16_t name_len = (uint16_t)body[pos] | ((uint16_t)body[pos + 1] << 8);
+            pos += 2;
+            if (pos + name_len > body_len) break;
+            char name[256];
+            memcpy(name, body + pos, name_len);
+            name[name_len] = '\0';
+            pos += name_len;
+
+            /* Try as directory first, then as file */
+            int next_fd = openat(cur_fd, name, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            uint8_t next_qtype = P9_QID_DIR;
+            if (next_fd < 0) {
+                next_fd = openat(cur_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+                next_qtype = 0;
+            }
+            if (next_fd < 0) {
+                /* Component not found — walk failed, return 0 qids */
+                nwqid = 0;
+                break;
+            }
+
+            /* Build new path */
+            char new_path[512];
+            if (cur_path[0])
+                snprintf(new_path, sizeof(new_path), "%s/%s", cur_path, name);
+            else
+                snprintf(new_path, sizeof(new_path), "%s", name);
+
+            uint64_t next_qpath = fid_next_qpath();
+            P9_PACK_QID(qids + nwqid * 13, next_qtype, 0, next_qpath);
+            nwqid++;
+
+            /* If this is the last component, store in fid_map */
+            if (i == nwname - 1) {
+                if (!fid_add(newfid, next_fd, next_qpath, next_qtype, new_path)) {
+                    close(next_fd);
+                    nwqid = 0;
+                    break;
+                }
+            } else {
+                /* Intermediate component: close old cur_fd (unless it's the parent) */
+                if (cur_fd != parent->fd)
+                    close(cur_fd);
+                cur_fd = next_fd;
+                snprintf(cur_path, sizeof(cur_path), "%s", new_path);
+            }
+        }
+
+        if (nwqid == 0) {
+            /* Walk failed entirely */
+            uint8_t resp[2];
+            p9_put16(resp, 0);
+            p9_send_response(fd, P9_RWALK, tag, resp, 2);
+            printf("[plan9-stub] Twalk: fid=%u nwname=%u → Rwalk (0 qids, failed)\n",
+                   fid, nwname);
+        } else {
+            uint8_t resp[2 + 13 * 16];
+            p9_put16(resp, nwqid);
+            memcpy(resp + 2, qids, (size_t)nwqid * 13);
+            p9_send_response(fd, P9_RWALK, tag, resp, 2 + (size_t)nwqid * 13);
+            printf("[plan9-stub] Twalk: fid=%u nwname=%u → Rwalk (%u qids)\n",
+                   fid, nwname, nwqid);
+        }
         break;
     }
     case P9_TCLUNK: {
-        /* body: fid[4]. Respond Rclunk (empty body). */
+        /* body: fid[4]
+         * C7: Close the fd and remove from fid table. */
+        uint32_t fid = 0;
+        if (body_len >= 4) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+        }
+        struct fid_entry *entry = fid_find(fid);
+        if (entry)
+            printf("[plan9-stub] Tclunk: fid=%u path=%s → Rclunk\n", fid, entry->path);
+        else
+            printf("[plan9-stub] Tclunk: fid=%u (unknown) → Rclunk\n", fid);
+        fid_remove(fid);
         p9_send_response(fd, P9_RCLUNK, tag, NULL, 0);
-        printf("[plan9-stub] Tclunk → Rclunk\n");
         break;
     }
     case P9_TLOPEN: {
         /* 9P2000.L Tlopen body: fid[4] flags[4]
-         * Rlopen body: qid[13] iounit[4]
-         * Stub: return a file QID (non-dir, path derived from fid) + iounit. */
+         * C4: Open the file referenced by fid with the given flags.
+         * The fid was set up by Twalk; we re-open for I/O. */
         uint32_t fid = 0;
-        if (body_len >= 4) {
+        uint32_t flags = 0;
+        if (body_len >= 8) {
             fid = (uint32_t)body[0]
                 | ((uint32_t)body[1] << 8)
                 | ((uint32_t)body[2] << 16)
                 | ((uint32_t)body[3] << 24);
+            flags = (uint32_t)body[4]
+                  | ((uint32_t)body[5] << 8)
+                  | ((uint32_t)body[6] << 16)
+                  | ((uint32_t)body[7] << 24);
         }
-        uint8_t resp[17];
-        resp[0] = 0;  /* qid.type = regular file (no QT_DIR) */
-        p9_put32(resp + 1, 1);     /* qid.version */
-        /* qid.path: derive a non-root path from fid (avoid path=1 which is root) */
-        p9_put64(resp + 5, (uint64_t)(0x1000 + fid));
-        p9_put32(resp + 13, 8192); /* iounit */
-        p9_send_response(fd, P9_RLOPEN, tag, resp, 17);
-        printf("[plan9-stub] Tlopen: fid=%u → Rlopen (file qid, iounit=8192)\n", fid);
+        struct fid_entry *entry = fid_find(fid);
+        if (!entry) { p9_send_error(fd, tag, "unknown fid"); break; }
+
+        /* Re-open the file for I/O (the walk fd may be O_RDONLY or O_DIRECTORY) */
+        if (entry->qtype & P9_QID_DIR) {
+            /* Directory: just return the existing fd */
+            uint8_t resp[17];
+            P9_PACK_QID(resp, entry->qtype, 0, entry->qpath);
+            p9_put32(resp + 13, 8192); /* iounit */
+            p9_send_response(fd, P9_RLOPEN, tag, resp, 17);
+            printf("[plan9-stub] Tlopen: fid=%u (dir) → Rlopen (iounit=8192)\n", fid);
+        } else {
+            /* File: re-open with requested flags */
+            char fullpath[512];
+            if (entry->path[0])
+                snprintf(fullpath, sizeof(fullpath), "%s/%s", g_root_path, entry->path);
+            else
+                snprintf(fullpath, sizeof(fullpath), "%s", g_root_path);
+
+            int newfd = open(fullpath, flags | O_CLOEXEC);
+            if (newfd < 0) {
+                p9_send_error(fd, tag, "open failed");
+                printf("[plan9-stub] Tlopen: fid=%u path=%s flags=0x%x → error\n",
+                       fid, entry->path, flags);
+                break;
+            }
+            close(entry->fd);
+            entry->fd = newfd;
+
+            uint8_t resp[17];
+            resp[0] = 0; /* qid.type = regular file */
+            p9_put32(resp + 1, 0); /* qid.version */
+            p9_put64(resp + 5, entry->qpath);
+            p9_put32(resp + 13, 8192); /* iounit */
+            p9_send_response(fd, P9_RLOPEN, tag, resp, 17);
+            printf("[plan9-stub] Tlopen: fid=%u path=%s flags=0x%x → Rlopen (iounit=8192)\n",
+                   fid, entry->path, flags);
+        }
         break;
     }
     case P9_TLCREATE: {
         /* 9P2000.L Tlcreate body: fid[4] name[s] flags[4] mode[4] gid[4]
-         * Rlcreate body: qid[13] iounit[4]
-         * Stub: ignore name/flags/mode, return a fresh file QID + iounit. */
+         * C7: Create a real file in the parent directory referenced by fid. */
         uint32_t fid = 0;
-        if (body_len >= 4) {
+        uint16_t name_len = 0;
+        char name[256];
+        uint32_t flags = 0, mode = 0;
+        if (body_len >= 10) {
             fid = (uint32_t)body[0]
                 | ((uint32_t)body[1] << 8)
                 | ((uint32_t)body[2] << 16)
                 | ((uint32_t)body[3] << 24);
+            name_len = (uint16_t)body[4] | ((uint16_t)body[5] << 8);
+            if (name_len > 0 && (size_t)(6 + name_len) <= body_len) {
+                memcpy(name, body + 6, name_len);
+                name[name_len] = '\0';
+            }
+            size_t off = (size_t)(6 + name_len);
+            if (off + 12 <= body_len) {
+                flags = (uint32_t)body[off]
+                      | ((uint32_t)body[off + 1] << 8)
+                      | ((uint32_t)body[off + 2] << 16)
+                      | ((uint32_t)body[off + 3] << 24);
+                mode = (uint32_t)body[off + 4]
+                     | ((uint32_t)body[off + 5] << 8)
+                     | ((uint32_t)body[off + 6] << 16)
+                     | ((uint32_t)body[off + 7] << 24);
+            }
         }
+        struct fid_entry *parent = fid_find(fid);
+        if (!parent) { p9_send_error(fd, tag, "unknown fid"); break; }
+
+        int newfd = openat(parent->fd, name, flags | O_CREAT | O_CLOEXEC, mode & 0777);
+        if (newfd < 0) {
+            p9_send_error(fd, tag, "create failed");
+            printf("[plan9-stub] Tlcreate: fid=%u name=%s → error: %s\n",
+                   fid, name, strerror(errno));
+            break;
+        }
+
+        /* Build child path */
+        char child_path[512];
+        if (parent->path[0])
+            snprintf(child_path, sizeof(child_path), "%s/%s", parent->path, name);
+        else
+            snprintf(child_path, sizeof(child_path), "%s", name);
+
+        uint64_t qpath = fid_next_qpath();
+        /* Try fid_replace first: when fid is reused (e.g. from root dir
+         * to a newly created file), replace the old entry. Fall back to
+         * fid_add if the fid is not already in the table. */
+        if (!fid_replace(fid, newfd, qpath, 0, child_path)) {
+            if (!fid_add(fid, newfd, qpath, 0, child_path)) {
+                close(newfd);
+                p9_send_error(fd, tag, "fid table full");
+                break;
+            }
+        }
+
         uint8_t resp[17];
-        resp[0] = 0;  /* qid.type = regular file */
-        p9_put32(resp + 1, 1);     /* qid.version */
-        /* qid.path: fresh path per fid (avoid collision with Tlopen's path space) */
-        p9_put64(resp + 5, (uint64_t)(0x2000 + fid));
-        p9_put32(resp + 13, 8192); /* iounit */
+        resp[0] = 0; /* regular file */
+        p9_put32(resp + 1, 0);
+        p9_put64(resp + 5, qpath);
+        p9_put32(resp + 13, 8192);
         p9_send_response(fd, P9_RLCREATE, tag, resp, 17);
-        printf("[plan9-stub] Tlcreate: fid=%u → Rlcreate (file qid, iounit=8192)\n", fid);
+        printf("[plan9-stub] Tlcreate: fid=%u name=%s path=%s → Rlcreate (qpath=%llu)\n",
+               fid, name, child_path, (unsigned long long)qpath);
         break;
     }
     case P9_TREAD: {
         /* Tread body: fid[4] offset[8] count[4]
-         * Rread body: count[4] data[count]
-         * Stub: always return count=0 (empty file). This exercises the
-         * protocol path (header packing/unpacking) without storing data. */
+         * C5: Real file read via pread() or directory read via getdents(). */
         uint32_t fid = 0;
         uint64_t offset = 0;
         uint32_t count = 0;
@@ -661,18 +987,93 @@ static int p9_handle_request(int fd)
                   | ((uint32_t)body[14] << 16)
                   | ((uint32_t)body[15] << 24);
         }
-        /* Respond with count=0 (no data) */
-        uint8_t resp[4];
-        p9_put32(resp, 0);
-        p9_send_response(fd, P9_RREAD, tag, resp, 4);
-        printf("[plan9-stub] Tread: fid=%u off=%llu count=%u → Rread (0 bytes)\n",
-               fid, (unsigned long long)offset, count);
+        struct fid_entry *entry = fid_find(fid);
+        if (!entry) { p9_send_error(fd, tag, "unknown fid"); break; }
+
+        if (entry->qtype & P9_QID_DIR) {
+            /* Directory read: pack entries in 9P2000.L format.
+             * Format: qid[13] offset[8] type[1] name[s] */
+            DIR *dir = fdopendir(dup(entry->fd));
+            if (!dir) { p9_send_error(fd, tag, "opendir failed"); break; }
+            rewinddir(dir);
+
+            /* Skip entries up to the requested offset */
+            uint64_t entry_idx = 0;
+            struct dirent *de;
+            while (entry_idx < offset && (de = readdir(dir)) != NULL)
+                entry_idx++;
+
+            /* Pack entries into the response buffer */
+            uint8_t *data = malloc(count);
+            if (!data) { closedir(dir); p9_send_error(fd, tag, "oom"); break; }
+            size_t data_len = 0;
+
+            while ((de = readdir(dir)) != NULL && data_len < count) {
+                if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                    continue;
+
+                /* Determine QID type */
+                uint8_t qtype = 0;
+                if (de->d_type == DT_DIR)
+                    qtype = P9_QID_DIR;
+                else if (de->d_type == DT_LNK)
+                    qtype = 0; /* symlinks are files in Plan9 */
+
+                uint64_t d_qpath = fid_next_qpath();
+                size_t name_bytes = strlen(de->d_name);
+                /* Entry size: qid[13] + offset[8] + type[1] + string_len[2] + name[name_bytes] */
+                size_t entry_size = 13 + 8 + 1 + 2 + name_bytes;
+                if (data_len + entry_size > count) break;
+
+                P9_PACK_QID(data + data_len, qtype, 0, d_qpath);
+                data_len += 13;
+                p9_put64(data + data_len, entry_idx + 1);
+                data_len += 8;
+                data[data_len] = (de->d_type == DT_DIR) ? 1 : 0;
+                data_len += 1;
+                data_len += p9_put_string(data + data_len, de->d_name);
+                entry_idx++;
+            }
+            closedir(dir);
+
+            /* Build Rread response: count[4] + data */
+            uint8_t *resp = malloc(4 + data_len);
+            if (!resp) { free(data); p9_send_error(fd, tag, "oom"); break; }
+            p9_put32(resp, (uint32_t)data_len);
+            if (data_len > 0)
+                memcpy(resp + 4, data, data_len);
+            p9_send_response(fd, P9_RREAD, tag, resp, 4 + data_len);
+            free(data);
+            free(resp);
+            printf("[plan9-stub] Tread(dir): fid=%u off=%llu → Rread (%zu bytes, %llu entries)\n",
+                   fid, (unsigned long long)offset, data_len, (unsigned long long)entry_idx - offset);
+        } else {
+            /* File read: use pread() */
+            uint8_t *data = malloc(count);
+            if (!data) { p9_send_error(fd, tag, "oom"); break; }
+            ssize_t n = pread(entry->fd, data, count, (off_t)offset);
+            if (n < 0) {
+                free(data);
+                p9_send_error(fd, tag, "read failed");
+                break;
+            }
+
+            uint8_t *resp = malloc(4 + (size_t)n);
+            if (!resp) { free(data); p9_send_error(fd, tag, "oom"); break; }
+            p9_put32(resp, (uint32_t)n);
+            if (n > 0)
+                memcpy(resp + 4, data, (size_t)n);
+            p9_send_response(fd, P9_RREAD, tag, resp, 4 + (size_t)n);
+            free(data);
+            free(resp);
+            printf("[plan9-stub] Tread(file): fid=%u off=%llu count=%u → Rread (%zd bytes)\n",
+                   fid, (unsigned long long)offset, count, n);
+        }
         break;
     }
     case P9_TWRITE: {
         /* Twrite body: fid[4] offset[8] count[4] data[count]
-         * Rwrite body: count[4]
-         * Stub: echo back the requested count (accept all writes, discard data). */
+         * C5: Real file write via pwrite(). */
         uint32_t fid = 0;
         uint64_t offset = 0;
         uint32_t count = 0;
@@ -688,17 +1089,30 @@ static int p9_handle_request(int fd)
                   | ((uint32_t)body[14] << 16)
                   | ((uint32_t)body[15] << 24);
         }
+        struct fid_entry *entry = fid_find(fid);
+        if (!entry) { p9_send_error(fd, tag, "unknown fid"); break; }
+
+        ssize_t n = 0;
+        if (count > 0 && body_len >= 16 + count) {
+            n = pwrite(entry->fd, body + 16, count, (off_t)offset);
+        }
+
         uint8_t resp[4];
-        p9_put32(resp, count);
+        if (n < 0) {
+            p9_put32(resp, 0);
+            printf("[plan9-stub] Twrite: fid=%u off=%llu count=%u → error: %s\n",
+                   fid, (unsigned long long)offset, count, strerror(errno));
+        } else {
+            p9_put32(resp, (uint32_t)n);
+            printf("[plan9-stub] Twrite: fid=%u off=%llu count=%u → Rwrite (%zd bytes)\n",
+                   fid, (unsigned long long)offset, count, n);
+        }
         p9_send_response(fd, P9_RWRITE, tag, resp, 4);
-        printf("[plan9-stub] Twrite: fid=%u off=%llu count=%u → Rwrite (%u bytes)\n",
-               fid, (unsigned long long)offset, count, count);
         break;
     }
     case P9_TREMOVE: {
         /* Tremove body: fid[4]
-         * Rremove body: (empty)
-         * Stub: always succeed. */
+         * C7: Unlink the file from the filesystem. */
         uint32_t fid = 0;
         if (body_len >= 4) {
             fid = (uint32_t)body[0]
@@ -706,8 +1120,24 @@ static int p9_handle_request(int fd)
                 | ((uint32_t)body[2] << 16)
                 | ((uint32_t)body[3] << 24);
         }
+        struct fid_entry *entry = fid_find(fid);
+        if (!entry) { p9_send_error(fd, tag, "unknown fid"); break; }
+
+        char fullpath[512];
+        if (entry->path[0])
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", g_root_path, entry->path);
+        else
+            snprintf(fullpath, sizeof(fullpath), "%s", g_root_path);
+
+        int rc = (entry->qtype & P9_QID_DIR) ? rmdir(fullpath) : unlink(fullpath);
+        if (rc < 0) {
+            printf("[plan9-stub] Tremove: fid=%u path=%s → error: %s\n",
+                   fid, entry->path, strerror(errno));
+        } else {
+            printf("[plan9-stub] Tremove: fid=%u path=%s → success\n", fid, entry->path);
+        }
+        fid_remove(fid);
         p9_send_response(fd, P9_RREMOVE, tag, NULL, 0);
-        printf("[plan9-stub] Tremove: fid=%u → Rremove (success)\n", fid);
         break;
     }
     case P9_TFLUSH: {
@@ -717,7 +1147,7 @@ static int p9_handle_request(int fd)
         break;
     }
     default:
-        p9_send_error(fd, tag, "not supported (stub)");
+        p9_send_error(fd, tag, "not supported");
         printf("[plan9-stub] unhandled type %u → Rerror\n", msg_type);
         break;
     }
@@ -730,6 +1160,24 @@ static int p9_handle_request(int fd)
  * Exits on pipe close (parent stop) or accept() failure. */
 static void plan9_child_run(int listen_fd, int control_fd)
 {
+    /* Initialize fid_map: mark all slots as unused */
+    for (int i = 0; i < MAX_FID_MAP; i++) {
+        g_fid_map[i].fd = -1;
+        g_fid_map[i].fid = 0;
+        g_fid_map[i].path[0] = '\0';
+    }
+    g_fid_count = 0;
+    g_next_qpath = 2;
+
+    /* Open root directory for Plan9 file system */
+    g_rootfd = open(g_root_path, O_DIRECTORY | O_CLOEXEC);
+    if (g_rootfd < 0) {
+        fprintf(stderr, "[plan9-stub] open root '%s' failed: %s\n",
+                g_root_path, strerror(errno));
+        _exit(1);
+    }
+    printf("[plan9-stub] root directory: %s\n", g_root_path);
+
     /* Signal parent that we're ready */
     close(control_fd);
 
@@ -762,6 +1210,22 @@ static unsigned int plan9_start_server(void)
 {
     if (g_plan9.started) {
         return g_plan9.port;
+    }
+
+    /* 0. Create a temp directory to serve as the Plan9 filesystem root.
+     * This provides a real, writable directory for file I/O tests. */
+    {
+        const char *test_root = getenv("WSL_TEST_ROOT");
+        if (test_root && test_root[0]) {
+            snprintf(g_root_path, sizeof(g_root_path), "%s/plan9_XXXXXX", test_root);
+        } else {
+            snprintf(g_root_path, sizeof(g_root_path), "/tmp/wsl_plan9_XXXXXX");
+        }
+        if (mkdtemp(g_root_path) == NULL) {
+            perror("[plan9] mkdtemp");
+            return 0;
+        }
+        printf("[plan9-stub] created temp root: %s\n", g_root_path);
     }
 
     /* 1. Create TCP listener on port 50009 (localhost only).
@@ -872,6 +1336,29 @@ static bool plan9_stop_server(bool force)
     if (g_plan9.control_pipe[0] >= 0) {
         close(g_plan9.control_pipe[0]);
         g_plan9.control_pipe[0] = -1;
+    }
+
+    /* Clean up the temp directory recursively */
+    if (g_root_path[0]) {
+        /* Remove all files and subdirectories in the temp root */
+        DIR *dir = opendir(g_root_path);
+        if (dir) {
+            struct dirent *de;
+            char fullpath[512];
+            while ((de = readdir(dir)) != NULL) {
+                if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                    continue;
+                snprintf(fullpath, sizeof(fullpath), "%s/%s", g_root_path, de->d_name);
+                if (de->d_type == DT_DIR)
+                    rmdir(fullpath);
+                else
+                    unlink(fullpath);
+            }
+            closedir(dir);
+        }
+        rmdir(g_root_path);
+        printf("[plan9-stub] cleaned up temp root: %s\n", g_root_path);
+        g_root_path[0] = '\0';
     }
 
     printf("[plan9-stub] server stopped (force=%d)\n", force);

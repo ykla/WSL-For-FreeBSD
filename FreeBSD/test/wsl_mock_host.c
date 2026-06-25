@@ -757,17 +757,56 @@ int main(void)
         }
 
         /* ===================================================================
-         * Group H: 9P2000.L extended message types
+         * Group H: 9P2000.L extended message types (real file I/O)
          * ===================================================================
-         * Verify the stub server handles Tlopen/Tlcreate/Tread/Twrite/Tremove.
-         * Uses fid=10/11 to avoid colliding with fid=0 (clunked by Group A2).
-         * Each test sends a request and validates the response type, tag echo,
-         * and key body fields. */
+         * Verify the server handles Tlopen/Tlcreate/Tread/Twrite/Tremove
+         * with real file system operations. Uses fid=10 as the work fid
+         * (first attached to root, then reused for file create/write/read).
+         *
+         * Flow:
+         *   Pre: Tattach(fid=10) → root
+         *   H1: Tlopen(fid=10, O_RDONLY) → root dir open
+         *   H2: Tread(fid=10, offset=0) → directory entries
+         *   H3: Tlcreate(fid=10, "testfile", O_RDWR, 0644) → create file
+         *   H4: Twrite(fid=10, offset=0, "hello") → write 5 bytes
+         *   H5: Tread(fid=10, offset=0, count=100) → read back "hello"
+         *
+         * Group C (real file I/O extension):
+         *   C1: Tstat(fid=10) → stat the file (size=5, regular file)
+         *   C2: Tremove(fid=10) → unlink the file
+         *   C3: Twalk to removed file → returns 0 qids (file gone) */
 
-        /* ---- Step H1: Tlopen(112) → Rlopen(113) ----
-         * Tlopen body: fid[4] flags[4]
-         * Rlopen body: qid[13] iounit[4] */
-        printf("\n[host] Step H1: Group H - Tlopen(112) on fid=10...\n");
+        /* ---- Pre: Tattach fid=10 to root ---- */
+        printf("\n[host] Step Pre-H: Tattach fid=10 to root...\n");
+        {
+            uint8_t tattach[32];
+            size_t tattach_size = 4 + 1 + 2 + 4 + 4 + 2 + 2;  /* 19 bytes */
+            tattach[0] = (uint8_t)(tattach_size & 0xFF);
+            tattach[1] = (uint8_t)((tattach_size >> 8) & 0xFF);
+            tattach[2] = 0; tattach[3] = 0;
+            tattach[4] = 104;       /* Tattach */
+            tattach[5] = 0x20;      /* tag = 32 */
+            tattach[6] = 0x00;
+            /* fid = 10 */
+            tattach[7] = 10; tattach[8] = 0; tattach[9] = 0; tattach[10] = 0;
+            /* afid = NOFID (0xFFFFFFFF) */
+            tattach[11] = 0xFF; tattach[12] = 0xFF;
+            tattach[13] = 0xFF; tattach[14] = 0xFF;
+            /* uname = "" */
+            tattach[15] = 0; tattach[16] = 0;
+            /* aname = "" */
+            tattach[17] = 0; tattach[18] = 0;
+
+            CHECK(send_all(p9_fd, tattach, tattach_size) == 0,
+                  "Group H: send Tattach(fid=10)", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            CHECK(rlen >= 20, "Group H: receive Rattach(fid=10)", "got %d bytes", rlen);
+            printf("  fid=10 attached to root\n");
+        }
+
+        /* ---- Step H1: Tlopen(112) on root directory ---- */
+        printf("\n[host] Step H1: Group H - Tlopen(112) on fid=10 (root dir)...\n");
         {
             uint8_t tlopen[15];
             size_t msg_size = 4 + 1 + 2 + 4 + 4;  /* 15 */
@@ -779,14 +818,13 @@ int main(void)
             tlopen[6] = 0x00;
             /* fid = 10 */
             tlopen[7] = 10; tlopen[8] = 0; tlopen[9] = 0; tlopen[10] = 0;
-            /* flags = O_RDONLY (0x0000) */
+            /* flags = O_RDONLY */
             tlopen[11] = 0; tlopen[12] = 0; tlopen[13] = 0; tlopen[14] = 0;
 
             CHECK(send_all(p9_fd, tlopen, msg_size) == 0,
-                  "Group H: send Tlopen", "send failed");
+                  "Group H: send Tlopen(fid=10)", "send failed");
 
             int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
-            /* Rlopen: size[4] type[1] tag[2] qid[13] iounit[4] = 24 bytes */
             CHECK(rlen >= 24, "Group H: receive Rlopen", "got %d bytes", rlen);
 
             if (rlen >= 24) {
@@ -804,20 +842,18 @@ int main(void)
                 CHECK(resp_tag == 10,
                       "Group H: Rlopen tag echoed (10)",
                       "got %u", resp_tag);
-                CHECK((qtype & 0x80) == 0,
-                      "Group H: Rlopen QID is regular file (no QT_DIR)",
+                CHECK((qtype & 0x80) != 0,
+                      "Group H: Rlopen QID is directory (QT_DIR set)",
                       "got 0x%02X", qtype);
                 CHECK(iounit > 0,
                       "Group H: Rlopen iounit > 0",
                       "got %u", iounit);
-                printf("  Rlopen: qid(type=0x%02X), iounit=%u\n", qtype, iounit);
+                printf("  Rlopen: qid(dir, type=0x%02X), iounit=%u\n", qtype, iounit);
             }
         }
 
-        /* ---- Step H2: Tread(116) → Rread(117) ----
-         * Tread body: fid[4] offset[8] count[4]
-         * Rread body: count[4] data[count] (stub returns count=0) */
-        printf("\n[host] Step H2: Group H - Tread(116) on fid=10...\n");
+        /* ---- Step H2: Tread(116) on root directory ---- */
+        printf("\n[host] Step H2: Group H - Tread(116) on fid=10 (root dir)...\n");
         {
             uint8_t tread[23];
             size_t msg_size = 4 + 1 + 2 + 4 + 8 + 4;  /* 23 */
@@ -825,21 +861,20 @@ int main(void)
             tread[1] = (uint8_t)((msg_size >> 8) & 0xFF);
             tread[2] = 0; tread[3] = 0;
             tread[4] = 116;       /* Tread */
-            tread[5] = 0x0B;     /* tag = 11 */
+            tread[5] = 0x0B;      /* tag = 11 */
             tread[6] = 0x00;
             /* fid = 10 */
             tread[7] = 10; tread[8] = 0; tread[9] = 0; tread[10] = 0;
             /* offset = 0 */
             memset(&tread[11], 0, 8);
-            /* count = 100 (request up to 100 bytes) */
+            /* count = 100 */
             tread[19] = 100; tread[20] = 0; tread[21] = 0; tread[22] = 0;
 
             CHECK(send_all(p9_fd, tread, msg_size) == 0,
-                  "Group H: send Tread", "send failed");
+                  "Group H: send Tread(dir)", "send failed");
 
             int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
-            /* Rread: size[4] type[1] tag[2] count[4] = 11 bytes (count=0) */
-            CHECK(rlen >= 11, "Group H: receive Rread", "got %d bytes", rlen);
+            CHECK(rlen >= 11, "Group H: receive Rread(dir)", "got %d bytes", rlen);
 
             if (rlen >= 11) {
                 uint8_t  resp_type = rbuf[4];
@@ -855,101 +890,43 @@ int main(void)
                 CHECK(resp_tag == 11,
                       "Group H: Rread tag echoed (11)",
                       "got %u", resp_tag);
-                CHECK(resp_count == 0,
-                      "Group H: Rread count==0 (empty file stub)",
-                      "got %u", resp_count);
-                printf("  Rread: count=%u (empty)\n", resp_count);
+                /* Directory may be empty (new temp dir) — accept any count */
+                (void)resp_count;
+                printf("  Rread(dir): count=%u (directory entries)\n", resp_count);
             }
         }
 
-        /* ---- Step H3: Twrite(118) → Rwrite(119) ----
-         * Twrite body: fid[4] offset[8] count[4] data[count]
-         * Rwrite body: count[4] (echoes requested count) */
-        printf("\n[host] Step H3: Group H - Twrite(118) on fid=10...\n");
+        /* ---- Step H3: Tlcreate(114) on fid=10 (parent dir) ---- */
+        printf("\n[host] Step H3: Group H - Tlcreate(114) on fid=10...\n");
         {
-            const char *payload = "hello";
-            uint32_t payload_len = (uint32_t)strlen(payload);
-            size_t msg_size = 4 + 1 + 2 + 4 + 8 + 4 + payload_len;  /* 23 + 5 = 28 */
-            uint8_t twrite[64];
-            twrite[0] = (uint8_t)(msg_size & 0xFF);
-            twrite[1] = (uint8_t)((msg_size >> 8) & 0xFF);
-            twrite[2] = 0; twrite[3] = 0;
-            twrite[4] = 118;       /* Twrite */
-            twrite[5] = 0x0C;      /* tag = 12 */
-            twrite[6] = 0x00;
-            /* fid = 10 */
-            twrite[7] = 10; twrite[8] = 0; twrite[9] = 0; twrite[10] = 0;
-            /* offset = 0 */
-            memset(&twrite[11], 0, 8);
-            /* count = payload_len */
-            twrite[19] = (uint8_t)(payload_len & 0xFF);
-            twrite[20] = (uint8_t)((payload_len >> 8) & 0xFF);
-            twrite[21] = 0; twrite[22] = 0;
-            /* data */
-            memcpy(&twrite[23], payload, payload_len);
-
-            CHECK(send_all(p9_fd, twrite, msg_size) == 0,
-                  "Group H: send Twrite", "send failed");
-
-            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
-            /* Rwrite: size[4] type[1] tag[2] count[4] = 11 bytes */
-            CHECK(rlen >= 11, "Group H: receive Rwrite", "got %d bytes", rlen);
-
-            if (rlen >= 11) {
-                uint8_t  resp_type = rbuf[4];
-                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
-                uint32_t resp_count = (uint32_t)rbuf[7]
-                                    | ((uint32_t)rbuf[8] << 8)
-                                    | ((uint32_t)rbuf[9] << 16)
-                                    | ((uint32_t)rbuf[10] << 24);
-
-                CHECK(resp_type == 119,
-                      "Group H: Rwrite type==119",
-                      "got %u", resp_type);
-                CHECK(resp_tag == 12,
-                      "Group H: Rwrite tag echoed (12)",
-                      "got %u", resp_tag);
-                CHECK(resp_count == payload_len,
-                      "Group H: Rwrite count==payload_len",
-                      "got %u (expected %u)", resp_count, payload_len);
-                printf("  Rwrite: count=%u (echoed)\n", resp_count);
-            }
-        }
-
-        /* ---- Step H4: Tlcreate(114) → Rlcreate(115) ----
-         * Tlcreate body: fid[4] name[s] flags[4] mode[4] gid[4]
-         * Rlcreate body: qid[13] iounit[4] */
-        printf("\n[host] Step H4: Group H - Tlcreate(114) on fid=11...\n");
-        {
-            const char *name = "test";
+            const char *name = "testfile";
             uint16_t name_len = (uint16_t)strlen(name);
-            /* fid[4] + name_len[2] + name[4] + flags[4] + mode[4] + gid[4] = 22 body bytes */
-            size_t msg_size = 4 + 1 + 2 + 4 + 2 + name_len + 4 + 4 + 4;  /* 29 */
-            uint8_t tlcreate[32];
+            /* fid[4] + name_len[2] + name[8] + flags[4] + mode[4] + gid[4] */
+            size_t msg_size = 4 + 1 + 2 + 4 + 2 + name_len + 4 + 4 + 4;  /* 33 */
+            uint8_t tlcreate[40];
             tlcreate[0] = (uint8_t)(msg_size & 0xFF);
             tlcreate[1] = (uint8_t)((msg_size >> 8) & 0xFF);
             tlcreate[2] = 0; tlcreate[3] = 0;
             tlcreate[4] = 114;       /* Tlcreate */
             tlcreate[5] = 0x0D;      /* tag = 13 */
             tlcreate[6] = 0x00;
-            /* fid = 11 */
-            tlcreate[7] = 11; tlcreate[8] = 0; tlcreate[9] = 0; tlcreate[10] = 0;
+            /* fid = 10 (parent dir) */
+            tlcreate[7] = 10; tlcreate[8] = 0; tlcreate[9] = 0; tlcreate[10] = 0;
             /* name: length + data */
             tlcreate[11] = (uint8_t)(name_len & 0xFF);
             tlcreate[12] = (uint8_t)((name_len >> 8) & 0xFF);
             memcpy(&tlcreate[13], name, name_len);
-            /* flags = O_WRONLY|O_CREAT (0x0241) */
-            tlcreate[17] = 0x41; tlcreate[18] = 0x02; tlcreate[19] = 0; tlcreate[20] = 0;
+            /* flags = O_RDWR (0x0002) */
+            tlcreate[21] = 0x02; tlcreate[22] = 0; tlcreate[23] = 0; tlcreate[24] = 0;
             /* mode = 0644 */
-            tlcreate[21] = 0xA4; tlcreate[22] = 0x01; tlcreate[23] = 0; tlcreate[24] = 0;
+            tlcreate[25] = 0xA4; tlcreate[26] = 0x01; tlcreate[27] = 0; tlcreate[28] = 0;
             /* gid = 0 */
-            memset(&tlcreate[25], 0, 4);
+            memset(&tlcreate[29], 0, 4);
 
             CHECK(send_all(p9_fd, tlcreate, msg_size) == 0,
                   "Group H: send Tlcreate", "send failed");
 
             int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
-            /* Rlcreate: size[4] type[1] tag[2] qid[13] iounit[4] = 24 bytes */
             CHECK(rlen >= 24, "Group H: receive Rlcreate", "got %d bytes", rlen);
 
             if (rlen >= 24) {
@@ -973,14 +950,172 @@ int main(void)
                 CHECK(iounit > 0,
                       "Group H: Rlcreate iounit > 0",
                       "got %u", iounit);
-                printf("  Rlcreate: qid(type=0x%02X), iounit=%u\n", qtype, iounit);
+                printf("  Rlcreate: qid(file, type=0x%02X), iounit=%u\n", qtype, iounit);
             }
         }
 
-        /* ---- Step H5: Tremove(122) → Rremove(123) ----
-         * Tremove body: fid[4]
-         * Rremove body: (empty) */
-        printf("\n[host] Step H5: Group H - Tremove(122) on fid=11...\n");
+        /* ---- Step H4: Twrite(118) on fid=10 (the file) ---- */
+        printf("\n[host] Step H4: Group H - Twrite(118) on fid=10...\n");
+        {
+            const char *payload = "hello";
+            uint32_t payload_len = (uint32_t)strlen(payload);
+            size_t msg_size = 4 + 1 + 2 + 4 + 8 + 4 + payload_len;  /* 28 */
+            uint8_t twrite[64];
+            twrite[0] = (uint8_t)(msg_size & 0xFF);
+            twrite[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+            twrite[2] = 0; twrite[3] = 0;
+            twrite[4] = 118;       /* Twrite */
+            twrite[5] = 0x0C;      /* tag = 12 */
+            twrite[6] = 0x00;
+            /* fid = 10 */
+            twrite[7] = 10; twrite[8] = 0; twrite[9] = 0; twrite[10] = 0;
+            /* offset = 0 */
+            memset(&twrite[11], 0, 8);
+            /* count = payload_len */
+            twrite[19] = (uint8_t)(payload_len & 0xFF);
+            twrite[20] = (uint8_t)((payload_len >> 8) & 0xFF);
+            twrite[21] = 0; twrite[22] = 0;
+            /* data */
+            memcpy(&twrite[23], payload, payload_len);
+
+            CHECK(send_all(p9_fd, twrite, msg_size) == 0,
+                  "Group H: send Twrite", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            CHECK(rlen >= 11, "Group H: receive Rwrite", "got %d bytes", rlen);
+
+            if (rlen >= 11) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+                uint32_t resp_count = (uint32_t)rbuf[7]
+                                    | ((uint32_t)rbuf[8] << 8)
+                                    | ((uint32_t)rbuf[9] << 16)
+                                    | ((uint32_t)rbuf[10] << 24);
+
+                CHECK(resp_type == 119,
+                      "Group H: Rwrite type==119",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 12,
+                      "Group H: Rwrite tag echoed (12)",
+                      "got %u", resp_tag);
+                CHECK(resp_count == payload_len,
+                      "Group H: Rwrite count==payload_len",
+                      "got %u (expected %u)", resp_count, payload_len);
+                printf("  Rwrite: count=%u\n", resp_count);
+            }
+        }
+
+        /* ---- Step H5: Tread(116) on fid=10 (read back the file) ---- */
+        printf("\n[host] Step H5: Group H - Tread(116) on fid=10 (read back)...\n");
+        {
+            uint8_t tread[23];
+            size_t msg_size = 4 + 1 + 2 + 4 + 8 + 4;  /* 23 */
+            tread[0] = (uint8_t)(msg_size & 0xFF);
+            tread[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+            tread[2] = 0; tread[3] = 0;
+            tread[4] = 116;       /* Tread */
+            tread[5] = 0x0F;      /* tag = 15 */
+            tread[6] = 0x00;
+            /* fid = 10 */
+            tread[7] = 10; tread[8] = 0; tread[9] = 0; tread[10] = 0;
+            /* offset = 0 */
+            memset(&tread[11], 0, 8);
+            /* count = 100 */
+            tread[19] = 100; tread[20] = 0; tread[21] = 0; tread[22] = 0;
+
+            CHECK(send_all(p9_fd, tread, msg_size) == 0,
+                  "Group H: send Tread(file)", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            CHECK(rlen >= 11, "Group H: receive Rread(file)", "got %d bytes", rlen);
+
+            if (rlen >= 11) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+                uint32_t resp_count = (uint32_t)rbuf[7]
+                                    | ((uint32_t)rbuf[8] << 8)
+                                    | ((uint32_t)rbuf[9] << 16)
+                                    | ((uint32_t)rbuf[10] << 24);
+
+                CHECK(resp_type == 117,
+                      "Group H: Rread type==117",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 15,
+                      "Group H: Rread tag echoed (15)",
+                      "got %u", resp_tag);
+                CHECK(resp_count == 5,
+                      "Group H: Rread count==5 (read back 'hello')",
+                      "got %u", resp_count);
+                if (resp_count == 5) {
+                    CHECK(memcmp(rbuf + 11, "hello", 5) == 0,
+                          "Group H: Rread data=='hello'",
+                          "got '%.5s'", rbuf + 11);
+                }
+                printf("  Rread(file): count=%u, data='%.*s'\n",
+                       resp_count, (int)resp_count, rbuf + 11);
+            }
+        }
+
+        /* ===================================================================
+         * Group C: Real file I/O extension tests
+         * =================================================================== */
+        printf("\n[host] Group C: Real file I/O tests...\n");
+
+        /* ---- Step C1: Tstat(124) on fid=10 (the file) ---- */
+        printf("\n[host] Step C1: Tstat(124) on fid=10...\n");
+        {
+            uint8_t tstat[11];
+            size_t msg_size = 4 + 1 + 2 + 4;  /* 11 */
+            tstat[0] = (uint8_t)(msg_size & 0xFF);
+            tstat[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+            tstat[2] = 0; tstat[3] = 0;
+            tstat[4] = 124;       /* Tstat */
+            tstat[5] = 0x30;      /* tag = 48 */
+            tstat[6] = 0x00;
+            /* fid = 10 */
+            tstat[7] = 10; tstat[8] = 0; tstat[9] = 0; tstat[10] = 0;
+
+            CHECK(send_all(p9_fd, tstat, msg_size) == 0,
+                  "Group C: send Tstat", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            CHECK(rlen >= 9, "Group C: receive Rstat", "got %d bytes", rlen);
+
+            if (rlen >= 9) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+                /* stat_size[2] at rbuf[7], then stat body */
+                uint16_t stat_size = (uint16_t)rbuf[7] | ((uint16_t)rbuf[8] << 8);
+                /* stat body: type[2] dev[4] qid[13] mode[4] atime[4] mtime[4] length[8] ... */
+                uint16_t stat_type = (uint16_t)rbuf[9] | ((uint16_t)rbuf[10] << 8);
+                uint32_t mode = (uint32_t)rbuf[28]
+                              | ((uint32_t)rbuf[29] << 8)
+                              | ((uint32_t)rbuf[30] << 16)
+                              | ((uint32_t)rbuf[31] << 24);
+                uint64_t length = 0;
+                for (int i = 0; i < 8; i++)
+                    length |= ((uint64_t)rbuf[40 + i]) << (i * 8);
+
+                CHECK(resp_type == 125,
+                      "Group C: Rstat type==125",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 48,
+                      "Group C: Rstat tag echoed (48)",
+                      "got %u", resp_tag);
+                CHECK(stat_type == 0,
+                      "Group C: stat type==0 (regular file)",
+                      "got %u", stat_type);
+                CHECK(length == 5,
+                      "Group C: stat length==5 (file size)",
+                      "got %llu", (unsigned long long)length);
+                printf("  Rstat: type=%u, mode=0%o, length=%llu, stat_size=%u\n",
+                       stat_type, (unsigned)mode & 07777,
+                       (unsigned long long)length, stat_size);
+            }
+        }
+
+        /* ---- Step C2: Tremove(122) on fid=10 (remove the file) ---- */
+        printf("\n[host] Step C2: Tremove(122) on fid=10...\n");
         {
             uint8_t tremove[11];
             size_t msg_size = 4 + 1 + 2 + 4;  /* 11 */
@@ -988,34 +1123,96 @@ int main(void)
             tremove[1] = (uint8_t)((msg_size >> 8) & 0xFF);
             tremove[2] = 0; tremove[3] = 0;
             tremove[4] = 122;       /* Tremove */
-            tremove[5] = 0x0E;      /* tag = 14 */
+            tremove[5] = 0x31;      /* tag = 49 */
             tremove[6] = 0x00;
-            /* fid = 11 */
-            tremove[7] = 11; tremove[8] = 0; tremove[9] = 0; tremove[10] = 0;
+            /* fid = 10 */
+            tremove[7] = 10; tremove[8] = 0; tremove[9] = 0; tremove[10] = 0;
 
             CHECK(send_all(p9_fd, tremove, msg_size) == 0,
-                  "Group H: send Tremove", "send failed");
+                  "Group C: send Tremove", "send failed");
 
             int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
-            /* Rremove: size[4] type[1] tag[2] = 7 bytes (empty body) */
-            CHECK(rlen >= 7, "Group H: receive Rremove", "got %d bytes", rlen);
+            CHECK(rlen >= 7, "Group C: receive Rremove", "got %d bytes", rlen);
 
             if (rlen >= 7) {
                 uint8_t  resp_type = rbuf[4];
                 uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
 
                 CHECK(resp_type == 123,
-                      "Group H: Rremove type==123",
+                      "Group C: Rremove type==123",
                       "got %u", resp_type);
-                CHECK(resp_tag == 14,
-                      "Group H: Rremove tag echoed (14)",
+                CHECK(resp_tag == 49,
+                      "Group C: Rremove tag echoed (49)",
                       "got %u", resp_tag);
-                printf("  Rremove: success (empty body)\n");
+                printf("  Rremove: success\n");
+            }
+        }
+
+        /* ---- Step C3: Verify file is gone (Twalk to removed file fails) ---- */
+        printf("\n[host] Step C3: Twalk to removed file...\n");
+        {
+            /* Tattach fid=20 to root */
+            uint8_t tattach[32];
+            size_t tattach_size = 4 + 1 + 2 + 4 + 4 + 2 + 2;
+            tattach[0] = (uint8_t)(tattach_size & 0xFF);
+            tattach[1] = (uint8_t)((tattach_size >> 8) & 0xFF);
+            tattach[2] = 0; tattach[3] = 0;
+            tattach[4] = 104;       /* Tattach */
+            tattach[5] = 0x32;      /* tag = 50 */
+            tattach[6] = 0x00;
+            tattach[7] = 20; tattach[8] = 0; tattach[9] = 0; tattach[10] = 0;
+            tattach[11] = 0xFF; tattach[12] = 0xFF;
+            tattach[13] = 0xFF; tattach[14] = 0xFF;
+            tattach[15] = 0; tattach[16] = 0;
+            tattach[17] = 0; tattach[18] = 0;
+
+            CHECK(send_all(p9_fd, tattach, tattach_size) == 0,
+                  "Group C: send Tattach(fid=20)", "send failed");
+            read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+
+            /* Twalk fid=20 → newfid=21, nwname=1, "testfile" */
+            const char *wanted = "testfile";
+            uint16_t wlen = (uint16_t)strlen(wanted);
+            size_t twalk_size = 4 + 1 + 2 + 4 + 4 + 2 + 2 + wlen;  /* 29 */
+            uint8_t twalk[40];
+            twalk[0] = (uint8_t)(twalk_size & 0xFF);
+            twalk[1] = (uint8_t)((twalk_size >> 8) & 0xFF);
+            twalk[2] = 0; twalk[3] = 0;
+            twalk[4] = 110;       /* Twalk */
+            twalk[5] = 0x33;      /* tag = 51 */
+            twalk[6] = 0x00;
+            twalk[7] = 20; twalk[8] = 0; twalk[9] = 0; twalk[10] = 0;  /* fid = 20 */
+            twalk[11] = 21; twalk[12] = 0; twalk[13] = 0; twalk[14] = 0; /* newfid = 21 */
+            twalk[15] = 1; twalk[16] = 0;  /* nwname = 1 */
+            twalk[17] = (uint8_t)(wlen & 0xFF);
+            twalk[18] = (uint8_t)((wlen >> 8) & 0xFF);
+            memcpy(&twalk[19], wanted, wlen);
+
+            CHECK(send_all(p9_fd, twalk, twalk_size) == 0,
+                  "Group C: send Twalk(testfile)", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            CHECK(rlen >= 9, "Group C: receive Rwalk", "got %d bytes", rlen);
+
+            if (rlen >= 9) {
+                uint8_t  resp_type = rbuf[4];
+                /* uint16_t resp_tag = ...; — unused */
+                (void)rbuf[5]; (void)rbuf[6];
+                uint16_t nwqid = (uint16_t)rbuf[7] | ((uint16_t)rbuf[8] << 8);
+
+                CHECK(resp_type == 111,
+                      "Group C: Rwalk type==111",
+                      "got %u", resp_type);
+                CHECK(nwqid == 0,
+                      "Group C: Rwalk returns 0 qids (file not found)",
+                      "got %u", nwqid);
+                printf("  Rwalk: nwqid=%u (file '%s' removed → not found)\n",
+                       nwqid, wanted);
             }
         }
 
         close(p9_fd);
-        printf("  Group A/H: 9P connection closed\n");
+        printf("  Group H/C: 9P connection closed\n");
     }
 
     /* ---- Step A3 (Group A): StopPlan9Server(24) round-trip ----
