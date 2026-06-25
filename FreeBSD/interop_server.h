@@ -41,6 +41,42 @@
 #include <stdbool.h>
 #include <errno.h>
 
+/* ===================================================================
+ * VM GUID helper (interop-local, independent of gns_engine.h)
+ * ===================================================================
+ *
+ * Task Group G: QueryVmId returns actual VM GUID string instead of "".
+ * Reads host UUID from /etc/hostid (FreeBSD) or /etc/machine-id (Linux).
+ */
+static inline int interop_get_vm_id_string(char *buf, size_t buf_size)
+{
+    if (buf_size < 37) return -1;
+
+    static const char *const try_paths[] = {
+        "/etc/hostid",                              /* FreeBSD */
+        "/etc/machine-id",                          /* Linux */
+        "/proc/sys/kernel/random/boot_id",          /* Linux fallback */
+        NULL,
+    };
+
+    for (int i = 0; try_paths[i] != NULL; i++) {
+        FILE *f = fopen(try_paths[i], "r");
+        if (!f) continue;
+        size_t n = fread(buf, 1, buf_size - 1, f);
+        fclose(f);
+        if (n == 0) continue;
+        buf[n] = '\0';
+        while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' ||
+                         buf[n-1] == ' '  || buf[n-1] == '\t')) {
+            buf[--n] = '\0';
+        }
+        if (n > 0) return 0;
+    }
+
+    snprintf(buf, buf_size, "00000000-0000-0000-0000-000000000000");
+    return 0;
+}
+
 /* ---- Interop message types (from lxinitshared.h LX_MESSAGE_TYPE enum) ---- */
 #ifndef LxInitMessageCreateProcess
 #define LxInitMessageCreateProcess               1
@@ -363,9 +399,13 @@ static inline int interop_process_message(int fd, void *msg, size_t msg_size)
         break;
 
     case LxInitMessageQueryVmId:
-        /* No VM ID configured — return empty string. */
-        printf("[interop] QueryVmId -> (empty)\n");
-        interop_send_vm_id_response(fd, hdr->SequenceNumber, "");
+        /* Task Group G: return actual VM GUID string from hostid/machine-id. */
+        {
+            char vm_id_str[64];
+            interop_get_vm_id_string(vm_id_str, sizeof(vm_id_str));
+            printf("[interop] QueryVmId -> %s\n", vm_id_str);
+            interop_send_vm_id_response(fd, hdr->SequenceNumber, vm_id_str);
+        }
         break;
 
     case LxInitMessageCreateProcess:

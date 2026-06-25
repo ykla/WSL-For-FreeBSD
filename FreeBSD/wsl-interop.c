@@ -74,9 +74,11 @@ struct LX_INIT_CREATE_NT_PROCESS_UTILITY_VM {
 
 /* Build a CreateNtProcessUtilityVm message.
  * Returns malloc'd buffer (caller frees) or NULL on failure.
- * Sets *out_size to the message size. */
+ * Sets *out_size to the message size.
+ * port: the I/O relay port to advertise (0 = no I/O relay). */
 static char *build_create_nt_process_message(const char *filename,
                                               int argc, char **argv,
+                                              uint32_t port,
                                               size_t *out_size)
 {
     /* Calculate the base size (header + Port + Common up to Buffer[]) */
@@ -109,9 +111,7 @@ static char *build_create_nt_process_message(const char *filename,
     m->Header.MessageType = LxInitMessageCreateProcessUtilityVm;
     m->Header.MessageSize = (unsigned int)total;
     m->Header.SequenceNumber = 0;
-    m->Port = 0; /* No vsock port — I/O relay is not implemented in this
-                  * minimal version. The host may reject if it requires
-                  * I/O sockets, but the message format is correct. */
+    m->Port = port; /* I/O relay port (0 = no I/O relay, for backward compat) */
 
     size_t offset = 0;
     /* Filename */
@@ -195,11 +195,24 @@ int main(int argc, char **argv)
     printf("[wsl-interop] connected, sending CreateProcessUtilityVm for '%s'\n",
            windows_path);
 
-    /* Build the CreateNtProcessUtilityVm message */
+    /* Task Group F: Create the I/O relay listener before sending the message.
+     * The host will connect back to this port for stdin/stdout/stderr. */
+    int io_listen_fd = -1;
+    uint16_t io_port = 0;
+    if (wsl_interop_create_io_listener(&io_listen_fd, &io_port) < 0) {
+        fprintf(stderr, "wsl-interop: failed to create I/O relay listener; "
+                        "falling back to Port=0 (no I/O)\n");
+        /* Continue with Port=0 — host may still accept the message */
+    } else {
+        printf("[wsl-interop] I/O relay listener on port %u\n", io_port);
+    }
+
+    /* Build the CreateNtProcessUtilityVm message with the I/O port */
     size_t msg_size = 0;
     char *msg = build_create_nt_process_message(windows_path, argc, argv,
-                                                  &msg_size);
+                                                  io_port, &msg_size);
     if (!msg) {
+        if (io_listen_fd >= 0) close(io_listen_fd);
         close(fd);
         return 1;
     }
@@ -212,6 +225,7 @@ int main(int argc, char **argv)
             if (errno == EINTR) continue;
             perror("wsl-interop: send");
             free(msg);
+            if (io_listen_fd >= 0) close(io_listen_fd);
             close(fd);
             return 1;
         }
@@ -219,8 +233,8 @@ int main(int argc, char **argv)
     }
     free(msg);
 
-    printf("[wsl-interop] message sent (%zu bytes), waiting for response...\n",
-           msg_size);
+    printf("[wsl-interop] message sent (%zu bytes, port=%u), waiting for response...\n",
+           msg_size, io_port);
 
     /* Read the ResultUint32 response */
     struct {
@@ -245,11 +259,13 @@ int main(int argc, char **argv)
             fprintf(stderr, "wsl-interop: interop server closed connection\n");
         else
             perror("wsl-interop: recv");
+        if (io_listen_fd >= 0) close(io_listen_fd);
         return 1;
     }
 
     if (n < (ssize_t)sizeof(resp)) {
         fprintf(stderr, "wsl-interop: short response (%zd bytes)\n", n);
+        if (io_listen_fd >= 0) close(io_listen_fd);
         return 1;
     }
 
@@ -259,20 +275,34 @@ int main(int argc, char **argv)
     if (resp.MessageType != LxMessageResultUint32) {
         fprintf(stderr, "wsl-interop: unexpected response type %u\n",
                 resp.MessageType);
+        if (io_listen_fd >= 0) close(io_listen_fd);
         return 1;
     }
 
     if (resp.Result != 0) {
         fprintf(stderr, "wsl-interop: host returned error %u (%s)\n",
                 resp.Result, strerror(resp.Result));
+        if (io_listen_fd >= 0) close(io_listen_fd);
         return 1;
     }
 
     printf("[wsl-interop] Windows process launched successfully\n");
-    /* Note: Full I/O relay (stdin/stdout/stderr) would require the host to
-     * connect back to I/O sockets provided by this wrapper. In the current
-     * minimal implementation, the Port field is 0 (no I/O listener). The
-     * host may handle this differently — some WSL host implementations
-     * relay I/O through the control channel itself. */
+
+    /* Task Group F: If we advertised an I/O port, run the relay loop.
+     * The host should connect back 3 times (stdin, stdout, stderr).
+     * This blocks until the host closes the stdin connection. */
+    if (io_listen_fd >= 0 && io_port > 0) {
+        printf("[wsl-interop] starting I/O relay (port=%u)...\n", io_port);
+        int relay_rc = wsl_interop_run_io_relay(io_listen_fd, 15000);
+        if (relay_rc < 0) {
+            fprintf(stderr, "wsl-interop: I/O relay failed\n");
+            return 1;
+        }
+        printf("[wsl-interop] I/O relay complete\n");
+    } else {
+        /* Backward-compat mode: no I/O relay (Port=0).
+         * Some host implementations relay I/O through the control channel. */
+        printf("[wsl-interop] no I/O relay (Port=0)\n");
+    }
     return 0;
 }

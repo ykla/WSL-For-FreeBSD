@@ -73,6 +73,7 @@
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 
 #include "wsl_protocol.h"
 
@@ -96,6 +97,9 @@
 
 /* E3: Include GNS engine for g_generate_resolvconf flag testing */
 #include "../gns_engine.h"
+
+/* Task Group F: Include wsl_interop.h for I/O relay unit testing */
+#include "../wsl_interop.h"
 
 /* Phase 1: TerminateInstance message type */
 #define LxInitMessageTerminateInstance  14
@@ -752,8 +756,266 @@ int main(void)
             }
         }
 
+        /* ===================================================================
+         * Group H: 9P2000.L extended message types
+         * ===================================================================
+         * Verify the stub server handles Tlopen/Tlcreate/Tread/Twrite/Tremove.
+         * Uses fid=10/11 to avoid colliding with fid=0 (clunked by Group A2).
+         * Each test sends a request and validates the response type, tag echo,
+         * and key body fields. */
+
+        /* ---- Step H1: Tlopen(112) → Rlopen(113) ----
+         * Tlopen body: fid[4] flags[4]
+         * Rlopen body: qid[13] iounit[4] */
+        printf("\n[host] Step H1: Group H - Tlopen(112) on fid=10...\n");
+        {
+            uint8_t tlopen[15];
+            size_t msg_size = 4 + 1 + 2 + 4 + 4;  /* 15 */
+            tlopen[0] = (uint8_t)(msg_size & 0xFF);
+            tlopen[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+            tlopen[2] = 0; tlopen[3] = 0;
+            tlopen[4] = 112;       /* Tlopen */
+            tlopen[5] = 0x0A;      /* tag = 10 */
+            tlopen[6] = 0x00;
+            /* fid = 10 */
+            tlopen[7] = 10; tlopen[8] = 0; tlopen[9] = 0; tlopen[10] = 0;
+            /* flags = O_RDONLY (0x0000) */
+            tlopen[11] = 0; tlopen[12] = 0; tlopen[13] = 0; tlopen[14] = 0;
+
+            CHECK(send_all(p9_fd, tlopen, msg_size) == 0,
+                  "Group H: send Tlopen", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            /* Rlopen: size[4] type[1] tag[2] qid[13] iounit[4] = 24 bytes */
+            CHECK(rlen >= 24, "Group H: receive Rlopen", "got %d bytes", rlen);
+
+            if (rlen >= 24) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+                uint8_t  qtype = rbuf[7];
+                uint32_t iounit = (uint32_t)rbuf[20]
+                                | ((uint32_t)rbuf[21] << 8)
+                                | ((uint32_t)rbuf[22] << 16)
+                                | ((uint32_t)rbuf[23] << 24);
+
+                CHECK(resp_type == 113,
+                      "Group H: Rlopen type==113",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 10,
+                      "Group H: Rlopen tag echoed (10)",
+                      "got %u", resp_tag);
+                CHECK((qtype & 0x80) == 0,
+                      "Group H: Rlopen QID is regular file (no QT_DIR)",
+                      "got 0x%02X", qtype);
+                CHECK(iounit > 0,
+                      "Group H: Rlopen iounit > 0",
+                      "got %u", iounit);
+                printf("  Rlopen: qid(type=0x%02X), iounit=%u\n", qtype, iounit);
+            }
+        }
+
+        /* ---- Step H2: Tread(116) → Rread(117) ----
+         * Tread body: fid[4] offset[8] count[4]
+         * Rread body: count[4] data[count] (stub returns count=0) */
+        printf("\n[host] Step H2: Group H - Tread(116) on fid=10...\n");
+        {
+            uint8_t tread[23];
+            size_t msg_size = 4 + 1 + 2 + 4 + 8 + 4;  /* 23 */
+            tread[0] = (uint8_t)(msg_size & 0xFF);
+            tread[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+            tread[2] = 0; tread[3] = 0;
+            tread[4] = 116;       /* Tread */
+            tread[5] = 0x0B;     /* tag = 11 */
+            tread[6] = 0x00;
+            /* fid = 10 */
+            tread[7] = 10; tread[8] = 0; tread[9] = 0; tread[10] = 0;
+            /* offset = 0 */
+            memset(&tread[11], 0, 8);
+            /* count = 100 (request up to 100 bytes) */
+            tread[19] = 100; tread[20] = 0; tread[21] = 0; tread[22] = 0;
+
+            CHECK(send_all(p9_fd, tread, msg_size) == 0,
+                  "Group H: send Tread", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            /* Rread: size[4] type[1] tag[2] count[4] = 11 bytes (count=0) */
+            CHECK(rlen >= 11, "Group H: receive Rread", "got %d bytes", rlen);
+
+            if (rlen >= 11) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+                uint32_t resp_count = (uint32_t)rbuf[7]
+                                    | ((uint32_t)rbuf[8] << 8)
+                                    | ((uint32_t)rbuf[9] << 16)
+                                    | ((uint32_t)rbuf[10] << 24);
+
+                CHECK(resp_type == 117,
+                      "Group H: Rread type==117",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 11,
+                      "Group H: Rread tag echoed (11)",
+                      "got %u", resp_tag);
+                CHECK(resp_count == 0,
+                      "Group H: Rread count==0 (empty file stub)",
+                      "got %u", resp_count);
+                printf("  Rread: count=%u (empty)\n", resp_count);
+            }
+        }
+
+        /* ---- Step H3: Twrite(118) → Rwrite(119) ----
+         * Twrite body: fid[4] offset[8] count[4] data[count]
+         * Rwrite body: count[4] (echoes requested count) */
+        printf("\n[host] Step H3: Group H - Twrite(118) on fid=10...\n");
+        {
+            const char *payload = "hello";
+            uint32_t payload_len = (uint32_t)strlen(payload);
+            size_t msg_size = 4 + 1 + 2 + 4 + 8 + 4 + payload_len;  /* 23 + 5 = 28 */
+            uint8_t twrite[64];
+            twrite[0] = (uint8_t)(msg_size & 0xFF);
+            twrite[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+            twrite[2] = 0; twrite[3] = 0;
+            twrite[4] = 118;       /* Twrite */
+            twrite[5] = 0x0C;      /* tag = 12 */
+            twrite[6] = 0x00;
+            /* fid = 10 */
+            twrite[7] = 10; twrite[8] = 0; twrite[9] = 0; twrite[10] = 0;
+            /* offset = 0 */
+            memset(&twrite[11], 0, 8);
+            /* count = payload_len */
+            twrite[19] = (uint8_t)(payload_len & 0xFF);
+            twrite[20] = (uint8_t)((payload_len >> 8) & 0xFF);
+            twrite[21] = 0; twrite[22] = 0;
+            /* data */
+            memcpy(&twrite[23], payload, payload_len);
+
+            CHECK(send_all(p9_fd, twrite, msg_size) == 0,
+                  "Group H: send Twrite", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            /* Rwrite: size[4] type[1] tag[2] count[4] = 11 bytes */
+            CHECK(rlen >= 11, "Group H: receive Rwrite", "got %d bytes", rlen);
+
+            if (rlen >= 11) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+                uint32_t resp_count = (uint32_t)rbuf[7]
+                                    | ((uint32_t)rbuf[8] << 8)
+                                    | ((uint32_t)rbuf[9] << 16)
+                                    | ((uint32_t)rbuf[10] << 24);
+
+                CHECK(resp_type == 119,
+                      "Group H: Rwrite type==119",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 12,
+                      "Group H: Rwrite tag echoed (12)",
+                      "got %u", resp_tag);
+                CHECK(resp_count == payload_len,
+                      "Group H: Rwrite count==payload_len",
+                      "got %u (expected %u)", resp_count, payload_len);
+                printf("  Rwrite: count=%u (echoed)\n", resp_count);
+            }
+        }
+
+        /* ---- Step H4: Tlcreate(114) → Rlcreate(115) ----
+         * Tlcreate body: fid[4] name[s] flags[4] mode[4] gid[4]
+         * Rlcreate body: qid[13] iounit[4] */
+        printf("\n[host] Step H4: Group H - Tlcreate(114) on fid=11...\n");
+        {
+            const char *name = "test";
+            uint16_t name_len = (uint16_t)strlen(name);
+            /* fid[4] + name_len[2] + name[4] + flags[4] + mode[4] + gid[4] = 22 body bytes */
+            size_t msg_size = 4 + 1 + 2 + 4 + 2 + name_len + 4 + 4 + 4;  /* 29 */
+            uint8_t tlcreate[32];
+            tlcreate[0] = (uint8_t)(msg_size & 0xFF);
+            tlcreate[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+            tlcreate[2] = 0; tlcreate[3] = 0;
+            tlcreate[4] = 114;       /* Tlcreate */
+            tlcreate[5] = 0x0D;      /* tag = 13 */
+            tlcreate[6] = 0x00;
+            /* fid = 11 */
+            tlcreate[7] = 11; tlcreate[8] = 0; tlcreate[9] = 0; tlcreate[10] = 0;
+            /* name: length + data */
+            tlcreate[11] = (uint8_t)(name_len & 0xFF);
+            tlcreate[12] = (uint8_t)((name_len >> 8) & 0xFF);
+            memcpy(&tlcreate[13], name, name_len);
+            /* flags = O_WRONLY|O_CREAT (0x0241) */
+            tlcreate[17] = 0x41; tlcreate[18] = 0x02; tlcreate[19] = 0; tlcreate[20] = 0;
+            /* mode = 0644 */
+            tlcreate[21] = 0xA4; tlcreate[22] = 0x01; tlcreate[23] = 0; tlcreate[24] = 0;
+            /* gid = 0 */
+            memset(&tlcreate[25], 0, 4);
+
+            CHECK(send_all(p9_fd, tlcreate, msg_size) == 0,
+                  "Group H: send Tlcreate", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            /* Rlcreate: size[4] type[1] tag[2] qid[13] iounit[4] = 24 bytes */
+            CHECK(rlen >= 24, "Group H: receive Rlcreate", "got %d bytes", rlen);
+
+            if (rlen >= 24) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+                uint8_t  qtype = rbuf[7];
+                uint32_t iounit = (uint32_t)rbuf[20]
+                                | ((uint32_t)rbuf[21] << 8)
+                                | ((uint32_t)rbuf[22] << 16)
+                                | ((uint32_t)rbuf[23] << 24);
+
+                CHECK(resp_type == 115,
+                      "Group H: Rlcreate type==115",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 13,
+                      "Group H: Rlcreate tag echoed (13)",
+                      "got %u", resp_tag);
+                CHECK((qtype & 0x80) == 0,
+                      "Group H: Rlcreate QID is regular file (no QT_DIR)",
+                      "got 0x%02X", qtype);
+                CHECK(iounit > 0,
+                      "Group H: Rlcreate iounit > 0",
+                      "got %u", iounit);
+                printf("  Rlcreate: qid(type=0x%02X), iounit=%u\n", qtype, iounit);
+            }
+        }
+
+        /* ---- Step H5: Tremove(122) → Rremove(123) ----
+         * Tremove body: fid[4]
+         * Rremove body: (empty) */
+        printf("\n[host] Step H5: Group H - Tremove(122) on fid=11...\n");
+        {
+            uint8_t tremove[11];
+            size_t msg_size = 4 + 1 + 2 + 4;  /* 11 */
+            tremove[0] = (uint8_t)(msg_size & 0xFF);
+            tremove[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+            tremove[2] = 0; tremove[3] = 0;
+            tremove[4] = 122;       /* Tremove */
+            tremove[5] = 0x0E;      /* tag = 14 */
+            tremove[6] = 0x00;
+            /* fid = 11 */
+            tremove[7] = 11; tremove[8] = 0; tremove[9] = 0; tremove[10] = 0;
+
+            CHECK(send_all(p9_fd, tremove, msg_size) == 0,
+                  "Group H: send Tremove", "send failed");
+
+            int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            /* Rremove: size[4] type[1] tag[2] = 7 bytes (empty body) */
+            CHECK(rlen >= 7, "Group H: receive Rremove", "got %d bytes", rlen);
+
+            if (rlen >= 7) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+
+                CHECK(resp_type == 123,
+                      "Group H: Rremove type==123",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 14,
+                      "Group H: Rremove tag echoed (14)",
+                      "got %u", resp_tag);
+                printf("  Rremove: success (empty body)\n");
+            }
+        }
+
         close(p9_fd);
-        printf("  Group A: 9P connection closed\n");
+        printf("  Group A/H: 9P connection closed\n");
     }
 
     /* ---- Step A3 (Group A): StopPlan9Server(24) round-trip ----
@@ -1272,6 +1534,42 @@ int main(void)
         }
     }
 
+    /* ---- Step 77b (Phase 9 / G): GNS SetupIpv6 (type=69) ----
+     * G: Verify SetupIpv6 now performs actual IPv6 configuration and
+     * responds with success (was: simple ack with "ipv6 ack" message). */
+    printf("\n[host] Step 77b: Sending GNS SetupIpv6 (type=69)...\n");
+    {
+        struct MESSAGE_HEADER ipv6_msg;
+        memset(&ipv6_msg, 0, sizeof(ipv6_msg));
+        ipv6_msg.MessageType = LxGnsMessageSetupIpv6;
+        ipv6_msg.MessageSize = sizeof(ipv6_msg);
+        ipv6_msg.SequenceNumber = 772;
+
+        int sent = send_all(gns_fd, &ipv6_msg, sizeof(ipv6_msg));
+        CHECK(sent == 0, "G: SetupIpv6 sent", "send returned %d", sent);
+
+        if (sent == 0) {
+            LX_GNS_RESULT *gns_resp =
+                (LX_GNS_RESULT *)recv_gns_response(gns_fd, &hdr);
+            if (gns_resp) {
+                CHECK(gns_resp->Header.MessageType == LxGnsMessageResult,
+                      "G: SetupIpv6 response MessageType==54",
+                      "got %u", gns_resp->Header.MessageType);
+                CHECK(gns_resp->Header.SequenceNumber == 772,
+                      "G: SetupIpv6 response seq echoed (772)",
+                      "got %u", gns_resp->Header.SequenceNumber);
+                CHECK(gns_resp->Result == 0,
+                      "G: SetupIpv6 Result==0 (success)",
+                      "got %d", gns_resp->Result);
+                printf("  SetupIpv6 response: '%s'\n",
+                       gns_resp->Buffer[0] ? gns_resp->Buffer : "(empty)");
+                free(gns_resp);
+            } else {
+                CHECK(0, "G: SetupIpv6 response received", "no response");
+            }
+        }
+    }
+
     /* ================================================================== */
     /* ---- Task Group D: LxGnsMessageNotification(55) HNS state tests  ---- */
     /* ---- Steps 78-82: Route/IPAddress/DNS/Interface/unknown          ---- */
@@ -1411,6 +1709,105 @@ int main(void)
             close(test_listen);
         }
     }
+
+    /* ================================================================== */
+    /* ---- Task Group C/D/E: GNS request/response round-trips         ---- */
+    /* ---- Steps 85-94: PortMapping/SetListener/ListenerRelay/        ---- */
+    /* ---- CreateDevice/ModifyDevice/LoopbackRoutes/DeviceSetting/    ---- */
+    /* ---- IfStateChange/GlobalNetFilter/InterfaceNetFilter            ---- */
+    /* ================================================================== */
+
+    /* Helper: send a GNS request with JSON payload and verify the response.
+     * Uses LX_GNS_INTERFACE_CONFIGURATION as the wire format (Header + Content[]).
+     * expected_resp_type is LxGnsMessageResult(54) for most, or
+     * LxGnsMessageIfStateChangeResponse(67) for IfStateChangeRequest. */
+    #define SEND_GNS_REQUEST(msg_type, json, seq_num, expected_resp_type, \
+                              desc)                                               \
+        do {                                                                      \
+            size_t _clen = strlen(json) + 1;                                     \
+            size_t _msz = sizeof(LX_GNS_INTERFACE_CONFIGURATION) + _clen;       \
+            LX_GNS_INTERFACE_CONFIGURATION *_m = calloc(1, _msz);                 \
+            if (_m) {                                                            \
+                _m->Header.MessageType = (msg_type);                            \
+                _m->Header.MessageSize = (unsigned int)_msz;                    \
+                _m->Header.SequenceNumber = (seq_num);                          \
+                memcpy(_m->Content, (json), _clen);                             \
+                int _sr = send_all(gns_fd, _m, _msz);                           \
+                CHECK(_sr == 0, desc " sent", "send failed");                    \
+                free(_m);                                                        \
+                if (_sr == 0) {                                                 \
+                    LX_GNS_RESULT *_r =                                          \
+                        (LX_GNS_RESULT *)recv_gns_response(gns_fd, &hdr);      \
+                    if (_r) {                                                    \
+                        CHECK(_r->Header.MessageType == (expected_resp_type),   \
+                              desc " resp type", "got %u",                      \
+                              _r->Header.MessageType);                          \
+                        CHECK(_r->Header.SequenceNumber == (seq_num),           \
+                              desc " seq echoed", "got %u",                     \
+                              _r->Header.SequenceNumber);                      \
+                        CHECK(_r->Result == 0,                                  \
+                              desc " Result==0", "got %d", _r->Result);         \
+                        free(_r);                                                \
+                    } else {                                                     \
+                        CHECK(0, desc " resp received", "no response");         \
+                    }                                                            \
+                }                                                                \
+            } else {                                                             \
+                CHECK(0, desc " alloc", "oom");                                  \
+            }                                                                    \
+        } while (0)
+
+    printf("\n[host] Step 85: GNS PortMappingRequest(56)...\n");
+    SEND_GNS_REQUEST(LxGnsMessagePortMappingRequest,
+                     "{\"Port\":8080,\"Protocol\":\"tcp\",\"Remove\":false}",
+                     851, LxGnsMessageResult, "C: PortMappingRequest");
+
+    printf("\n[host] Step 86: GNS SetPortListener(58)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageSetPortListener,
+                     "{\"Family\":2,\"Port\":9090,\"Address\":\"127.0.0.1\"}",
+                     861, LxGnsMessageResult, "C: SetPortListener");
+
+    printf("\n[host] Step 87: GNS ListenerRelay(75)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageListenerRelay,
+                     "{\"Port\":7070,\"Family\":2}",
+                     871, LxGnsMessageResult, "C: ListenerRelay");
+
+    printf("\n[host] Step 88: GNS CreateDeviceRequest(62)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageCreateDeviceRequest,
+                     "{\"Name\":\"eth1\",\"Type\":\"veth\",\"MAC\":\"02:00:00:00:00:01\"}",
+                     881, LxGnsMessageResult, "D: CreateDevice");
+
+    printf("\n[host] Step 89: GNS ModifyGuestDeviceSettingRequest(63)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageModifyGuestDeviceSettingRequest,
+                     "{\"Name\":\"eth1\",\"Setting\":\"mtu\",\"Value\":\"1500\"}",
+                     891, LxGnsMessageResult, "D: ModifyDeviceSetting");
+
+    printf("\n[host] Step 90: GNS LoopbackRoutesRequest(64)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageLoopbackRoutesRequest,
+                     "{\"Action\":\"add\",\"Destination\":\"127.0.0.0/8\"}",
+                     901, LxGnsMessageResult, "D: LoopbackRoutes");
+
+    printf("\n[host] Step 91: GNS DeviceSettingRequest(65)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageDeviceSettingRequest,
+                     "{\"Name\":\"eth1\",\"Setting\":\"mtu\"}",
+                     911, LxGnsMessageResult, "D: DeviceSetting");
+
+    printf("\n[host] Step 92: GNS IfStateChangeRequest(66) -> IfStateChangeResponse(67)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageIfStateChangeRequest,
+                     "{\"Name\":\"lo0\",\"Up\":true,\"MTU\":1500}",
+                     921, LxGnsMessageIfStateChangeResponse, "D: IfStateChange");
+
+    printf("\n[host] Step 93: GNS GlobalNetFilter(72)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageGlobalNetFilter,
+                     "{\"Action\":\"add\",\"Rules\":\"pass in all\"}",
+                     931, LxGnsMessageResult, "E: GlobalNetFilter");
+
+    printf("\n[host] Step 94: GNS InterfaceNetFilter(73)...\n");
+    SEND_GNS_REQUEST(LxGnsMessageInterfaceNetFilter,
+                     "{\"Name\":\"eth1\",\"Action\":\"add\",\"Rules\":\"pass in all\"}",
+                     941, LxGnsMessageResult, "E: InterfaceNetFilter");
+
+    #undef SEND_GNS_REQUEST
 
     /* ---- Step 6: Connect to hvbridge on port 60000 ---- */
     printf("\n[host] Step 6: Connecting to hvbridge on port %d...\n", PORT_HVS_BSD);
@@ -3881,11 +4278,12 @@ int main(void)
                         CHECK(rh->SequenceNumber == 612,
                               "QueryVmId response seq echoed (612)",
                               "got %u", rh->SequenceNumber);
-                        /* VmId should be empty string (no VM ID configured) */
-                        CHECK(vm_id[0] == '\0',
-                              "QueryVmId result==empty string",
-                              "got '%s'", vm_id);
-                        printf("  VmId: '%s' (empty)\n", vm_id);
+                        /* G: VmId should now be a non-empty GUID string
+                         * (read from /etc/hostid or /etc/machine-id). */
+                        CHECK(vm_id[0] != '\0',
+                              "QueryVmId result non-empty GUID string",
+                              "got empty string");
+                        printf("  VmId: '%s'\n", vm_id);
                         free(qvi_resp);
                     } else {
                         CHECK(0, "QueryVmId response received", "no response");
@@ -5206,6 +5604,386 @@ int main(void)
         CHECK(brc == 0, "E1: binfmt_setup(protect=0) returns 0", "got %d", brc);
 
         wsl_conf_free(&conf);
+    }
+
+    /* ====================================================================
+     * Task Group F: I/O Relay — unit tests for wsl_interop.h helpers.
+     *
+     * Tests the I/O relay infrastructure added in Task Group F:
+     *   F1: wsl_interop_create_io_listener — listener creation + port assignment
+     *   F2: wsl_interop_accept_one_io — accept timeout + successful accept
+     *   F3: wsl_interop_relay_pair — bidirectional data relay
+     *   F4: end-to-end relay through pipes (simulates stdin/stdout relay)
+     * ==================================================================== */
+    printf("\n[host] Step 74: F1 — I/O relay listener creation...\n");
+    {
+        /* Override bind IP to 127.0.0.1 for the test environment */
+        setenv("WSL_INTEROP_IO_BIND_IP", "127.0.0.1", 1);
+
+        int listen_fd = -1;
+        uint16_t port = 0;
+        int rc = wsl_interop_create_io_listener(&listen_fd, &port);
+
+        CHECK(rc == 0, "F1: create_io_listener returns 0", "got rc=%d", rc);
+        CHECK(listen_fd >= 0, "F1: listener fd >= 0", "got fd=%d", listen_fd);
+        CHECK(port > 0, "F1: assigned port > 0", "got port=%u", port);
+
+        /* Verify the port is actually listening by connecting to it */
+        if (listen_fd >= 0 && port > 0) {
+            int probe = socket(AF_INET, SOCK_STREAM, 0);
+            CHECK(probe >= 0, "F1: probe socket created", "failed");
+
+            if (probe >= 0) {
+                struct sockaddr_in addr;
+                memset(&addr, 0, sizeof(addr));
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(port);
+                inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+                int crc = connect(probe, (struct sockaddr *)&addr, sizeof(addr));
+                CHECK(crc == 0, "F1: connect to listener succeeds",
+                      "connect failed: %s", strerror(errno));
+
+                if (crc == 0) {
+                    /* Accept the probe connection */
+                    int accepted = wsl_interop_accept_one_io(listen_fd, 1000);
+                    CHECK(accepted >= 0, "F1: accept probe connection",
+                          "accept failed: %s", strerror(errno));
+                    if (accepted >= 0) close(accepted);
+                }
+                close(probe);
+            }
+        }
+
+        if (listen_fd >= 0) close(listen_fd);
+
+        /* Test F1b: invalid bind IP is rejected */
+        setenv("WSL_INTEROP_IO_BIND_IP", "999.999.999.999", 1);
+        int bad_fd = -1;
+        uint16_t bad_port = 0;
+        int bad_rc = wsl_interop_create_io_listener(&bad_fd, &bad_port);
+        CHECK(bad_rc < 0, "F1b: invalid bind IP rejected", "rc=%d", bad_rc);
+        if (bad_fd >= 0) close(bad_fd);
+
+        /* Restore valid bind IP for subsequent tests */
+        setenv("WSL_INTEROP_IO_BIND_IP", "127.0.0.1", 1);
+    }
+
+    printf("\n[host] Step 75: F2 — accept timeout behavior...\n");
+    {
+        int listen_fd = -1;
+        uint16_t port = 0;
+        int rc = wsl_interop_create_io_listener(&listen_fd, &port);
+        CHECK(rc == 0, "F2: listener created for timeout test", "rc=%d", rc);
+
+        if (rc == 0) {
+            /* No one connects — accept should time out */
+            int start_ms = 0;
+            struct timespec ts_start, ts_end;
+            clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
+            int accepted = wsl_interop_accept_one_io(listen_fd, 500);
+
+            clock_gettime(CLOCK_MONOTONIC, &ts_end);
+            start_ms = (int)((ts_end.tv_sec - ts_start.tv_sec) * 1000 +
+                             (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000);
+
+            CHECK(accepted < 0, "F2: accept times out when no connection",
+                  "got fd=%d", accepted);
+            CHECK(start_ms >= 400, "F2: timeout waited ~500ms",
+                  "only %d ms", start_ms);
+            CHECK(start_ms < 2000, "F2: timeout not excessively long",
+                  "%d ms", start_ms);
+
+            if (accepted >= 0) close(accepted);
+            close(listen_fd);
+        }
+    }
+
+    printf("\n[host] Step 76: F3 — bidirectional relay via wsl_interop_relay_pair...\n");
+    {
+        /* Test wsl_interop_relay_pair using pipes to simulate stdio.
+         *
+         * Setup:
+         *   - pipe_local[2]: represents the local fd (e.g. stdin or stdout)
+         *   - pipe_remote[2]: represents the network fd
+         *
+         * For direction=0 (local→remote, like stdin):
+         *   write to pipe_local[1] → relay reads pipe_local[0], writes pipe_remote[1]
+         *   read from pipe_remote[0] to verify
+         *
+         * We use socketpair instead of pipe for bidirectional capability. */
+        int local_sv[2], remote_sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, local_sv) == 0,
+              "F3: local socketpair created", "%s", strerror(errno));
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, remote_sv) == 0,
+              "F3: remote socketpair created", "%s", strerror(errno));
+
+        if (local_sv[0] >= 0 && remote_sv[0] >= 0) {
+            /* direction=0: local→remote (stdin direction)
+             * relay reads from local_sv[0], writes to remote_sv[1]
+             * We write to local_sv[1], read from remote_sv[0] */
+            volatile int stop_flag = 0;
+
+            /* Fork a child to run the relay */
+            pid_t child = fork();
+            CHECK(child >= 0, "F3: fork relay child", "%s", strerror(errno));
+
+            if (child == 0) {
+                /* Child: close the ends we don't use */
+                close(local_sv[1]);
+                close(remote_sv[0]);
+                /* relay: read local_sv[0] → write remote_sv[1] */
+                wsl_interop_relay_pair(local_sv[0], remote_sv[1], 0, &stop_flag);
+                close(local_sv[0]);
+                close(remote_sv[1]);
+                _exit(0);
+            }
+
+            if (child > 0) {
+                /* Parent: close child's ends */
+                close(local_sv[0]);
+                close(remote_sv[1]);
+
+                /* Send test data through the relay */
+                const char *test_data = "Hello from F3 relay test!\n";
+                size_t data_len = strlen(test_data);
+                ssize_t sent = send(local_sv[1], test_data, data_len, 0);
+                CHECK(sent == (ssize_t)data_len,
+                      "F3: send test data to local end",
+                      "sent=%zd", sent);
+
+                /* Read from remote end */
+                char buf[128] = {0};
+                ssize_t received = 0;
+                for (int attempt = 0; attempt < 50 && received < (ssize_t)data_len; attempt++) {
+                    ssize_t n = read(remote_sv[0], buf + received,
+                                     sizeof(buf) - received - 1);
+                    if (n > 0) received += n;
+                    else if (n == 0) break;
+                    else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+                    usleep(10000); /* 10 ms */
+                }
+
+                CHECK(received == (ssize_t)data_len,
+                      "F3: relay forwarded all data",
+                      "received=%zd/%zu", received, data_len);
+                CHECK(strcmp(buf, test_data) == 0,
+                      "F3: relayed data matches",
+                      "got '%s'", buf);
+
+                /* Signal child to stop and close fds */
+                stop_flag = 1;
+                close(local_sv[1]);
+                close(remote_sv[0]);
+
+                int status;
+                waitpid(child, &status, 0);
+                CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                      "F3: relay child exited cleanly",
+                      "status=%d", status);
+            }
+        }
+    }
+
+    printf("\n[host] Step 77: F4 — reverse relay direction (remote→local)...\n");
+    {
+        /* Test wsl_interop_relay_pair with direction=1 (remote→local).
+         * This simulates the stdout/stderr relay path: data flows from
+         * the network fd to the local fd (e.g. STDOUT_FILENO). */
+        int local_sv[2], remote_sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, local_sv) == 0,
+              "F4: local socketpair created", "%s", strerror(errno));
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, remote_sv) == 0,
+              "F4: remote socketpair created", "%s", strerror(errno));
+
+        if (local_sv[0] >= 0 && remote_sv[0] >= 0) {
+            volatile int stop_flag = 0;
+
+            /* Fork a child to run the relay */
+            pid_t child = fork();
+            CHECK(child >= 0, "F4: fork relay child", "%s", strerror(errno));
+
+            if (child == 0) {
+                /* Child: close the ends we don't use */
+                close(local_sv[1]);
+                close(remote_sv[0]);
+                /* direction=1: read remote_sv[1] → write local_sv[0]
+                 * (simulates stdout: data from network → local fd) */
+                wsl_interop_relay_pair(local_sv[0], remote_sv[1], 1, &stop_flag);
+                close(local_sv[0]);
+                close(remote_sv[1]);
+                _exit(0);
+            }
+
+            if (child > 0) {
+                /* Parent: close child's ends */
+                close(local_sv[0]);
+                close(remote_sv[1]);
+
+                /* Send data to the remote end (simulating host sending
+                 * stdout data to the guest) */
+                const char *test_data = "stdout data from F4!\n";
+                size_t data_len = strlen(test_data);
+                ssize_t sent = send(remote_sv[0], test_data, data_len, 0);
+                CHECK(sent == (ssize_t)data_len,
+                      "F4: send data to remote end",
+                      "sent=%zd", sent);
+
+                /* Read from local end (where the relay wrote) */
+                char buf[128] = {0};
+                ssize_t received = 0;
+                for (int attempt = 0; attempt < 50 && received < (ssize_t)data_len; attempt++) {
+                    ssize_t n = read(local_sv[1], buf + received,
+                                     sizeof(buf) - received - 1);
+                    if (n > 0) received += n;
+                    else if (n == 0) break;
+                    else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+                    usleep(10000);
+                }
+
+                CHECK(received == (ssize_t)data_len,
+                      "F4: relay forwarded data in reverse direction",
+                      "received=%zd/%zu", received, data_len);
+                CHECK(strcmp(buf, test_data) == 0,
+                      "F4: reverse-relayed data matches",
+                      "got '%s'", buf);
+
+                /* Signal child to stop and close fds */
+                stop_flag = 1;
+                close(local_sv[1]);
+                close(remote_sv[0]);
+
+                int status;
+                waitpid(child, &status, 0);
+                CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                      "F4: reverse relay child exited cleanly",
+                      "status=%d", status);
+            }
+        }
+    }
+
+    printf("\n[host] Step 78: F5 — full I/O relay with 3 host connections...\n");
+    {
+        /* Test the complete wsl_interop_run_io_relay flow by forking a
+         * child that uses it with redirected stdio. The parent acts as
+         * the host: connects 3 times to the listener port.
+         *
+         * Since wsl_interop_run_io_relay uses STDIN_FILENO/STDOUT_FILENO/
+         * STDERR_FILENO directly, the child must redirect these to pipes. */
+        int listen_fd = -1;
+        uint16_t port = 0;
+        int rc = wsl_interop_create_io_listener(&listen_fd, &port);
+        CHECK(rc == 0, "F5: listener created for full relay test", "rc=%d", rc);
+
+        if (rc == 0) {
+            /* Pipes for the guest's stdin/stdout/stderr */
+            int gstdin[2], gstdout[2], gstderr[2];
+            CHECK(pipe(gstdin) == 0, "F5: gstdin pipe", "%s", strerror(errno));
+            CHECK(pipe(gstdout) == 0, "F5: gstdout pipe", "%s", strerror(errno));
+            CHECK(pipe(gstderr) == 0, "F5: gstderr pipe", "%s", strerror(errno));
+
+            if (gstdin[0] >= 0 && gstdout[0] >= 0 && gstderr[0] >= 0) {
+                pid_t guest = fork();
+                CHECK(guest >= 0, "F5: fork guest", "%s", strerror(errno));
+
+                if (guest == 0) {
+                    /* Guest child: redirect stdio to pipes, then run
+                     * the full I/O relay. */
+                    dup2(gstdin[0], STDIN_FILENO);
+                    dup2(gstdout[1], STDOUT_FILENO);
+                    dup2(gstderr[1], STDERR_FILENO);
+                    /* Close all original fds (parent will close its copies) */
+                    close(gstdin[0]); close(gstdin[1]);
+                    close(gstdout[0]); close(gstdout[1]);
+                    close(gstderr[0]); close(gstderr[1]);
+
+                    /* Run the full relay — accepts 3 connections on listen_fd */
+                    int rrc = wsl_interop_run_io_relay(listen_fd, 5000);
+                    _exit(rrc == 0 ? 0 : 1);
+                }
+
+                if (guest > 0) {
+                    /* Parent (host): close guest-side pipe ends */
+                    close(gstdin[0]);
+                    close(gstdout[1]);
+                    close(gstderr[1]);
+                    close(listen_fd); /* guest owns it now */
+
+                    usleep(50000); /* let guest start */
+
+                    /* Connect 3 times as the host would */
+                    int conns[3] = {-1, -1, -1};
+                    struct sockaddr_in addr;
+                    memset(&addr, 0, sizeof(addr));
+                    addr.sin_family = AF_INET;
+                    addr.sin_port = htons(port);
+                    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+                    int all_connected = 1;
+                    for (int i = 0; i < 3; i++) {
+                        conns[i] = socket(AF_INET, SOCK_STREAM, 0);
+                        if (conns[i] < 0 ||
+                            connect(conns[i], (struct sockaddr *)&addr,
+                                    sizeof(addr)) < 0) {
+                            all_connected = 0;
+                            break;
+                        }
+                        usleep(10000); /* stagger connections */
+                    }
+
+                    CHECK(all_connected,
+                          "F5: host connects 3 times (stdin/stdout/stderr)",
+                          "failed at connection %d", all_connected ? 3 : 0);
+
+                    if (all_connected) {
+                        /* conns[0] = stdin (host→guest) */
+                        /* conns[1] = stdout (guest→host) */
+                        /* conns[2] = stderr (guest→host) */
+
+                        /* Send test data via stdin connection */
+                        const char *msg = "F5 full relay test\n";
+                        size_t mlen = strlen(msg);
+                        ssize_t sent = send(conns[0], msg, mlen, 0);
+                        CHECK(sent == (ssize_t)mlen,
+                              "F5: host sends stdin data",
+                              "sent=%zd", sent);
+
+                        /* Read it back from the guest's stdout pipe
+                         * (the relay forwards stdin_net→STDOUT_FILENO→pipe) */
+                        char buf[128] = {0};
+                        ssize_t received = 0;
+                        for (int a = 0; a < 100 && received < (ssize_t)mlen; a++) {
+                            ssize_t n = read(gstdout[0], buf + received,
+                                             sizeof(buf) - received - 1);
+                            if (n > 0) received += n;
+                            else if (n == 0) break;
+                            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+                            usleep(10000);
+                        }
+
+                        CHECK(received == (ssize_t)mlen,
+                              "F5: full relay forwarded stdin→stdout",
+                              "got %zd/%zu", received, mlen);
+                        CHECK(strcmp(buf, msg) == 0,
+                              "F5: full relay data matches",
+                              "got '%s'", buf);
+                    }
+
+                    /* Close all connections to signal guest to exit */
+                    for (int i = 0; i < 3; i++) if (conns[i] >= 0) close(conns[i]);
+                    close(gstdin[1]);
+                    close(gstdout[0]);
+                    close(gstderr[0]);
+
+                    int status;
+                    waitpid(guest, &status, 0);
+                    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                          "F5: full relay guest exited cleanly",
+                          "status=%d", status);
+                }
+            }
+        }
     }
 
     /* ---- Cleanup ---- */

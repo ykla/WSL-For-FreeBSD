@@ -14,7 +14,8 @@
  *     fs backend (serves "/" via open(O_DIRECTORY) rootfd). Listens on
  *     AF_HYPERV (hvsocket) port 50001 (LX_INIT_UTILITY_VM_PLAN9_PORT).
  *   - Test (Linux/WSL2): Minimal 9P2000.L stub over TCP for protocol-level
- *     testing. Implements Tversion/Tattach/Tstat/Twalk/Tclunk/Tflush.
+ *     testing. Implements Tversion/Tattach/Tstat/Twalk/Tclunk/Tflush plus
+ *     Tlopen/Tlcreate/Tread/Twrite/Tremove (Group H extension).
  *
  * lib9p selection rationale (verified via web research 2026-06-25):
  *   1. lib9p is part of FreeBSD base (/usr/src/contrib/lib9p), BSD-2-clause
@@ -346,6 +347,11 @@ static bool plan9_is_running(void)
  *   - Twalk(110)    → Rwalk(111): 0-element walk (root fid clone)
  *   - Tclunk(120)   → Rclunk(121): acknowledge
  *   - Tflush(108)   → Rflush(109): acknowledge
+ *   - Tlopen(112)   → Rlopen(113): return QID + iounit (stub open)
+ *   - Tlcreate(114) → Rlcreate(115): return QID + iounit (stub create)
+ *   - Tread(116)    → Rread(117): return count=0 (empty file)
+ *   - Twrite(118)   → Rwrite(119): echo back count (accept writes)
+ *   - Tremove(122)  → Rremove(123): acknowledge
  *   - Others        → Rerror(7): "not supported"
  *
  * 9P wire format: size[4] type[1] tag[2] [body...]
@@ -363,8 +369,18 @@ static bool plan9_is_running(void)
 #define P9_RFLUSH   109
 #define P9_TWALK    110
 #define P9_RWALK    111
+#define P9_TLOPEN   112   /* 9P2000.L open */
+#define P9_RLOPEN   113
+#define P9_TLCREATE 114   /* 9P2000.L create */
+#define P9_RLCREATE 115
+#define P9_TREAD    116
+#define P9_RREAD    117
+#define P9_TWRITE   118
+#define P9_RWRITE   119
 #define P9_TCLUNK   120
 #define P9_RCLUNK   121
+#define P9_TREMOVE  122
+#define P9_RREMOVE  123
 #define P9_TSTAT    124
 #define P9_RSTAT    125
 #define P9_RERROR   7
@@ -581,6 +597,117 @@ static int p9_handle_request(int fd)
         /* body: fid[4]. Respond Rclunk (empty body). */
         p9_send_response(fd, P9_RCLUNK, tag, NULL, 0);
         printf("[plan9-stub] Tclunk → Rclunk\n");
+        break;
+    }
+    case P9_TLOPEN: {
+        /* 9P2000.L Tlopen body: fid[4] flags[4]
+         * Rlopen body: qid[13] iounit[4]
+         * Stub: return a file QID (non-dir, path derived from fid) + iounit. */
+        uint32_t fid = 0;
+        if (body_len >= 4) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+        }
+        uint8_t resp[17];
+        resp[0] = 0;  /* qid.type = regular file (no QT_DIR) */
+        p9_put32(resp + 1, 1);     /* qid.version */
+        /* qid.path: derive a non-root path from fid (avoid path=1 which is root) */
+        p9_put64(resp + 5, (uint64_t)(0x1000 + fid));
+        p9_put32(resp + 13, 8192); /* iounit */
+        p9_send_response(fd, P9_RLOPEN, tag, resp, 17);
+        printf("[plan9-stub] Tlopen: fid=%u → Rlopen (file qid, iounit=8192)\n", fid);
+        break;
+    }
+    case P9_TLCREATE: {
+        /* 9P2000.L Tlcreate body: fid[4] name[s] flags[4] mode[4] gid[4]
+         * Rlcreate body: qid[13] iounit[4]
+         * Stub: ignore name/flags/mode, return a fresh file QID + iounit. */
+        uint32_t fid = 0;
+        if (body_len >= 4) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+        }
+        uint8_t resp[17];
+        resp[0] = 0;  /* qid.type = regular file */
+        p9_put32(resp + 1, 1);     /* qid.version */
+        /* qid.path: fresh path per fid (avoid collision with Tlopen's path space) */
+        p9_put64(resp + 5, (uint64_t)(0x2000 + fid));
+        p9_put32(resp + 13, 8192); /* iounit */
+        p9_send_response(fd, P9_RLCREATE, tag, resp, 17);
+        printf("[plan9-stub] Tlcreate: fid=%u → Rlcreate (file qid, iounit=8192)\n", fid);
+        break;
+    }
+    case P9_TREAD: {
+        /* Tread body: fid[4] offset[8] count[4]
+         * Rread body: count[4] data[count]
+         * Stub: always return count=0 (empty file). This exercises the
+         * protocol path (header packing/unpacking) without storing data. */
+        uint32_t fid = 0;
+        uint64_t offset = 0;
+        uint32_t count = 0;
+        if (body_len >= 16) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+            for (int i = 0; i < 8; i++)
+                offset |= ((uint64_t)body[4 + i]) << (i * 8);
+            count = (uint32_t)body[12]
+                  | ((uint32_t)body[13] << 8)
+                  | ((uint32_t)body[14] << 16)
+                  | ((uint32_t)body[15] << 24);
+        }
+        /* Respond with count=0 (no data) */
+        uint8_t resp[4];
+        p9_put32(resp, 0);
+        p9_send_response(fd, P9_RREAD, tag, resp, 4);
+        printf("[plan9-stub] Tread: fid=%u off=%llu count=%u → Rread (0 bytes)\n",
+               fid, (unsigned long long)offset, count);
+        break;
+    }
+    case P9_TWRITE: {
+        /* Twrite body: fid[4] offset[8] count[4] data[count]
+         * Rwrite body: count[4]
+         * Stub: echo back the requested count (accept all writes, discard data). */
+        uint32_t fid = 0;
+        uint64_t offset = 0;
+        uint32_t count = 0;
+        if (body_len >= 16) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+            for (int i = 0; i < 8; i++)
+                offset |= ((uint64_t)body[4 + i]) << (i * 8);
+            count = (uint32_t)body[12]
+                  | ((uint32_t)body[13] << 8)
+                  | ((uint32_t)body[14] << 16)
+                  | ((uint32_t)body[15] << 24);
+        }
+        uint8_t resp[4];
+        p9_put32(resp, count);
+        p9_send_response(fd, P9_RWRITE, tag, resp, 4);
+        printf("[plan9-stub] Twrite: fid=%u off=%llu count=%u → Rwrite (%u bytes)\n",
+               fid, (unsigned long long)offset, count, count);
+        break;
+    }
+    case P9_TREMOVE: {
+        /* Tremove body: fid[4]
+         * Rremove body: (empty)
+         * Stub: always succeed. */
+        uint32_t fid = 0;
+        if (body_len >= 4) {
+            fid = (uint32_t)body[0]
+                | ((uint32_t)body[1] << 8)
+                | ((uint32_t)body[2] << 16)
+                | ((uint32_t)body[3] << 24);
+        }
+        p9_send_response(fd, P9_RREMOVE, tag, NULL, 0);
+        printf("[plan9-stub] Tremove: fid=%u → Rremove (success)\n", fid);
         break;
     }
     case P9_TFLUSH: {
