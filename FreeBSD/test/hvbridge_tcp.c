@@ -70,6 +70,7 @@
 
 #include "wsl_protocol.h"
 #include "../terminal_notify.h"
+#include "../interop_server.h"
 
 /* Phase 1: also handle TerminateInstance on control channel */
 #define LxInitMessageTerminateInstance  14
@@ -560,6 +561,9 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
 
     struct control_reader cr;
     memset(&cr, 0, sizeof(cr));
+    /* Task Group D: interop channel buffered reader */
+    struct interop_reader ir;
+    interop_reader_init(&ir);
     char buf[4096];
     int exit_code = -1;
     int session_done = 0;
@@ -861,10 +865,20 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             if (n > 0) send_all(channel_fd, buf, (size_t)n);
         }
 
-        /* interop echo */
+        /* Task Group D: interop channel — handle query/response messages */
         if (!host_disconnected && interop_fd >= 0 && (pfds[IDX_INTEROP].revents & POLLIN)) {
-            ssize_t n = recv(interop_fd, buf, sizeof(buf), 0);
-            if (n > 0) send_all(interop_fd, buf, (size_t)n);
+            void *imsg = NULL;
+            int ir_r = interop_try_read(interop_fd, &ir, &imsg);
+            if (ir_r < 0) {
+                printf("[bridge] interop channel closed by host\n");
+                /* Mark interop_fd as invalid so we stop polling it */
+                pfds[IDX_INTEROP].fd = -1;
+            } else if (ir_r > 0 && imsg) {
+                struct MESSAGE_HEADER *ihdr = (struct MESSAGE_HEADER *)imsg;
+                size_t imsg_size = ihdr->MessageSize;
+                interop_process_message(interop_fd, imsg, imsg_size);
+                interop_consume(&ir, imsg_size);
+            }
         }
     }
 

@@ -71,7 +71,7 @@ struct wsl_init_message {
     uint32_t DrvFsDefaultOwner;
     uint32_t FeatureFlags;
     uint32_t DrvfsMount;
-    /* Buffer[] follows — variable length */
+    char Buffer[];             /* flexible array member — variable length */
 };
 
 /* ---- Parsed configuration storage ----
@@ -290,7 +290,7 @@ static inline void *wsl_config_build_message(
 
     /* Pack strings into Buffer[] and record offsets */
     uint32_t offset = 0;
-    char *buf = msg->Buffer;  /* flexible array member — but we allocated manually */
+    char *buf = (char *)msg + sizeof(struct wsl_init_message);
 
     msg->HostnameOffset = offset;
     memcpy(buf + offset, hostname, hlen);

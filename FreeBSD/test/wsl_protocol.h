@@ -22,6 +22,7 @@
 #define PORT_HVS_BSD          60000  /* hvbridge listen port (session/interop) */
 
 /* ---- WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum) ---- */
+#define LxInitMessageCreateProcess               1
 #define LxInitMessageCreateSession               2
 #define LxInitMessageCreateSessionResponse       3
 #define LxInitMessageNetworkInformation           4
@@ -30,18 +31,27 @@
 #define LxInitMessageCreateProcessUtilityVm      8
 #define LxInitMessageExitStatus                  9
 #define LxInitMessageWindowSizeChanged           10
+#define LxInitMessageCreateProcessResponse       11
+#define LxInitMessageQueryDrvfsElevated          12
 #define LxInitMessageStartSocketRelay            15
+#define LxInitMessageQueryEnvironmentVariable    16
+#define LxInitMessageQueryFeatureFlags           17
+#define LxInitMessageCreateLoginSession          23
 #define LxInitMessageQueryNetworkingMode         25
 #define LxInitMessageQueryVmId                   26
+#define LxInitMessageOobeResult                  28  /* F1: guest->host, OOBE completion */
 #define LxMiniInitMessageCreateInstanceResult    33
 #define LxMiniInitMessageGuestCapabilities       43
+#define LxMessageResultBool                      76
+#define LxMessageResultInt32                     77
 #define LxMessageResultUint32                    78
+#define LxMessageResultUint8                     79
 
-/* GNS message types (334+) */
-#define LxGnsMessageInterfaceConfiguration              334
-#define LxGnsMessageResult                              335
-#define LxGnsMessageNoOp                                352
-#define LxGnsMessageConnectTestRequest                  355
+/* GNS message types (correct enum values from lxinitshared.h) */
+#define LxGnsMessageInterfaceConfiguration              53
+#define LxGnsMessageResult                              54
+#define LxGnsMessageNoOp                                71
+#define LxGnsMessageConnectTestRequest                  74
 
 /* ---- Core structures ---- */
 
@@ -190,6 +200,26 @@ typedef struct LX_INIT_WINDOW_SIZE_CHANGED {
     unsigned short Columns;
 } LX_INIT_WINDOW_SIZE_CHANGED;
 
+/* F1: OobeResult (guest -> host, type 28)
+ * Sent on a dedicated OOBE channel when the distribution's first-run
+ * setup (OOBE) completes. The host blocks waiting for this message
+ * when RunOOBE=true and the create-process request has an empty
+ * filename/commandline with the AllowOOBE flag (0x20) set.
+ *
+ * Fields:
+ *   Result     - 0 on success, non-zero on failure
+ *   DefaultUid - configured default UID, or -1 if not present
+ *
+ * Reference: src/shared/inc/lxinitshared.h LX_INIT_OOBE_RESULT */
+typedef struct LX_INIT_OOBE_RESULT {
+    struct MESSAGE_HEADER Header;
+    uint32_t Result;
+    int64_t DefaultUid;
+} LX_INIT_OOBE_RESULT;
+
+/* F1: CreateProcess AllowOOBE flag (from lxinitshared.h LX_INIT_CREATE_PROCESS_FLAGS) */
+#define LxInitCreateProcessFlagAllowOOBE         0x20
+
 /* Phase 9 (Task Group C): Networking structures */
 
 /* NetworkInformation (host -> guest, type 4)
@@ -223,6 +253,61 @@ typedef struct LX_GNS_RESULT {
     int Result;
     char Buffer[];
 } LX_GNS_RESULT;
+
+/* ---- Task Group D: Interop server structures ---- */
+
+/* RESULT_MESSAGE<bool> (type 76) — bool stored as uint32_t for 4-byte alignment */
+typedef struct RESULT_MESSAGE_BOOL {
+    struct MESSAGE_HEADER Header;
+    uint32_t Result;
+} RESULT_MESSAGE_BOOL;
+
+/* RESULT_MESSAGE<int32_t> (type 77) */
+typedef struct RESULT_MESSAGE_INT32 {
+    struct MESSAGE_HEADER Header;
+    int32_t Result;
+} RESULT_MESSAGE_INT32;
+
+/* RESULT_MESSAGE<uint8_t> (type 79) — uint8_t stored as uint32_t for alignment */
+typedef struct RESULT_MESSAGE_UINT8 {
+    struct MESSAGE_HEADER Header;
+    uint32_t Result;
+} RESULT_MESSAGE_UINT8;
+
+/* QueryEnvironmentVariable (type 16) — Buffer holds var name (request) or value (response) */
+typedef struct LX_INIT_QUERY_ENVIRONMENT_VARIABLE {
+    struct MESSAGE_HEADER Header;
+    char Buffer[];
+} LX_INIT_QUERY_ENVIRONMENT_VARIABLE;
+
+/* QueryVmId (type 26) — Buffer holds VmId string (may be empty) */
+typedef struct LX_INIT_QUERY_VM_ID {
+    struct MESSAGE_HEADER Header;
+    char Buffer[];
+} LX_INIT_QUERY_VM_ID;
+
+/* CreateLoginSession (type 23) — Buffer holds username (NUL-terminated) */
+typedef struct LX_INIT_CREATE_LOGIN_SESSION {
+    struct MESSAGE_HEADER Header;
+    unsigned int Uid;
+    unsigned int Gid;
+    char Buffer[];
+} LX_INIT_CREATE_LOGIN_SESSION;
+
+/* CreateProcessResponse (type 11) — response to CreateProcess(1) */
+typedef struct LX_INIT_CREATE_PROCESS_RESPONSE {
+    struct MESSAGE_HEADER Header;
+    int Result;           /* errno-style: 0 = success */
+    int64_t SignalPipeId; /* LxBus handle id; 0 if none */
+    unsigned int Flags;   /* LX_INIT_CREATE_PROCESS_RESULT_FLAG_* */
+} LX_INIT_CREATE_PROCESS_RESPONSE;
+
+#define LX_INIT_CREATE_PROCESS_RESULT_FLAG_GUI_APPLICATION 0x1
+
+/* Networking modes (for QueryNetworkingMode response) */
+#define LxInitNetworkingModeNat       0
+#define LxInitNetworkingModeMirrored  1
+#define LxInitNetworkingModeBridged   2
 
 /* ---- Helper: reliable send/recv over TCP ---- */
 /* Handles EAGAIN on non-blocking sockets by polling. */

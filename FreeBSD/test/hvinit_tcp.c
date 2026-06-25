@@ -15,6 +15,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -23,13 +25,113 @@
 #include <fcntl.h>
 
 #include "wsl_protocol.h"
-#include "gns_engine.h"
+
+/* A1: Include config parser from parent directory.
+ * wsl_protocol.h already defines struct MESSAGE_HEADER and LxInitMessageInitialize. */
+#include "../config_parser.h"
+
+/* A1: Global parsed configuration from Initialize(5) message. */
+static struct wsl_config g_config;
+static int g_config_parsed = 0;
+#include "../gns_engine.h"
 
 /* Phase 1: additional message types for event loop */
 #define LxInitMessageTerminateInstance  14
 
 /* Phase 1: SIGCHLD self-pipe */
 static int g_sigchld_pipe[2] = {-1, -1};
+
+/* F2: Track mounted filesystems for graceful unmount on shutdown.
+ * Each entry records the mount point path. Unmount happens in reverse
+ * order (last mounted = first unmounted). */
+#define F2_MAX_MOUNTS 16
+static char g_mounted_fs[F2_MAX_MOUNTS][64];
+static int g_mounted_count = 0;
+
+/* F2: Record a filesystem mount for later cleanup. */
+static void fs_track_mount(const char *path)
+{
+    if (g_mounted_count < F2_MAX_MOUNTS) {
+        strncpy(g_mounted_fs[g_mounted_count], path,
+                sizeof(g_mounted_fs[g_mounted_count]) - 1);
+        g_mounted_fs[g_mounted_count][sizeof(g_mounted_fs[0]) - 1] = '\0';
+        g_mounted_count++;
+        printf("[init] tracked mount: %s (total=%d)\n", path, g_mounted_count);
+    }
+}
+
+/* F2: Unmount all tracked filesystems in reverse mount order.
+ * Returns the number of successful unmounts.
+ * Note: FreeBSD uses unmount(), Linux uses umount2(). The production
+ * hvinit.c uses unmount() since it runs on FreeBSD. */
+static int fs_unmount_all(void)
+{
+    int unmounted = 0;
+    for (int i = g_mounted_count - 1; i >= 0; i--) {
+        printf("[init] unmounting %s...\n", g_mounted_fs[i]);
+#ifdef __FreeBSD__
+        int rc = unmount(g_mounted_fs[i], 0);
+        if (rc < 0 && errno == EBUSY) {
+            fprintf(stderr, "[init] %s busy, forcing unmount\n", g_mounted_fs[i]);
+            rc = unmount(g_mounted_fs[i], MNT_FORCE);
+        }
+#else
+        /* Linux: use umount2 with MNT_FORCE for busy mounts */
+        int rc = umount2(g_mounted_fs[i], 0);
+        if (rc < 0 && errno == EBUSY) {
+            fprintf(stderr, "[init] %s busy, forcing unmount\n", g_mounted_fs[i]);
+            rc = umount2(g_mounted_fs[i], MNT_FORCE);
+        }
+#endif
+        if (rc < 0) {
+            /* Log but don't fail — best-effort cleanup.
+             * In the test harness, these mounts don't actually exist
+             * (we're on Linux, not FreeBSD), so ENOENT is expected. */
+            fprintf(stderr, "[init] unmount %s: %s (expected in test harness)\n",
+                    g_mounted_fs[i], strerror(errno));
+        } else {
+            unmounted++;
+            printf("[init] unmounted %s\n", g_mounted_fs[i]);
+        }
+    }
+    return unmounted;
+}
+
+/* F1: Send OobeResult (type 28) on the given channel.
+ *
+ * In the reference WSL, this is sent on a dedicated OOBE channel when
+ * the distribution's first-run setup completes. The host blocks waiting
+ * for this message when RunOOBE=true and the create-process request
+ * has AllowOOBE flag (0x20) set with empty filename/commandline.
+ *
+ * For the FreeBSD port, we send it on the init channel after the
+ * handshake completes. The host reads it to unblock session creation.
+ *
+ * Parameters:
+ *   fd          - channel to send on (typically init_fd)
+ *   result      - 0 on success, non-zero on failure
+ *   default_uid - configured default UID, or -1 if not present
+ *
+ * Reference: src/linux/init/init.cpp lines 642-648,
+ *            src/shared/inc/lxinitshared.h LX_INIT_OOBE_RESULT */
+static void send_oobe_result(int fd, uint32_t result, int64_t default_uid)
+{
+    LX_INIT_OOBE_RESULT msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.Header.MessageType = LxInitMessageOobeResult;
+    msg.Header.MessageSize = sizeof(msg);
+    msg.Header.SequenceNumber = 1;  /* first message on the OOBE channel */
+    msg.Result = result;
+    msg.DefaultUid = default_uid;
+
+    if (send_all(fd, &msg, sizeof(msg)) < 0) {
+        perror("[init] send OobeResult");
+    } else {
+        printf("[init] sent OobeResult (type=%u, size=%u, Result=%u, DefaultUid=%lld)\n",
+               msg.Header.MessageType, msg.Header.MessageSize,
+               msg.Result, (long long)msg.DefaultUid);
+    }
+}
 
 static void sigchld_handler(int sig)
 {
@@ -49,11 +151,28 @@ static void reap_children(void)
     }
 }
 
-/* Phase 1: Handle TerminateInstance (type 14) — clean shutdown */
+/* F2: Handle TerminateInstance (type 14) — graceful shutdown.
+ *
+ * Enhanced from Phase 1's simple sync()+exit() to a proper cleanup sequence:
+ *   1. Send ResultUint32 response (acknowledge the request)
+ *   2. Unmount all tracked filesystems in reverse mount order
+ *   3. sync() to flush all pending filesystem writes
+ *   4. exit(0)
+ *
+ * This mirrors the reference WSL shutdown sequence in init.cpp where
+ * the guest cleans up mounted filesystems (DrvFs, Plan9, etc.) before
+ * exiting. For the FreeBSD port, we unmount devfs/linprocfs/tmpfs that
+ * were mounted during initialize_filesystems().
+ *
+ * Edge cases:
+ *   - Unmount failure (EBUSY): retry with MNT_FORCE, log but continue
+ *   - No tracked mounts: skip unmount step entirely
+ *   - Double TerminateInstance: first call exits before second can arrive */
 static void handle_terminate_instance(int init_fd, struct MESSAGE_HEADER *hdr)
 {
-    printf("[init] received TerminateInstance, shutting down\n");
+    printf("[init] received TerminateInstance, initiating graceful shutdown\n");
 
+    /* 1. Send success response immediately so the host knows we're shutting down */
     RESULT_MESSAGE_UINT32 resp;
     memset(&resp, 0, sizeof(resp));
     resp.Header.MessageType = LxMessageResultUint32;
@@ -61,8 +180,21 @@ static void handle_terminate_instance(int init_fd, struct MESSAGE_HEADER *hdr)
     resp.Header.SequenceNumber = hdr->SequenceNumber;
     resp.Result = 0;
     send_all(init_fd, &resp, sizeof(resp));
+    printf("[init] sent TerminateInstance response (seq=%u, result=0)\n",
+           hdr->SequenceNumber);
 
+    /* 2. Unmount tracked filesystems in reverse order */
+    if (g_mounted_count > 0) {
+        printf("[init] unmounting %d filesystem(s)...\n", g_mounted_count);
+        int unmounted = fs_unmount_all();
+        printf("[init] unmounted %d/%d filesystem(s)\n", unmounted, g_mounted_count);
+    }
+
+    /* 3. Sync to flush all pending writes */
     sync();
+    printf("[init] sync complete, exiting\n");
+
+    /* 4. Exit */
     exit(0);
 }
 
@@ -240,7 +372,8 @@ static void send_create_instance_result(int init_fd)
     free(msg);
 }
 
-/* Send ConfigurationInformationResponse (type 6), echoing host's seq. */
+/* Send ConfigurationInformationResponse (type 6), echoing host's seq.
+ * A1: Uses parsed config values (DefaultUid from DrvFsDefaultOwner) when available. */
 static void send_configuration_info_response(int init_fd, unsigned int seq)
 {
     const char *flavor = "GenericFlavor";
@@ -255,22 +388,23 @@ static void send_configuration_info_response(int init_fd, unsigned int seq)
     resp->Header.MessageType = LxInitMessageInitializeResponse;
     resp->Header.MessageSize = (unsigned int)msglen;
     resp->Header.SequenceNumber = seq;  /* Phase 0 fix: echo host's seq */
-    resp->Plan9Port = 0;
-    resp->DefaultUid = 1;
+    resp->Plan9Port = 0;                /* No Plan9 server yet (Task Group B) */
+    /* A1: Use DrvFsDefaultOwner from parsed config as DefaultUid */
+    resp->DefaultUid = g_config_parsed ? g_config.drvfs_default_owner : 1;
     resp->InteropPort = PORT_HVS_BSD;
     resp->SystemdEnabled = false;  /* Phase 0 fix: FreeBSD has no systemd */
     resp->PidNamespace = 0;
-    resp->FlavorIndex = 0;
-    resp->VersionIndex = 0;
+    resp->FlavorIndex = 0;  /* Offset of flavor string in Buffer */
+    resp->VersionIndex = (unsigned int)(strlen(flavor) + 1);  /* Offset of version */
     memcpy(resp->Buffer, flavor, strlen(flavor) + 1);
     memcpy(resp->Buffer + strlen(flavor) + 1, version, strlen(version) + 1);
 
     if (send_all(init_fd, resp, msglen) < 0)
         perror("[init] send config_response");
     else
-        printf("[init] sent InitializeResponse (type=%u, seq=%u, InteropPort=%u, Systemd=%d)\n",
+        printf("[init] sent InitializeResponse (type=%u, seq=%u, DefaultUid=%u, InteropPort=%u, Systemd=%d)\n",
                resp->Header.MessageType, resp->Header.SequenceNumber,
-               resp->InteropPort, resp->SystemdEnabled);
+               resp->DefaultUid, resp->InteropPort, resp->SystemdEnabled);
     free(resp);
 }
 
@@ -332,44 +466,121 @@ int main(void)
     /* 4. Send CreateInstanceResult */
     send_create_instance_result(init_fd);
 
-    /* 5. Receive Initialize(5), respond with InitializeResponse(6) */
-    char recv_buf[512];
-    ssize_t r1 = recv(init_fd, recv_buf, sizeof(recv_buf) - 1, 0);
-    if (r1 > 0) {
-        recv_buf[r1] = '\0';  /* Phase 0 fix: was recv_buf[r] — buffer overflow */
-        printf("[init] received Initialize (%zd bytes)\n", r1);
-        unsigned int init_seq = 1;
-        if ((size_t)r1 >= sizeof(struct MESSAGE_HEADER)) {
-            struct MESSAGE_HEADER *hdr = (struct MESSAGE_HEADER *)recv_buf;
-            printf("[init]   host Initialize: type=%u, seq=%u\n",
-                   hdr->MessageType, hdr->SequenceNumber);
-            init_seq = hdr->SequenceNumber;
+    /* 5. Receive Initialize(5), respond with InitializeResponse(6).
+     * A1: Read header first, then payload, to handle variable-length
+     * LX_INIT_CONFIGURATION_INFORMATION with Buffer[] strings. */
+    {
+        struct MESSAGE_HEADER init_hdr;
+        ssize_t r_hdr = recv(init_fd, &init_hdr, sizeof(init_hdr), 0);
+        if (r_hdr != (ssize_t)sizeof(init_hdr)) {
+            perror("[init] recv Initialize header");
+        } else if (init_hdr.MessageSize < sizeof(init_hdr)) {
+            fprintf(stderr, "[init] invalid Initialize size %u\n", init_hdr.MessageSize);
+        } else {
+            size_t payload_len = init_hdr.MessageSize - sizeof(init_hdr);
+            char *full_msg = malloc(init_hdr.MessageSize);
+            if (!full_msg) {
+                perror("[init] malloc Initialize");
+            } else {
+                memcpy(full_msg, &init_hdr, sizeof(init_hdr));
+                if (payload_len > 0) {
+                    ssize_t r_body = recv(init_fd, full_msg + sizeof(init_hdr),
+                                          payload_len, 0);
+                    if (r_body != (ssize_t)payload_len) {
+                        fprintf(stderr, "[init] short read Initialize body: expected %zu, got %zd\n",
+                                payload_len, r_body);
+                        free(full_msg);
+                        full_msg = NULL;
+                    }
+                }
+
+                if (full_msg) {
+                    printf("[init] received Initialize (type=%u, seq=%u, size=%u)\n",
+                           init_hdr.MessageType, init_hdr.SequenceNumber,
+                           init_hdr.MessageSize);
+
+                    /* A1: Parse the full Initialize message into g_config */
+                    wsl_config_init(&g_config);
+                    if (wsl_config_parse(&g_config, full_msg, init_hdr.MessageSize) == 0) {
+                        g_config_parsed = 1;
+                        wsl_config_dump(&g_config);
+
+                        /* Set WSL_DISTRO_NAME env var from config */
+                        if (g_config.distribution_name) {
+                            setenv("WSL_DISTRO_NAME", g_config.distribution_name, 1);
+                            printf("[init] set WSL_DISTRO_NAME=%s\n", g_config.distribution_name);
+                        }
+
+                        /* Export feature flags as hex string */
+                        char flags_str[16];
+                        snprintf(flags_str, sizeof(flags_str), "%x", g_config.feature_flags);
+                        setenv("WSL_FEATURE_FLAGS", flags_str, 1);
+                    } else {
+                        printf("[init] Initialize too small for full parse, using defaults\n");
+                    }
+
+                    send_configuration_info_response(init_fd, init_hdr.SequenceNumber);
+                    free(full_msg);
+                }
+            }
         }
-        send_configuration_info_response(init_fd, init_seq);
-    } else {
-        perror("[init] recv Initialize");
     }
 
     /* 6. Receive CreateSession(2), respond with CreateSessionResponse(3) */
-    r1 = recv(init_fd, recv_buf, sizeof(recv_buf) - 1, 0);
-    if (r1 > 0) {
-        recv_buf[r1] = '\0';
-        printf("[init] received CreateSession (%zd bytes)\n", r1);
-        unsigned int sess_seq = 1;
-        if ((size_t)r1 >= sizeof(struct MESSAGE_HEADER)) {
-            struct MESSAGE_HEADER *hdr = (struct MESSAGE_HEADER *)recv_buf;
-            printf("[init]   host CreateSession: type=%u, seq=%u\n",
-                   hdr->MessageType, hdr->SequenceNumber);
-            sess_seq = hdr->SequenceNumber;
+    {
+        char sess_buf[256];
+        ssize_t r_sess = recv(init_fd, sess_buf, sizeof(sess_buf) - 1, 0);
+        if (r_sess > 0) {
+            sess_buf[r_sess] = '\0';
+            printf("[init] received CreateSession (%zd bytes)\n", r_sess);
+            unsigned int sess_seq = 1;
+            if ((size_t)r_sess >= sizeof(struct MESSAGE_HEADER)) {
+                struct MESSAGE_HEADER *hdr = (struct MESSAGE_HEADER *)sess_buf;
+                printf("[init]   host CreateSession: type=%u, seq=%u\n",
+                       hdr->MessageType, hdr->SequenceNumber);
+                sess_seq = hdr->SequenceNumber;
+            }
+            send_create_session_response(init_fd, PORT_HVS_BSD, sess_seq);
+        } else {
+            perror("[init] recv CreateSession");
         }
-        send_create_session_response(init_fd, PORT_HVS_BSD, sess_seq);
-    } else {
-        perror("[init] recv CreateSession");
     }
 
-    printf("[init] handshake complete, entering event loop\n");
+    printf("[init] handshake complete\n");
+
+    /* F1: Send OobeResult (type 28) on the init channel.
+     *
+     * In the reference WSL, this is sent on a dedicated OOBE channel when
+     * RunOOBE=true. For the FreeBSD port, we send it on the init channel
+     * after the handshake to signal that first-run setup is complete.
+     * The host reads this to unblock session creation.
+     *
+     * Result=0 (success), DefaultUid from parsed config or -1 if not set. */
+    {
+        int64_t oobe_uid = -1;
+        if (g_config_parsed && g_config.drvfs_default_owner != 0)
+            oobe_uid = (int64_t)g_config.drvfs_default_owner;
+        send_oobe_result(init_fd, 0, oobe_uid);
+    }
+
+    /* F2: Track filesystem mounts for graceful shutdown.
+     * In the production hvinit.c, these are mounted by initialize_filesystems().
+     * In the TCP test harness, we don't actually mount (we're on Linux, not
+     * FreeBSD), but we track them so the graceful shutdown logic can be tested.
+     * The mock host verifies the unmount log output. */
+    fs_track_mount("/dev");
+    fs_track_mount("/proc");
+    fs_track_mount("/run");
+
+    printf("[init] entering event loop\n");
     /* Phase 1: event loop replaces pause() */
     event_loop(init_fd, notify_fd);
+
+    /* A1: Free parsed config */
+    if (g_config_parsed) {
+        wsl_config_free(&g_config);
+        g_config_parsed = 0;
+    }
 
     /* Clean up (only reached if event loop exits) */
     close(cap_fd);

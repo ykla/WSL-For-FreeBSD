@@ -35,6 +35,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -52,37 +53,41 @@
 #define LxInitMessageQueryNetworkingMode   25
 #define LxInitMessageQueryVmId             26
 
-/* GNS message types (334+) */
-#define LxGnsMessageInterfaceConfiguration              334
-#define LxGnsMessageResult                              335
-#define LxGnsMessageNotification                        336
-#define LxGnsMessagePortMappingRequest                  337
-#define LxGnsMessagePortMappingResponse                 338
-#define LxGnsMessageSetPortListener                     339
-#define LxGnsMessagePortListenerRelayStart              340
-#define LxGnsMessagePortListenerRelayStop               341
-#define LxGnsMessageVmNicCreatedNotification            342
-#define LxGnsMessageCreateDeviceRequest                 343
-#define LxGnsMessageModifyGuestDeviceSettingRequest     344
-#define LxGnsMessageLoopbackRoutesRequest               345
-#define LxGnsMessageDeviceSettingRequest                346
-#define LxGnsMessageIfStateChangeRequest                347
-#define LxGnsMessageIfStateChangeResponse               348
-#define LxGnsMessageInitialIpConfigurationNotification  349
-#define LxGnsMessageSetupIpv6                           350
-#define LxGnsMessageDnsTunneling                        351
-#define LxGnsMessageNoOp                                352
-#define LxGnsMessageGlobalNetFilter                     353
-#define LxGnsMessageInterfaceNetFilter                  354
-#define LxGnsMessageConnectTestRequest                  355
-#define LxGnsMessageListenerRelay                       356
+/* GNS message types (correct enum values from lxinitshared.h) */
+#define LxGnsMessageInterfaceConfiguration              53
+#define LxGnsMessageResult                              54
+#define LxGnsMessageNotification                        55
+#define LxGnsMessagePortMappingRequest                  56
+#define LxGnsMessagePortMappingResponse                 57
+#define LxGnsMessageSetPortListener                     58
+#define LxGnsMessagePortListenerRelayStart              59
+#define LxGnsMessagePortListenerRelayStop               60
+#define LxGnsMessageVmNicCreatedNotification            61
+#define LxGnsMessageCreateDeviceRequest                 62
+#define LxGnsMessageModifyGuestDeviceSettingRequest     63
+#define LxGnsMessageLoopbackRoutesRequest               64
+#define LxGnsMessageDeviceSettingRequest                65
+#define LxGnsMessageIfStateChangeRequest                66
+#define LxGnsMessageIfStateChangeResponse               67
+#define LxGnsMessageInitialIpConfigurationNotification  68
+#define LxGnsMessageSetupIpv6                           69
+#define LxGnsMessageDnsTunneling                        70
+#define LxGnsMessageNoOp                                71
+#define LxGnsMessageGlobalNetFilter                     72
+#define LxGnsMessageInterfaceNetFilter                  73
+#define LxGnsMessageConnectTestRequest                  74
+#define LxGnsMessageListenerRelay                       75
 
 /* Result message types */
 #define LxMessageResultUint32   78
-#define LxMessageResultInt32    79
-#define LxMessageResultBool     80
+#define LxMessageResultInt32    77
+#define LxMessageResultBool     76
 
-/* ---- Core structures ---- */
+/* ---- Core structures ----
+ * NOTE: These are only defined if not already provided by wsl_protocol.h
+ *       (the TCP test harness includes wsl_protocol.h first). The production
+ *       hvinit.c does not include wsl_protocol.h, so it needs these here. */
+#ifndef WSL_PROTOCOL_H
 
 struct MESSAGE_HEADER {
     unsigned int MessageType;
@@ -150,6 +155,8 @@ typedef struct LX_GNS_RESULT {
     int Result;
     char Buffer[];
 } LX_GNS_RESULT;
+
+#endif /* WSL_PROTOCOL_H */
 
 /* ---- Helper: reliable send/recv (duplicated from wsl_protocol.h to keep
  *      this header self-contained for the production hvinit.c build). ---- */
@@ -229,8 +236,6 @@ static inline int gns_handle_network_information(void *msg_buf, size_t msg_size)
     }
     LX_INIT_NETWORK_INFORMATION *ni = (LX_INIT_NETWORK_INFORMATION *)msg_buf;
 
-    size_t buf_offset = sizeof(LX_INIT_NETWORK_INFORMATION) - sizeof(ni->Buffer);
-    /* Actually Buffer is a flexible array at the end; compute its size. */
     size_t header_fixed = offsetof(LX_INIT_NETWORK_INFORMATION, Buffer);
     if (msg_size <= header_fixed) {
         fprintf(stderr, "[gns] NetworkInformation: no buffer data\n");
@@ -620,8 +625,8 @@ static inline int gns_handle_query_vm_id(int init_fd, void *msg_buf,
         resp.Header.SequenceNumber = qh->SequenceNumber;
     }
     /* Fixed VM ID for FreeBSD port (would be a real GUID in production) */
-    resp.Result = 0xBSD0001;
-    printf("[gns] QueryVmId -> 0xBSD0001\n");
+    resp.Result = 0xB5D00001;
+    printf("[gns] QueryVmId -> 0xB5D00001\n");
     return gns_send_all(init_fd, &resp, sizeof(resp));
 }
 

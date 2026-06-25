@@ -8,20 +8,20 @@
 #   make clean    # remove binaries
 
 CC      = cc
-CFLAGS  = -Wall -Wextra -O2 -g -std=gnu11
+CFLAGS  = -Wall -Wextra -O2 -g -std=gnu11 -I..
 LDFLAGS = -lutil
 
 BINARIES = wsl_mock_host hvinit_tcp hvbridge_tcp
 
 all: $(BINARIES)
 
-wsl_mock_host: wsl_mock_host.c wsl_protocol.h
+wsl_mock_host: wsl_mock_host.c wsl_protocol.h ../config_parser.h
 	$(CC) $(CFLAGS) -o $@ wsl_mock_host.c $(LDFLAGS)
 
-hvinit_tcp: hvinit_tcp.c wsl_protocol.h gns_engine.h
+hvinit_tcp: hvinit_tcp.c wsl_protocol.h ../config_parser.h ../gns_engine.h
 	$(CC) $(CFLAGS) -o $@ hvinit_tcp.c
 
-hvbridge_tcp: hvbridge_tcp.c wsl_protocol.h
+hvbridge_tcp: hvbridge_tcp.c wsl_protocol.h ../interop_server.h
 	$(CC) $(CFLAGS) -o $@ hvbridge_tcp.c $(LDFLAGS)
 
 test: all
