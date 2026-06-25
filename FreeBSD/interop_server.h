@@ -40,6 +40,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <spawn.h>
 
 /* ===================================================================
  * VM GUID helper (interop-local, independent of gns_engine.h)
@@ -135,6 +138,34 @@ static inline int interop_get_vm_id_string(char *buf, size_t buf_size)
 /* CreateProcess result flags */
 #ifndef LX_INIT_CREATE_PROCESS_RESULT_FLAG_GUI_APPLICATION
 #define LX_INIT_CREATE_PROCESS_RESULT_FLAG_GUI_APPLICATION 0x1
+#endif
+
+/* CreateProcessCommon (from lxinitshared.h) — guarded to avoid redefinition
+ * when wsl_protocol.h is already included. */
+#ifndef WSL_PROTOCOL_H
+struct LX_INIT_CREATE_PROCESS_COMMON {
+    uint32_t FilenameOffset;
+    uint32_t CurrentWorkingDirectoryOffset;
+    uint32_t CommandLineOffset;
+    uint16_t CommandLineCount;
+    uint32_t EnvironmentOffset;
+    uint16_t EnvironmentCount;
+    uint32_t NtEnvironmentOffset;
+    uint16_t NtEnvironmentCount;
+    uint32_t NtPathOffset;
+    uint32_t ShellOptions;
+    uint32_t UsernameOffset;
+    uint32_t DefaultUid;
+    int32_t  Flags;
+    char Buffer[];
+};
+#endif
+
+/* CreateProcess flags (from lxinitshared.h) */
+#ifndef LxInitCreateProcessFlagsStdInConsole
+#define LxInitCreateProcessFlagsStdInConsole    0x1
+#define LxInitCreateProcessFlagsStdOutConsole   0x2
+#define LxInitCreateProcessFlagsStdErrConsole   0x4
 #endif
 
 /* ---- Struct definitions ----
@@ -408,13 +439,106 @@ static inline int interop_process_message(int fd, void *msg, size_t msg_size)
         }
         break;
 
-    case LxInitMessageCreateProcess:
-        /* Cannot create Windows NT processes from FreeBSD.
-         * Return ENOENT (no such file or directory). */
-        printf("[interop] CreateProcess -> ENOENT (cannot launch Windows binaries)\n");
+    case LxInitMessageCreateProcess: {
+        /* Task Group A: CreateProcess(1) — create a guest-side process.
+         *
+         * The host sends this message to ask the guest to launch a process
+         * (e.g., the user's shell or a command). The message body contains
+         * LX_INIT_CREATE_PROCESS_COMMON with command-line, environment, and
+         * working directory in the Buffer[].
+         *
+         * On FreeBSD, we fork+execvp the command. We cannot create Windows
+         * NT processes, but that's not what this message is for — it's for
+         * creating guest-side (FreeBSD) processes. */
+        const size_t cp_min = sizeof(struct MESSAGE_HEADER)
+                            + sizeof(struct LX_INIT_CREATE_PROCESS_COMMON);
+        if (msg_size < cp_min) {
+            printf("[interop] CreateProcess: message too small (%zu < %zu)\n",
+                   msg_size, cp_min);
+            interop_send_create_process_response(fd, hdr->SequenceNumber,
+                                                 EINVAL, 0, 0);
+            break;
+        }
+
+        const struct LX_INIT_CREATE_PROCESS_COMMON *cp =
+            (const struct LX_INIT_CREATE_PROCESS_COMMON *)
+            ((const char *)msg + sizeof(struct MESSAGE_HEADER));
+        const char *buffer = cp->Buffer;
+        const size_t buffer_size = msg_size - cp_min;
+
+        /* Extract command line string. If CommandLineCount is 0, the
+         * CommandLineOffset points to a NUL-terminated string. */
+        const char *cmdline = NULL;
+        if (cp->CommandLineCount > 0 &&
+            cp->CommandLineOffset + cp->CommandLineCount <= buffer_size) {
+            cmdline = buffer + cp->CommandLineOffset;
+        } else if (cp->CommandLineCount == 0 &&
+                   cp->CommandLineOffset < buffer_size) {
+            cmdline = buffer + cp->CommandLineOffset;
+        }
+        if (!cmdline || !cmdline[0]) {
+            printf("[interop] CreateProcess: empty command line\n");
+            interop_send_create_process_response(fd, hdr->SequenceNumber,
+                                                 ENOENT, 0, 0);
+            break;
+        }
+        printf("[interop] CreateProcess: cmdline='%s' cwd='%s' env_count=%u\n",
+               cmdline,
+               (cp->CurrentWorkingDirectoryOffset < buffer_size)
+                   ? buffer + cp->CurrentWorkingDirectoryOffset : "(none)",
+               cp->EnvironmentCount);
+
+        pid_t child = fork();
+        if (child < 0) {
+            perror("[interop] fork");
+            interop_send_create_process_response(fd, hdr->SequenceNumber,
+                                                 errno, 0, 0);
+            break;
+        }
+        if (child == 0) {
+            /* Child: set up environment, chdir, and exec.
+             *
+             * Apply environment variables from the message.
+             * Each entry is a NUL-terminated "KEY=VALUE" string.
+             * EnvironmentCount is the number of entries. */
+            if (cp->EnvironmentCount > 0 &&
+                cp->EnvironmentOffset + 1 <= buffer_size) {
+                const char *env_start = buffer + cp->EnvironmentOffset;
+                const char *env_end = buffer + buffer_size;
+                const char *p = env_start;
+                for (uint16_t i = 0; i < cp->EnvironmentCount && p < env_end; i++) {
+                    /* Each entry is NUL-terminated */
+                    if (p[0]) {
+                        putenv(strdup(p));  /* strdup: safe in child before exec */
+                    }
+                    p += strlen(p) + 1;
+                }
+            }
+
+            /* Change to the requested working directory. */
+            if (cp->CurrentWorkingDirectoryOffset < buffer_size) {
+                const char *cwd = buffer + cp->CurrentWorkingDirectoryOffset;
+                if (cwd[0] && chdir(cwd) < 0) {
+                    fprintf(stderr, "[interop] chdir '%s': %s\n",
+                            cwd, strerror(errno));
+                }
+            }
+
+            /* Build argv from the command line using /bin/sh -c.
+             * This handles shell parsing (quotes, redirects, etc.) */
+            execlp("/bin/sh", "sh", "-c", cmdline, (char *)NULL);
+            perror("[interop] execlp");
+            _exit(127);
+        }
+
+        /* Parent: return success immediately. The child runs independently.
+         * We don't wait for it — the host will get exit status via the
+         * session channel (hvbridge) when the child exits. */
+        printf("[interop] CreateProcess: child pid=%d\n", (int)child);
         interop_send_create_process_response(fd, hdr->SequenceNumber,
-                                             ENOENT, 0, 0);
+                                             0, (int64_t)child, 0);
         break;
+    }
 
     default:
         printf("[interop] unhandled message type=%u (size=%u, seq=%u)\n",

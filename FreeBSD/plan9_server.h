@@ -115,9 +115,14 @@ static struct {
 #ifdef __FreeBSD__
 
 #include <sys/un.h>
-/* lib9p headers (FreeBSD base system) */
+/* lib9p headers (FreeBSD base system).
+ * <lib9p.h> provides l9p_server_init, l9p_connection_init, L9P_2000L.
+ * <backend/fs.h> provides l9p_backend_fs_init (fs backend over rootfd).
+ * <transport/socket.h> provides l9p_socket_accept (accept-loop helper that
+ *   wraps l9p_connection_init + transport setup for each client). */
 #include <lib9p.h>
 #include <backend/fs.h>
+#include <transport/socket.h>
 
 /* Bind an AF_HYPERV (hvsocket) listener on the given port.
  * Returns fd on success, -1 on failure. */
@@ -291,18 +296,18 @@ static bool plan9_stop_server(bool force)
         /* Force: SIGKILL the child immediately */
         kill(g_plan9.child_pid, SIGKILL);
     } else {
-        /* Graceful: SIGTERM, wait up to 3 seconds, then SIGKILL */
+        /* Graceful: SIGTERM, wait up to 5 seconds, then SIGKILL */
         kill(g_plan9.child_pid, SIGTERM);
         int status;
         int waited = 0;
-        while (waited < 30) {
+        while (waited < 50) {
             pid_t rc = waitpid(g_plan9.child_pid, &status, WNOHANG);
             if (rc == g_plan9.child_pid) break;
             if (rc < 0) break;
             usleep(100000); /* 100ms */
             waited++;
         }
-        if (waited >= 30) {
+        if (waited >= 50) {
             kill(g_plan9.child_pid, SIGKILL);
             waitpid(g_plan9.child_pid, &status, 0);
         }

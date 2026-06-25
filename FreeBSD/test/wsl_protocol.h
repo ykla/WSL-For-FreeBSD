@@ -172,6 +172,8 @@ typedef enum {
 #define LX_INIT_UTILITY_VM_INVALID_PORT 0xFFFFFFFFu
 
 /* CreateProcess common structure (matches official lxinitshared.h) */
+#ifndef LX_INIT_CREATE_PROCESS_COMMON_DEFINED
+#define LX_INIT_CREATE_PROCESS_COMMON_DEFINED
 typedef struct LX_INIT_CREATE_PROCESS_COMMON {
     uint32_t FilenameOffset;
     uint32_t CurrentWorkingDirectoryOffset;
@@ -188,6 +190,7 @@ typedef struct LX_INIT_CREATE_PROCESS_COMMON {
     int32_t  Flags;
     char Buffer[];
 } LX_INIT_CREATE_PROCESS_COMMON;
+#endif
 
 /* CreateProcess flags (from lxinitshared.h LX_INIT_CREATE_PROCESS_FLAGS) */
 #define LxInitCreateProcessFlagsStdInConsole    0x1

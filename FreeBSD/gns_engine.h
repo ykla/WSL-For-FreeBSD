@@ -151,6 +151,13 @@ static inline uint32_t gns_get_vm_id_u32(void)
 #define LxGnsMessageConnectTestRequest                  74
 #define LxGnsMessageListenerRelay                       75
 
+/* Group B: init-channel message types (from lxinitshared.h enum) */
+#define LxInitMessageKernelVersion             18
+#define LxInitMessageAddVirtioFsDevice         19
+#define LxInitMessageAddVirtioFsDeviceResponse 20
+#define LxInitMessageRemountVirtioFsDevice     21
+#define LxInitMessageStartDistroInit           22
+
 /* Result message types */
 #define LxMessageResultUint32   78
 #define LxMessageResultInt32    77
@@ -248,6 +255,53 @@ typedef struct LX_INIT_MOUNT_DRVFS {
 } LX_INIT_MOUNT_DRVFS;
 
 #endif /* WSL_PROTOCOL_H */
+
+/* ===================================================================
+ * Group B: VirtioFs device message structs
+ * ===================================================================
+ * Defined OUTSIDE the WSL_PROTOCOL_H guard so they are visible to both
+ * production code (hvinit.c, which includes only gns_engine.h) and the
+ * test harness (hvinit_tcp.c / wsl_mock_host.c, which include
+ * wsl_protocol.h first, causing the guard block above to be skipped).
+ * MESSAGE_HEADER and bool are already defined at this point by either
+ * the guard block above (production) or wsl_protocol.h (test).
+ *
+ * Reference: src/shared/inc/lxinitshared.h lines 1066-1103 */
+#ifndef LX_INIT_ADD_VIRTIOFS_SHARE_MESSAGE_DEFINED
+#define LX_INIT_ADD_VIRTIOFS_SHARE_MESSAGE_DEFINED
+
+/* AddVirtioFsDevice (19) — host -> guest request.
+ * Buffer contains two NUL-terminated strings indexed by PathOffset and
+ * OptionsOffset: the mount path and mount options. */
+typedef struct {
+    struct MESSAGE_HEADER Header;
+    bool Admin;
+    unsigned int PathOffset;    /* offset into Buffer for mount path */
+    unsigned int OptionsOffset; /* offset into Buffer for mount options */
+    char Buffer[];              /* contains path + options strings */
+} LX_INIT_ADD_VIRTIOFS_SHARE_MESSAGE;
+
+/* AddVirtioFsDeviceResponse (20) — guest -> host response.
+ * Also used as the response for RemountVirtioFsDevice(21).
+ * Buffer contains a NUL-terminated tag string indexed by TagOffset. */
+typedef struct {
+    struct MESSAGE_HEADER Header;
+    int Result;
+    unsigned int TagOffset;     /* offset into Buffer for tag string */
+    char Buffer[];              /* contains tag string */
+} LX_INIT_ADD_VIRTIOFS_SHARE_RESPONSE_MESSAGE;
+
+/* RemountVirtioFsDevice (21) — host -> guest request.
+ * Response is LX_INIT_ADD_VIRTIOFS_SHARE_RESPONSE_MESSAGE (type 20).
+ * Buffer contains a NUL-terminated tag string indexed by TagOffset. */
+typedef struct {
+    struct MESSAGE_HEADER Header;
+    bool Admin;
+    unsigned int TagOffset;     /* offset into Buffer for tag string */
+    char Buffer[];              /* contains tag string */
+} LX_INIT_REMOUNT_VIRTIOFS_SHARE_MESSAGE;
+
+#endif /* LX_INIT_ADD_VIRTIOFS_SHARE_MESSAGE_DEFINED */
 
 /* E3: Global flag controlling /etc/resolv.conf generation.
  * Set from wsl.conf [network] generateResolvConf (default true).
@@ -479,6 +533,16 @@ static inline int gns_run_cmd(const char *cmd)
     return WEXITSTATUS(rc);
 }
 
+/* Forward declarations for JSON helpers (defined later in this header).
+ * Needed because gns_handle_interface_configuration (Group D) uses them
+ * before their full definitions appear. */
+static inline int gns_json_get_string(const char *json, const char *key,
+                                      char *out, size_t out_size);
+static inline long gns_json_get_int(const char *json, const char *key, long def);
+static inline int gns_json_get_bool(const char *json, const char *key, int def);
+static inline int gns_json_get_subobject(const char *json, const char *key,
+                                         char *out, size_t out_size);
+
 static inline int gns_handle_interface_configuration(int gns_fd, void *msg_buf,
                                                      size_t msg_size,
                                                      unsigned int seq)
@@ -506,32 +570,151 @@ static inline int gns_handle_interface_configuration(int gns_fd, void *msg_buf,
 
     printf("[gns] InterfaceConfiguration content: '%s'\n", content);
 
-    /* Parse simple key=value lines */
+    /* D: Parse interface configuration.
+     * Supports two formats:
+     * 1. HNSEndpoint JSON (starts with '{') — the format real WSL hosts send.
+     *    Fields: MacAddress, IPAddress, PrefixLength, GatewayAddress,
+     *    DNSServerList, PortFriendlyName, ID (GUID).
+     * 2. Simple key=value lines (fallback for test harness).
+     * Reference: HCN API HNSEndpoint JSON, src/linux/init/GnsEngine.cpp
+     *            ApplyEndpointConfiguration(). */
     char interface[64] = {0};
     char address[128] = {0};
     char gateway[64] = {0};
     char mtu[16] = {0};
     int bring_up = 0;
+    char dns_servers[256] = {0};
+    int prefix_len = 0;
 
-    char *line = content;
-    char *saveptr = NULL;
-    char *tok;
-    while ((tok = strtok_r(line, "\n\r", &saveptr)) != NULL) {
-        line = NULL;
-        /* Strip leading whitespace */
-        while (*tok == ' ' || *tok == '\t') tok++;
-        if (*tok == '\0' || *tok == '#') continue;
+    /* Detect JSON format (HNSEndpoint) */
+    const char *p = content;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == '{') {
+        /* D: HNSEndpoint JSON parsing */
+        printf("[gns] InterfaceConfiguration: parsing as HNSEndpoint JSON\n");
 
-        if (strncmp(tok, "interface=", 10) == 0) {
-            strncpy(interface, tok + 10, sizeof(interface) - 1);
-        } else if (strncmp(tok, "address=", 8) == 0) {
-            strncpy(address, tok + 8, sizeof(address) - 1);
-        } else if (strncmp(tok, "gateway=", 8) == 0) {
-            strncpy(gateway, tok + 8, sizeof(gateway) - 1);
-        } else if (strncmp(tok, "mtu=", 4) == 0) {
-            strncpy(mtu, tok + 4, sizeof(mtu) - 1);
-        } else if (strcmp(tok, "up") == 0) {
-            bring_up = 1;
+        /* PortFriendlyName → interface name (preferred) */
+        gns_json_get_string(content, "PortFriendlyName", interface, sizeof(interface));
+
+        /* If no PortFriendlyName, try "Name" or "targetDeviceName" */
+        if (!interface[0]) {
+            gns_json_get_string(content, "Name", interface, sizeof(interface));
+        }
+        if (!interface[0]) {
+            gns_json_get_string(content, "targetDeviceName", interface, sizeof(interface));
+        }
+
+        /* IPAddress (single string) or IPAddresses (array — take first) */
+        gns_json_get_string(content, "IPAddress", address, sizeof(address));
+        if (!address[0]) {
+            /* Try IPAddresses array — extract first element */
+            char iparr[256] = {0};
+            if (gns_json_get_subobject(content, "IPAddresses",
+                                        iparr, sizeof(iparr)) == 0 && iparr[0]) {
+                /* iparr contains ["172.x.x.x", ...] — extract first quoted string */
+                const char *q1 = strchr(iparr, '"');
+                if (q1) {
+                    const char *q2 = strchr(q1 + 1, '"');
+                    if (q2) {
+                        size_t alen = (size_t)(q2 - q1 - 1);
+                        if (alen >= sizeof(address)) alen = sizeof(address) - 1;
+                        memcpy(address, q1 + 1, alen);
+                        address[alen] = '\0';
+                    }
+                }
+            }
+        }
+
+        /* PrefixLength */
+        prefix_len = (int)gns_json_get_int(content, "PrefixLength", 0);
+        if (prefix_len > 0 && address[0]) {
+            /* Append /prefix to address for ifconfig */
+            size_t alen = strlen(address);
+            if (alen + 8 < sizeof(address)) {
+                snprintf(address + alen, sizeof(address) - alen, "/%d", prefix_len);
+            }
+        }
+
+        /* GatewayAddress (single) or Gateways (array — take first) */
+        gns_json_get_string(content, "GatewayAddress", gateway, sizeof(gateway));
+        if (!gateway[0]) {
+            char gwarr[256] = {0};
+            if (gns_json_get_subobject(content, "Gateways",
+                                        gwarr, sizeof(gwarr)) == 0 && gwarr[0]) {
+                const char *q1 = strchr(gwarr, '"');
+                if (q1) {
+                    const char *q2 = strchr(q1 + 1, '"');
+                    if (q2) {
+                        size_t glen = (size_t)(q2 - q1 - 1);
+                        if (glen >= sizeof(gateway)) glen = sizeof(gateway) - 1;
+                        memcpy(gateway, q1 + 1, glen);
+                        gateway[glen] = '\0';
+                    }
+                }
+            }
+        }
+
+        /* DNSServerList (comma-separated) */
+        gns_json_get_string(content, "DNSServerList", dns_servers, sizeof(dns_servers));
+
+        /* MacAddress — apply if present */
+        char mac_addr[32] = {0};
+        gns_json_get_string(content, "MacAddress", mac_addr, sizeof(mac_addr));
+
+        bring_up = 1;  /* HNSEndpoint always brings interface up */
+
+        printf("[gns] HNSEndpoint: iface=%s addr=%s gw=%s prefix=%d dns=%s mac=%s\n",
+               interface, address, gateway, prefix_len, dns_servers, mac_addr);
+
+        /* Apply MAC address if present */
+        if (interface[0] && mac_addr[0]) {
+            char cmd[192];
+            /* Convert "00-15-5D-xx-xx-xx" to "00:15:5d:xx:xx:xx" for ifconfig */
+            char ifconfig_mac[32] = {0};
+            size_t mi = 0;
+            for (size_t i = 0; mac_addr[i] && mi < sizeof(ifconfig_mac) - 1; i++) {
+                if (mac_addr[i] == '-') {
+                    ifconfig_mac[mi++] = ':';
+                } else {
+                    ifconfig_mac[mi++] = tolower((unsigned char)mac_addr[i]);
+                }
+            }
+            snprintf(cmd, sizeof(cmd), "ifconfig %s ether %s 2>/dev/null",
+                     interface, ifconfig_mac);
+            printf("[gns] running: %s\n", cmd);
+            gns_run_cmd(cmd);
+        }
+
+        /* Apply DNS servers to resolv.conf if present */
+        if (dns_servers[0]) {
+            printf("[gns] HNSEndpoint: DNS servers: %s\n", dns_servers);
+            /* The DNS update is handled by gns_handle_network_information
+             * which writes resolv.conf. Here we just log it. */
+        }
+    } else {
+        /* Fallback: simple key=value lines (test harness format) */
+        printf("[gns] InterfaceConfiguration: parsing as key=value lines\n");
+
+        char *line = content;
+        char *saveptr = NULL;
+        char *tok;
+        while ((tok = strtok_r(line, "\n\r", &saveptr)) != NULL) {
+            line = NULL;
+            /* Strip leading whitespace */
+            while (*tok == ' ' || *tok == '\t') tok++;
+            if (*tok == '\0' || *tok == '#') continue;
+
+            if (strncmp(tok, "interface=", 10) == 0) {
+                strncpy(interface, tok + 10, sizeof(interface) - 1);
+            } else if (strncmp(tok, "address=", 8) == 0) {
+                strncpy(address, tok + 8, sizeof(address) - 1);
+            } else if (strncmp(tok, "gateway=", 8) == 0) {
+                strncpy(gateway, tok + 8, sizeof(gateway) - 1);
+            } else if (strncmp(tok, "mtu=", 4) == 0) {
+                strncpy(mtu, tok + 4, sizeof(mtu) - 1);
+            } else if (strcmp(tok, "up") == 0) {
+                bring_up = 1;
+            }
         }
     }
 
@@ -1136,8 +1319,7 @@ static inline int gns_handle_start_socket_relay(int init_fd, void *msg_buf,
 static inline int gns_handle_query_networking_mode(int init_fd, void *msg_buf,
                                                    size_t msg_size)
 {
-    (void)msg_buf; (void)msg_size;
-    /* FreeBSD port defaults to NAT mode */
+    (void)msg_size;
     RESULT_MESSAGE_UINT32 resp;
     memset(&resp, 0, sizeof(resp));
     resp.Header.MessageType = LxMessageResultUint32;
@@ -1147,8 +1329,38 @@ static inline int gns_handle_query_networking_mode(int init_fd, void *msg_buf,
         struct MESSAGE_HEADER *qh = (struct MESSAGE_HEADER *)msg_buf;
         resp.Header.SequenceNumber = qh->SequenceNumber;
     }
-    resp.Result = LX_INIT_NETWORKING_MODE_NAT;
-    printf("[gns] QueryNetworkingMode -> NAT (0)\n");
+
+    /* Group F: Read networking mode from WSL2_NETWORKING_MODE env var
+     * instead of hardcoding NAT. The host (main.cpp) sets this env var
+     * to an LX_MINI_INIT_NETWORKING_MODE enum value before launching the
+     * guest init: None=0, Nat=1, Bridged=2, Mirrored=3, VirtioProxy=4.
+     * We map these to our internal LX_INIT_NETWORKING_MODE_* constants
+     * (NAT=0, BRIDGED=1, MIRRORED=2) which are returned to the host.
+     * Default (unset/None/Nat) is NAT. Reference: init.cpp:2242-2247. */
+    uint32_t mode = LX_INIT_NETWORKING_MODE_NAT;
+    const char *env = getenv("WSL2_NETWORKING_MODE");
+    if (env && env[0]) {
+        int v = atoi(env);
+        switch (v) {
+            case 2:  /* LxMiniInitNetworkingModeBridged */
+                mode = LX_INIT_NETWORKING_MODE_BRIDGED;
+                break;
+            case 3:  /* LxMiniInitNetworkingModeMirrored */
+                mode = LX_INIT_NETWORKING_MODE_MIRRORED;
+                break;
+            case 0:  /* None */
+            case 1:  /* Nat */
+            case 4:  /* VirtioProxy (unsupported, fallback to NAT) */
+            default:
+                mode = LX_INIT_NETWORKING_MODE_NAT;
+                break;
+        }
+        printf("[gns] QueryNetworkingMode: WSL2_NETWORKING_MODE=%s -> mode=%u\n",
+               env, mode);
+    } else {
+        printf("[gns] QueryNetworkingMode: no WSL2_NETWORKING_MODE env -> NAT(0)\n");
+    }
+    resp.Result = mode;
     return gns_send_all(init_fd, &resp, sizeof(resp));
 }
 
@@ -1232,6 +1444,41 @@ static inline void gns_handle_setup_ipv6(int gns_fd, const void *msg_buf,
                    strerror(errno));
         }
         close(v6_sock);
+
+        /* G: Apply real IPv6 configuration on FreeBSD.
+         *   - ifconfig lo0 inet6 ::1/128 add  (idempotent)
+         *   - sysctl net.inet6.ip6.dad_count=0           (DisableDAD)
+         *   - sysctl net.inet6.ip6.accept_rtadv=0         (DisableRouterDiscovery)
+         *   - sysctl net.inet6.ip6.auto_linklocal=0       (DisableIpv6AddressGeneration)
+         * On Linux test harness these will fail (expected — non-root, no IPv6 config). */
+#ifdef __FreeBSD__
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+                 "ifconfig lo0 inet6 ::1/128 add 2>/dev/null");
+        printf("[gns] SetupIpv6: running: %s\n", cmd);
+        int rc = gns_run_cmd(cmd);
+        if (rc != 0)
+            printf("[gns] SetupIpv6: ifconfig ::1 failed (rc=%d) — non-fatal\n", rc);
+
+        snprintf(cmd, sizeof(cmd),
+                 "sysctl net.inet6.ip6.dad_count=0 2>/dev/null");
+        gns_run_cmd(cmd);
+
+        snprintf(cmd, sizeof(cmd),
+                 "sysctl net.inet6.ip6.accept_rtadv=0 2>/dev/null");
+        gns_run_cmd(cmd);
+
+        snprintf(cmd, sizeof(cmd),
+                 "sysctl net.inet6.ip6.auto_linklocal=0 2>/dev/null");
+        gns_run_cmd(cmd);
+
+        printf("[gns] SetupIpv6: DisableDAD + DisableRouterDiscovery + "
+               "DisableIpv6AddressGeneration applied\n");
+#else
+        /* Linux test harness: log that we would apply IPv6 config */
+        printf("[gns] SetupIpv6: would apply ifconfig lo0 inet6 ::1/128 add + "
+               "sysctl dad_count/accept_rtadv/auto_linklocal on FreeBSD\n");
+#endif
     }
 
     /* Always respond with success so the host continues the init flow.
@@ -1953,8 +2200,53 @@ static inline void gns_engine_loop(int gns_fd)
             break;
 
         case LxGnsMessageConnectTestRequest:
-            /* Connectivity test: respond with success */
-            gns_send_result(gns_fd, hdr.SequenceNumber, 0, "connect ok");
+            /* C: Connectivity test — probe TCP/UDP reachability.
+             * JSON payload: {"Address":"<ip>","Port":<n>,"Protocol":"tcp|udp",...}
+             * On FreeBSD/Linux: attempt a real socket connect() to verify. */
+            {
+                char *ct_content = gns_extract_content(full_msg, hdr.MessageSize);
+                if (ct_content) {
+                    char ct_addr[64] = {0};
+                    long ct_port = gns_json_get_int(ct_content, "Port", 0);
+                    char ct_proto[16] = {0};
+                    gns_json_get_string(ct_content, "Address", ct_addr, sizeof(ct_addr));
+                    gns_json_get_string(ct_content, "Protocol", ct_proto, sizeof(ct_proto));
+                    printf("[gns] ConnectTestRequest: addr=%s port=%ld proto=%s\n",
+                           ct_addr, ct_port, ct_proto);
+
+                    int ct_result = 0;
+                    const char *ct_note = "connect ok";
+                    if (ct_addr[0] && ct_port > 0 && ct_port <= 65535) {
+                        int proto = (strcmp(ct_proto, "udp") == 0) ? SOCK_DGRAM : SOCK_STREAM;
+                        int s = socket(AF_INET, proto, 0);
+                        if (s >= 0) {
+                            struct sockaddr_in sa = {0};
+                            sa.sin_family = AF_INET;
+                            sa.sin_port = htons((uint16_t)ct_port);
+                            inet_pton(AF_INET, ct_addr, &sa.sin_addr);
+                            /* Set short timeout for connect */
+                            struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+                            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                            int cr = connect(s, (struct sockaddr *)&sa, sizeof(sa));
+                            if (cr == 0 || proto == SOCK_DGRAM) {
+                                ct_result = 0;
+                                ct_note = "connect succeeded";
+                            } else {
+                                ct_result = -1;
+                                ct_note = "connect failed (non-fatal)";
+                            }
+                            close(s);
+                        } else {
+                            ct_note = "socket creation failed";
+                        }
+                    }
+                    gns_send_result(gns_fd, hdr.SequenceNumber, ct_result, ct_note);
+                    free(ct_content);
+                } else {
+                    gns_send_result(gns_fd, hdr.SequenceNumber, 0, "connect ok (no payload)");
+                }
+            }
             break;
 
         case LxGnsMessageInitialIpConfigurationNotification:
@@ -1969,8 +2261,49 @@ static inline void gns_engine_loop(int gns_fd)
             break;
 
         case LxGnsMessageVmNicCreatedNotification:
-            /* NIC created notification — acknowledge */
-            gns_send_result(gns_fd, hdr.SequenceNumber, 0, "nic created");
+            /* Group F: VM NIC created — record interface and enable loopback
+             * routing. Was: ack only. Now: parse JSON for interfaceName
+             * (or targetDeviceName), update g_default_interface, and enable
+             * loopback routing on FreeBSD for mirrored networking mode.
+             * Reference: GnsEngine.cpp:467-477 (OpenAdapter + EnableLoopbackRouting). */
+            {
+                char *nic_content = gns_extract_content(full_msg, hdr.MessageSize);
+                if (nic_content) {
+                    char iface[32] = {0};
+                    /* HNS sends adapterId (GUID); FreeBSD uses interface names.
+                     * Try interfaceName first (FreeBSD extension), then
+                     * targetDeviceName (used by other Notification messages). */
+                    gns_json_get_string(nic_content, "interfaceName",
+                                        iface, sizeof(iface));
+                    if (!iface[0])
+                        gns_json_get_string(nic_content, "targetDeviceName",
+                                            iface, sizeof(iface));
+                    if (iface[0]) {
+                        gns_set_default_interface(iface);
+                        printf("[gns] VmNicCreated: default interface set to '%s'\n",
+                               iface);
+#ifdef __FreeBSD__
+                        /* Enable loopback routing for mirrored networking.
+                         * Reference: NetworkManager::EnableLoopbackRouting. */
+                        char cmd[128];
+                        snprintf(cmd, sizeof(cmd),
+                                 "sysctl net.inet.ip.forwarding=1 2>/dev/null");
+                        printf("[gns] VmNicCreated: running: %s\n", cmd);
+                        gns_run_cmd(cmd);
+#else
+                        printf("[gns] VmNicCreated: would enable loopback routing on FreeBSD\n");
+#endif
+                    } else {
+                        printf("[gns] VmNicCreated: no interfaceName in payload, "
+                               "keeping default '%s'\n", g_default_interface);
+                    }
+                    gns_send_result(gns_fd, hdr.SequenceNumber, 0, "nic created");
+                    free(nic_content);
+                } else {
+                    gns_send_result(gns_fd, hdr.SequenceNumber, 0,
+                                    "nic created (no content)");
+                }
+            }
             break;
 
         /* Task Group C (extended): port forwarding & relay management */
