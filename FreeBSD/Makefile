@@ -8,27 +8,39 @@
 # compiled by the Linux test harness (see test/Makefile for that).
 #
 # Build:  make
+# Install: make install
 # Clean:  make clean
+#
+# Installation targets:
+#   make install         Install binaries and rc.d script
+#   make install-bin     Install binaries only
+#   make install-rc      Install rc.d script only
+#   make install-tools   Install wslpath and wslinfo user tools
 #
 # Dependencies (FreeBSD base or pkg):
 #   - lib9p   : /usr/src/contrib/lib9p (base) or pkg install lib9p
 #   - libutil : forkpty() for hvbridge (base)
 #   - libevent: used internally by lib9p transport (base)
-#
-# The -D__FreeBSD__=1 flag selects the lib9p production branch in
-# plan9_server.h (AF_HYPERV + l9p_backend_fs_init) instead of the
-# Linux TCP test stub.
 
 CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -O2 -g -std=gnu11 -D__FreeBSD__=1
 LDFLAGS ?= -lutil -levent -l9p
 
+# Installation paths
+PREFIX     ?= /usr/local
+BINDIR     ?= $(PREFIX)/bin
+LIBEXECDIR ?= $(PREFIX)/libexec/wsl
+RCDIR      ?= $(PREFIX)/etc/rc.d
+MANDIR     ?= $(PREFIX)/share/man/man1
+
 # Production binaries
-BINS = hvinit hvbridge
+BINS = hvinit hvbridge wslpath wslinfo
 
 # Source files
 HVINIT_SRCS = hvinit.c
 HVBRIDGE_SRCS = hvbridge.c
+WSLPATH_SRCS = wslpath.c
+WSLINFO_SRCS = wslinfo.c
 
 # Headers that trigger rebuild.
 # Includes all headers transitively included by hvinit.c and hvbridge.c:
@@ -50,7 +62,42 @@ hvinit: $(HVINIT_SRCS) $(HDRS)
 hvbridge: $(HVBRIDGE_SRCS) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ $(HVBRIDGE_SRCS) $(LDFLAGS)
 
+wslpath: $(WSLPATH_SRCS)
+	$(CC) $(CFLAGS) -o $@ $(WSLPATH_SRCS)
+
+wslinfo: $(WSLINFO_SRCS)
+	$(CC) $(CFLAGS) -o $@ $(WSLINFO_SRCS)
+
 clean:
 	rm -f $(BINS)
 
-.PHONY: all clean
+# ---- Installation targets ----
+
+# install-bin: Install the WSL init daemon binaries to libexec.
+install-bin: hvinit hvbridge
+	mkdir -p $(DESTDIR)$(LIBEXECDIR)
+	install -m 755 hvinit $(DESTDIR)$(LIBEXECDIR)/hvinit
+	install -m 755 hvbridge $(DESTDIR)$(LIBEXECDIR)/hvbridge
+
+# install-tools: Install user-facing tools to bin.
+install-tools: wslpath wslinfo
+	mkdir -p $(DESTDIR)$(BINDIR)
+	install -m 755 wslpath $(DESTDIR)$(BINDIR)/wslpath
+	install -m 755 wslinfo $(DESTDIR)$(BINDIR)/wslinfo
+
+# install-rc: Install the rc.d service script.
+install-rc:
+	mkdir -p $(DESTDIR)$(RCDIR)
+	install -m 555 wsl_init $(DESTDIR)$(RCDIR)/wsl_init
+
+# install: Install everything (binaries, tools, rc.d script).
+install: install-bin install-tools install-rc
+	@echo ""
+	@echo "WSL-For-FreeBSD installed successfully."
+	@echo ""
+	@echo "To enable the WSL init daemon:"
+	@echo "  sysrc wsl_init_enable=YES"
+	@echo "  service wsl_init start"
+	@echo ""
+
+.PHONY: all clean install install-bin install-tools install-rc

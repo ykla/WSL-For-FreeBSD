@@ -11,7 +11,7 @@ CC      = cc
 CFLAGS  = -Wall -Wextra -O2 -g -std=gnu11 -I..
 LDFLAGS = -lutil
 
-BINARIES = wsl_mock_host hvinit_tcp hvbridge_tcp wsl-interop
+BINARIES = wsl_mock_host hvinit_tcp hvbridge_tcp wsl-interop wslpath wslinfo
 
 GNS_HEADERS = ../gns_engine.h ../port_tracker.h ../binfmt_handler.h ../interop_server.h
 
@@ -30,6 +30,12 @@ hvbridge_tcp: hvbridge_tcp.c wsl_protocol.h ../interop_server.h ../wsl_interop.h
 
 wsl-interop: ../wsl-interop.c ../wsl_interop.h
 	$(CC) $(CFLAGS) -o $@ ../wsl-interop.c
+
+wslpath: ../wslpath.c
+	$(CC) $(CFLAGS) -o $@ ../wslpath.c
+
+wslinfo: ../wslinfo.c
+	$(CC) $(CFLAGS) -o $@ ../wslinfo.c
 
 test: all
 	@./run_test.sh

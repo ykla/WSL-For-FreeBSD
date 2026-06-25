@@ -6725,6 +6725,308 @@ int main(void)
               "got empty");
     }
 
+    /* ====================================================================
+     * Task Group C: wslpath/wslinfo user tool integration tests.
+     *
+     * Validates that the wslpath and wslinfo tools compile and function
+     * correctly. These tools are compiled by the test Makefile and tested
+     * via system() calls from the test harness.
+     * ==================================================================== */
+
+    /* C1: wslpath — POSIX to Windows path conversion.
+     * Tests the core path translation logic: /mnt/c/... → C:\... */
+    printf("\n[host] Step 89: C1 — wslpath POSIX→Windows conversion...\n");
+    {
+        /* Test: wslpath -w /mnt/c/Users/foo */
+        int rc = system("./wslpath -w /mnt/c/Users/foo > /tmp/wslpath_test1.txt 2>/dev/null");
+        CHECK(rc == 0, "C1: wslpath -w succeeds", "got rc=%d", rc);
+
+        char buf[256];
+        FILE *f = fopen("/tmp/wslpath_test1.txt", "r");
+        CHECK(f != NULL, "C1: wslpath output file exists", "fopen failed");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                /* Strip trailing newline */
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strcmp(buf, "C:\\Users\\foo") == 0,
+                      "C1: /mnt/c/Users/foo → C:\\Users\\foo",
+                      "got '%s'", buf);
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslpath_test1.txt");
+    }
+
+    /* C2: wslpath — Windows to POSIX path conversion. */
+    printf("\n[host] Step 90: C2 — wslpath Windows→POSIX conversion...\n");
+    {
+        int rc = system("./wslpath -u 'C:\\Users\\foo' > /tmp/wslpath_test2.txt 2>/dev/null");
+        CHECK(rc == 0, "C2: wslpath -u succeeds", "got rc=%d", rc);
+
+        char buf[256];
+        FILE *f = fopen("/tmp/wslpath_test2.txt", "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strcmp(buf, "/mnt/c/Users/foo") == 0,
+                      "C2: C:\\Users\\foo → /mnt/c/Users/foo",
+                      "got '%s'", buf);
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslpath_test2.txt");
+    }
+
+    /* C3: wslpath — mixed mode (forward slashes). */
+    printf("\n[host] Step 91: C3 — wslpath mixed mode...\n");
+    {
+        int rc = system("./wslpath -m /mnt/c/Users/foo > /tmp/wslpath_test3.txt 2>/dev/null");
+        CHECK(rc == 0, "C3: wslpath -m succeeds", "got rc=%d", rc);
+
+        char buf[256];
+        FILE *f = fopen("/tmp/wslpath_test3.txt", "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strcmp(buf, "C:/Users/foo") == 0,
+                      "C3: /mnt/c/Users/foo → C:/Users/foo",
+                      "got '%s'", buf);
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslpath_test3.txt");
+    }
+
+    /* C4: wslpath — UNC path conversion. */
+    printf("\n[host] Step 92: C4 — wslpath UNC conversion...\n");
+    {
+        int rc = system("./wslpath -w /mnt/wsl/server/share > /tmp/wslpath_test4.txt 2>/dev/null");
+        CHECK(rc == 0, "C4: wslpath UNC succeeds", "got rc=%d", rc);
+
+        char buf[256];
+        FILE *f = fopen("/tmp/wslpath_test4.txt", "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strcmp(buf, "\\\\server\\share") == 0,
+                      "C4: /mnt/wsl/server/share → \\\\server\\share",
+                      "got '%s'", buf);
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslpath_test4.txt");
+    }
+
+    /* C5: wslinfo — version query. */
+    printf("\n[host] Step 93: C5 — wslinfo --version...\n");
+    {
+        int rc = system("./wslinfo --version > /tmp/wslinfo_test1.txt 2>/dev/null");
+        CHECK(rc == 0, "C5: wslinfo --version succeeds", "got rc=%d", rc);
+
+        char buf[256];
+        FILE *f = fopen("/tmp/wslinfo_test1.txt", "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strlen(buf) > 0, "C5: version string is non-empty",
+                      "got empty");
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslinfo_test1.txt");
+    }
+
+    /* C6: wslinfo --wsl-version (must be "2"). */
+    printf("\n[host] Step 94: C6 — wslinfo --wsl-version...\n");
+    {
+        int rc = system("./wslinfo --wsl-version > /tmp/wslinfo_test2.txt 2>/dev/null");
+        CHECK(rc == 0, "C6: wslinfo --wsl-version succeeds", "got rc=%d", rc);
+
+        char buf[256];
+        FILE *f = fopen("/tmp/wslinfo_test2.txt", "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strcmp(buf, "2") == 0,
+                      "C6: wsl-version is 2", "got '%s'", buf);
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslinfo_test2.txt");
+    }
+
+    /* C7: wslinfo --vm-id (non-empty GUID). */
+    printf("\n[host] Step 95: C7 — wslinfo --vm-id...\n");
+    {
+        int rc = system("./wslinfo --vm-id > /tmp/wslinfo_test3.txt 2>/dev/null");
+        CHECK(rc == 0, "C7: wslinfo --vm-id succeeds", "got rc=%d", rc);
+
+        char buf[256];
+        FILE *f = fopen("/tmp/wslinfo_test3.txt", "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strlen(buf) == 36, "C7: VM ID is 36 chars (GUID format)",
+                      "got %zu chars: '%s'", strlen(buf), buf);
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslinfo_test3.txt");
+    }
+
+    /* C8: wslinfo --networking-mode (defaults to NAT when no interop). */
+    printf("\n[host] Step 96: C8 — wslinfo --networking-mode...\n");
+    {
+        int rc = system("./wslinfo --networking-mode > /tmp/wslinfo_test4.txt 2>/dev/null");
+        (void)rc; /* rc may be non-zero if interop socket unavailable */
+        /* networking-mode may fail if interop socket not available, but should
+         * gracefully degrade to NAT */
+        char buf[256];
+        FILE *f = fopen("/tmp/wslinfo_test4.txt", "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strlen(buf) > 0, "C8: networking-mode output non-empty",
+                      "got empty");
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslinfo_test4.txt");
+    }
+
+    /* C9: wslinfo --name (reads WSL_DISTRO_NAME env var). */
+    printf("\n[host] Step 97: C9 — wslinfo --name...\n");
+    {
+        /* Set WSL_DISTRO_NAME for the test */
+        setenv("WSL_DISTRO_NAME", "TestDistro", 1);
+        int rc = system("./wslinfo --name > /tmp/wslinfo_test5.txt 2>/dev/null");
+        unsetenv("WSL_DISTRO_NAME");
+        CHECK(rc == 0, "C9: wslinfo --name succeeds", "got rc=%d", rc);
+
+        char buf[256];
+        FILE *f = fopen("/tmp/wslinfo_test5.txt", "r");
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+                CHECK(strcmp(buf, "TestDistro") == 0,
+                      "C9: distro name is TestDistro", "got '%s'", buf);
+            }
+            fclose(f);
+        }
+        unlink("/tmp/wslinfo_test5.txt");
+    }
+
+    /* C10: wslinfo --help (should exit 0, produce output). */
+    printf("\n[host] Step 98: C10 — wslinfo --help...\n");
+    {
+        int rc = system("./wslinfo --help > /tmp/wslinfo_help.txt 2>&1");
+        CHECK(rc == 0, "C10: wslinfo --help exits 0", "got rc=%d", rc);
+
+        FILE *f = fopen("/tmp/wslinfo_help.txt", "r");
+        if (f) {
+            char buf[256];
+            int found = 0;
+            while (fgets(buf, sizeof(buf), f)) {
+                if (strstr(buf, "--vm-id")) found = 1;
+            }
+            fclose(f);
+            CHECK(found, "C10: help output contains --vm-id", "not found");
+        }
+        unlink("/tmp/wslinfo_help.txt");
+    }
+
+    /* ====================================================================
+     * Task Group D: Build system + FreeBSD integration.
+     *
+     * Validates the production Makefile, rc.d init script, and install
+     * targets. These tests ensure the FreeBSD integration layer is
+     * syntactically correct and ready for deployment.
+     * ==================================================================== */
+
+    /* D1: rc.d script syntax check (sh -n). */
+    printf("\n[host] Step 99: D1 — wsl_init rc.d script syntax check...\n");
+    {
+        int rc = system("sh -n ../wsl_init > /dev/null 2>&1");
+        CHECK(rc == 0, "D1: wsl_init rc.d script passes sh -n syntax check",
+              "got rc=%d", rc);
+    }
+
+    /* D2: rc.d script contains required metadata keywords. */
+    printf("\n[host] Step 100: D2 — wsl_init rc.d script metadata...\n");
+    {
+        int rc = system("grep -q '^# PROVIDE:' ../wsl_init");
+        CHECK(rc == 0, "D2: wsl_init has PROVIDE line", "missing");
+
+        rc = system("grep -q '^# REQUIRE:' ../wsl_init");
+        CHECK(rc == 0, "D2: wsl_init has REQUIRE line", "missing");
+
+        rc = system("grep -q '^# BEFORE:' ../wsl_init");
+        CHECK(rc == 0, "D2: wsl_init has BEFORE line", "missing");
+
+        rc = system("grep -q 'rcvar=' ../wsl_init");
+        CHECK(rc == 0, "D2: wsl_init has rcvar= setting", "missing");
+    }
+
+    /* D3: Production Makefile compilation (syntax check). */
+    printf("\n[host] Step 101: D3 — production Makefile syntax check...\n");
+    {
+        /* Run make -n to dry-run the build and verify Makefile syntax */
+        int rc = system("make -C .. -n all > /dev/null 2>&1");
+        CHECK(rc == 0, "D3: make -n succeeds (Makefile syntax OK)",
+              "got rc=%d", rc);
+    }
+
+    /* D4: Production Makefile install targets exist. */
+    printf("\n[host] Step 102: D4 — production Makefile install targets...\n");
+    {
+        int rc = system("make -C .. -n install-bin > /dev/null 2>&1");
+        CHECK(rc == 0, "D4: install-bin target exists",
+              "got rc=%d", rc);
+
+        rc = system("make -C .. -n install-tools > /dev/null 2>&1");
+        CHECK(rc == 0, "D4: install-tools target exists",
+              "got rc=%d", rc);
+
+        rc = system("make -C .. -n install-rc > /dev/null 2>&1");
+        CHECK(rc == 0, "D4: install-rc target exists",
+              "got rc=%d", rc);
+
+        rc = system("make -C .. -n install > /dev/null 2>&1");
+        CHECK(rc == 0, "D4: install target exists",
+              "got rc=%d", rc);
+    }
+
+    /* D5: Verify LIBEXECDIR path is correct in Makefile. */
+    printf("\n[host] Step 103: D5 — Makefile default paths...\n");
+    {
+        /* Check that the Makefile defines the expected default paths */
+        int rc = system("grep -q 'LIBEXECDIR.*libexec/wsl' ../Makefile");
+        CHECK(rc == 0, "D5: LIBEXECDIR points to libexec/wsl", "missing");
+
+        rc = system("grep -q 'RCDIR.*etc/rc.d' ../Makefile");
+        CHECK(rc == 0, "D5: RCDIR points to etc/rc.d", "missing");
+
+        rc = system("grep -q 'PREFIX.*/usr/local' ../Makefile");
+        CHECK(rc == 0, "D5: PREFIX defaults to /usr/local", "missing");
+    }
+
+    /* D6: wsl_init script has correct command path. */
+    printf("\n[host] Step 104: D6 — wsl_init command path...\n");
+    {
+        int rc = system("grep -qE 'libexec/wsl.*hvinit|wsl_init_bindir.*libexec/wsl' ../wsl_init");
+        CHECK(rc == 0, "D6: wsl_init references hvinit in libexec/wsl",
+              "missing");
+    }
+
     /* ---- Cleanup ---- */
     /* Phase 4: some fds may already be closed (set to -1); guard close() */
     for (int i = 0; i < 5; i++) if (extra[i] >= 0) close(extra[i]);

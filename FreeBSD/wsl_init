@@ -1,0 +1,122 @@
+#!/bin/sh
+#
+# SPDX-License-Identifier: MIT
+#
+# wsl_init - FreeBSD rc.d script for WSL-For-FreeBSD init daemon.
+#
+# Starts the hvinit and hvbridge processes that implement the WSL
+# init protocol over Hyper-V sockets. This script is the FreeBSD
+# equivalent of the WSL /init process on Linux.
+#
+# Installation:
+#   cp wsl_init /usr/local/etc/rc.d/wsl_init
+#   chmod 555 /usr/local/etc/rc.d/wsl_init
+#   sysrc wsl_init_enable=YES
+#
+# The init process is started as a daemon. It opens the Hyper-V
+# socket channel and handles the full WSL initialization lifecycle:
+# capabilities negotiation, filesystem setup, network configuration,
+# Plan9 file server, DNS tunneling, and interop.
+#
+# Configuration:
+#   wsl_init_flags (str): Extra flags to pass to hvinit.
+#   wsl_init_nice   (int): Nice level (default: -10 for real-time).
+#
+# PROVIDE: wsl_init
+# REQUIRE: NETWORKING ldconfig syslogd
+# BEFORE: LOGIN
+
+. /etc/rc.subr
+
+name="wsl_init"
+rcvar="wsl_init_enable"
+
+# Default paths
+: ${wsl_init_prefix:=/usr/local}
+: ${wsl_init_bindir:=${wsl_init_prefix}/libexec/wsl}
+: ${wsl_init_nice:=-10}
+
+command="${wsl_init_bindir}/hvinit"
+procname="${wsl_init_bindir}/hvinit"
+pidfile="/var/run/${name}.pid"
+
+# hvinit is the main init process; hvbridge is forked by hvinit
+# when a terminal session is requested.
+
+start_precmd="wsl_init_prestart"
+start_cmd="wsl_init_start"
+stop_cmd="wsl_init_stop"
+status_cmd="wsl_init_status"
+
+wsl_init_prestart()
+{
+    # Verify the hvinit binary exists and is executable.
+    if [ ! -x "${command}" ]; then
+        err 1 "${command} not found or not executable"
+    fi
+
+    # Verify Hyper-V socket support is available.
+    # AF_HYPERV requires the hv_sock kernel module.
+    if ! kldstat -q -m hv_sock 2>/dev/null; then
+        # Try to load the module
+        if ! kldload hv_sock 2>/dev/null; then
+            warn "hv_sock kernel module not available; WSL init may fail"
+        fi
+    fi
+
+    return 0
+}
+
+wsl_init_start()
+{
+    echo "Starting ${name}."
+    # Run hvinit with elevated priority for low-latency message handling.
+    # The -n flag sets the nice level.
+    if [ -n "${wsl_init_nice}" ]; then
+        /usr/bin/nice -n "${wsl_init_nice}" \
+            /usr/sbin/daemon -p "${pidfile}" -f \
+            "${command}" ${wsl_init_flags}
+    else
+        /usr/sbin/daemon -p "${pidfile}" -f \
+            "${command}" ${wsl_init_flags}
+    fi
+}
+
+wsl_init_stop()
+{
+    if [ -f "${pidfile}" ]; then
+        echo "Stopping ${name}."
+        # Send SIGTERM first for graceful shutdown.
+        # hvinit handles SIGTERM by terminating child processes
+        # and closing connections cleanly.
+        kill -TERM $(cat "${pidfile}") 2>/dev/null
+        # Wait up to 5 seconds for graceful exit.
+        local _timeout=5
+        while [ ${_timeout} -gt 0 ] && kill -0 $(cat "${pidfile}") 2>/dev/null; do
+            sleep 1
+            _timeout=$((_timeout - 1))
+        done
+        # Force kill if still running.
+        if kill -0 $(cat "${pidfile}") 2>/dev/null; then
+            warn "${name} did not stop gracefully; forcing kill."
+            kill -KILL $(cat "${pidfile}") 2>/dev/null
+        fi
+        rm -f "${pidfile}"
+    fi
+}
+
+wsl_init_status()
+{
+    if [ -f "${pidfile}" ]; then
+        local _pid=$(cat "${pidfile}" 2>/dev/null)
+        if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
+            echo "${name} is running as pid ${_pid}."
+            return 0
+        fi
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+load_rc_config "${name}"
+run_rc_command "$@"
