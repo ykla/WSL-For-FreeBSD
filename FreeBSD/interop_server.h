@@ -330,16 +330,29 @@ static inline int interop_process_message(int fd, void *msg, size_t msg_size)
         break;
 
     case LxInitMessageCreateLoginSession: {
-        /* Parse Uid, Gid, username from the message. */
+        /* Parse Uid, Gid, username from the message.
+         *
+         * Reference: config.cpp:410-432. CreateLoginSession is only meaningful
+         * when systemd is enabled (Config.BootInit == true). The handler
+         * performs forkpty + execl("/bin/login", "-f", Username) to create a
+         * systemd login session, then waits for user@<uid>.service to activate.
+         *
+         * FreeBSD forces SystemdEnabled=false (project hard constraint), so
+         * Config.BootInit is always false. The reference implementation
+         * returns false in this case (config.cpp:422-424 logs an error and
+         * leaves success=false). We align with that behavior: return false
+         * to indicate no login session was created. The caller (distro init)
+         * checks this and prints a warning but does not fail. */
         struct LX_INIT_CREATE_LOGIN_SESSION *cls =
             (struct LX_INIT_CREATE_LOGIN_SESSION *)msg;
         if (msg_size >= sizeof(struct MESSAGE_HEADER) + sizeof(unsigned int) * 2) {
-            printf("[interop] CreateLoginSession uid=%u gid=%u username='%s' -> true\n",
+            printf("[interop] CreateLoginSession uid=%u gid=%u username='%s' "
+                   "-> false (systemd disabled on FreeBSD)\n",
                    cls->Uid, cls->Gid, cls->Buffer);
+        } else {
+            printf("[interop] CreateLoginSession -> false (systemd disabled)\n");
         }
-        /* Minimal implementation: return success without actually creating
-         * a login session. Full implementation would forkpty + /bin/login. */
-        interop_send_bool(fd, hdr->SequenceNumber, 1);
+        interop_send_bool(fd, hdr->SequenceNumber, 0);
         break;
     }
 

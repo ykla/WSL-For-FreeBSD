@@ -46,6 +46,10 @@
 /* E1: Include binfmt_misc handler */
 #include "../binfmt_handler.h"
 
+/* Group A: Include Plan9 file server module.
+ * Uses lib9p on FreeBSD (hvsocket 50001), 9P stub on Linux (TCP 50001). */
+#include "../plan9_server.h"
+
 /* A1: Global parsed configuration from Initialize(5) message. */
 static struct wsl_config g_config;
 static int g_config_parsed = 0;
@@ -56,6 +60,10 @@ static int g_wsl_conf_parsed = 0;
 
 #include "../gns_engine.h"
 
+/* B (DNS Tunneling): Include DNS tunneling module.
+ * Must come after gns_engine.h so MESSAGE_HEADER is defined. */
+#include "../dns_tunneling.h"
+
 /* Phase 1: additional message types for event loop */
 #define LxInitMessageTerminateInstance  14
 
@@ -64,6 +72,9 @@ static int g_sigchld_pipe[2] = {-1, -1};
 
 /* C1: GNS engine child process */
 static pid_t g_gns_pid = -1;
+
+/* B: DNS tunneling channel fd passed to the GNS child. -1 = disabled. */
+static int g_dns_channel_fd = -1;
 
 static int hv_connect(unsigned int port);
 
@@ -98,21 +109,68 @@ static void gns_start_engine(int cap_fd, int notify_fd, int init_fd)
         return;
     }
 
+    /* B (DNS Tunneling): if the host requested DNS tunneling, open a second
+     * channel to PORT_HVS that the GNS child uses to relay DNS packets.
+     * The host accepts this extra connection only when the feature flag is
+     * set, so a failure here is fatal only when DNS tunneling is required. */
+    int dns_fd = -1;
+    if (g_dns_channel_fd >= 0) {
+        /* The init process already opened it; just take ownership. */
+        dns_fd = g_dns_channel_fd;
+        g_dns_channel_fd = -1;
+    } else if (g_config_parsed && (g_config.feature_flags & 0x20 /*LxInitFeatureDnsTunneling*/)) {
+        dns_fd = hv_connect(PORT_HVS);
+        if (dns_fd < 0) {
+            fprintf(stderr, "[init] DNS tunneling channel connect failed (non-fatal)\n");
+        } else {
+            printf("[init] DNS tunneling channel opened (fd=%d)\n", dns_fd);
+        }
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         perror("[init] gns fork");
         close(gns_fd);
+        if (dns_fd >= 0) close(dns_fd);
         return;
     }
     if (pid == 0) {
         close(cap_fd);
         if (notify_fd >= 0) close(notify_fd);
         close(init_fd);
+
+        /* B: If DNS tunneling is enabled, start the DNS relay in a
+         * grandchild process so it runs concurrently with the GNS loop.
+         * Both the GNS channel and the DNS channel are owned by the
+         * GNS child; the DNS relay gets only the DNS channel. */
+        if (dns_fd >= 0) {
+            pid_t dns_pid = fork();
+            if (dns_pid < 0) {
+                perror("[init] dns tunnel fork");
+                close(dns_fd);
+            } else if (dns_pid == 0) {
+                close(gns_fd);  /* DNS relay does not use the GNS channel */
+                struct dns_tunnel tunnel;
+                memset(&tunnel, 0, sizeof(tunnel));
+                tunnel.channel_fd = dns_fd;
+
+                /* Tests override the listen IP via WSL_DNS_TUNNEL_IP so they
+                 * can bind 127.0.0.1 instead of 10.255.255.254. */
+                const char *ip = getenv("WSL_DNS_TUNNEL_IP");
+                dns_tunnel_run(&tunnel, ip);
+                _exit(0);
+            } else {
+                printf("[init] DNS tunneling relay started (pid=%d)\n", (int)dns_pid);
+                close(dns_fd);
+            }
+        }
+
         gns_engine_loop(gns_fd);
         _exit(0);
     }
 
     close(gns_fd);
+    if (dns_fd >= 0) close(dns_fd);
     g_gns_pid = pid;
     printf("[init] GNS engine started (pid=%d)\n", (int)pid);
 }
@@ -214,7 +272,8 @@ static void sigchld_handler(int sig)
     (void)sig;
     if (g_sigchld_pipe[1] >= 0) {
         char c = 'c';
-        (void)write(g_sigchld_pipe[1], &c, 1);
+        ssize_t wr = write(g_sigchld_pipe[1], &c, 1);
+        (void)wr;
     }
 }
 
@@ -261,6 +320,12 @@ static void handle_terminate_instance(int init_fd, struct MESSAGE_HEADER *hdr)
 
     /* 2. Stop GNS engine child */
     gns_stop_engine();
+
+    /* Group A: Stop Plan9 file server (force=true for shutdown) */
+    if (plan9_is_running()) {
+        printf("[init] stopping Plan9 server for shutdown\n");
+        plan9_stop_server(true);
+    }
 
     /* 3. Unmount tracked filesystems in reverse order */
     if (g_mounted_count > 0) {
@@ -454,6 +519,27 @@ static void event_loop(int init_fd, int notify_fd)
                     break;
                 }
 
+                case LxInitMessageStopPlan9Server: {
+                    if (hdr.MessageSize < sizeof(LX_INIT_STOP_PLAN9_SERVER_MSG)) {
+                        fprintf(stderr, "[init] Group A: StopPlan9Server size %u < %zu\n",
+                                hdr.MessageSize, sizeof(LX_INIT_STOP_PLAN9_SERVER_MSG));
+                        break;
+                    }
+                    LX_INIT_STOP_PLAN9_SERVER_MSG *stop =
+                        (LX_INIT_STOP_PLAN9_SERVER_MSG *)full_msg;
+                    printf("[init] Group A: StopPlan9Server force=%d\n", stop->Force);
+                    bool ok = plan9_stop_server(stop->Force);
+                    RESULT_MESSAGE_BOOL resp;
+                    memset(&resp, 0, sizeof(resp));
+                    resp.Header.MessageType = LxMessageResultBool;
+                    resp.Header.MessageSize = sizeof(resp);
+                    resp.Header.SequenceNumber = hdr.SequenceNumber;
+                    resp.Result = ok;
+                    send_all(init_fd, &resp, sizeof(resp));
+                    printf("[init] Group A: StopPlan9Server response sent (result=%d)\n", ok);
+                    break;
+                }
+
                 default:
                     printf("[init] unhandled message type %u (size=%u, seq=%u)\n",
                            hdr.MessageType, hdr.MessageSize, hdr.SequenceNumber);
@@ -525,7 +611,7 @@ static void send_configuration_info_response(int init_fd, unsigned int seq)
     resp->Header.MessageType = LxInitMessageInitializeResponse;
     resp->Header.MessageSize = (unsigned int)msglen;
     resp->Header.SequenceNumber = seq;  /* Phase 0 fix: echo host's seq */
-    resp->Plan9Port = 0;                /* No Plan9 server yet (Task Group B) */
+    resp->Plan9Port = plan9_get_port();  /* Group A: Plan9 file server port */
     /* A1: Use DrvFsDefaultOwner from parsed config as DefaultUid */
     resp->DefaultUid = g_config_parsed ? g_config.drvfs_default_owner : 1;
     resp->InteropPort = PORT_HVS_BSD;
@@ -800,6 +886,19 @@ int main(void)
                         setenv("WSL_APPEND_WINDOWS_PATH",
                                append_path ? "1" : "0", 1);
                         printf("[init] E3: appendWindowsPath=%d\n", append_path);
+                    }
+
+                    /* Group A: Start Plan9 file server before sending InitializeResponse.
+                     * The host reads Plan9Port from the response and connects to
+                     * the server for \\wsl$\ access. */
+                    {
+                        unsigned int p9port = plan9_start_server();
+                        if (p9port > 0) {
+                            printf("[init] Group A: Plan9 server started on port %u\n", p9port);
+                        } else {
+                            fprintf(stderr,
+                                "[init] Group A: Plan9 server failed to start (non-fatal)\n");
+                        }
                     }
 
                     send_configuration_info_response(init_fd, init_hdr.SequenceNumber);

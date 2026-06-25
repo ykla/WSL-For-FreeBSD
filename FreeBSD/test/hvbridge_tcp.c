@@ -71,6 +71,7 @@
 #include "wsl_protocol.h"
 #include "../terminal_notify.h"
 #include "../interop_server.h"
+#include "../wsl_interop.h"
 
 /* Phase 1: also handle TerminateInstance on control channel */
 #define LxInitMessageTerminateInstance  14
@@ -245,7 +246,8 @@ static void sigchld_handler(int sig)
     (void)sig;
     if (g_sigchld_pipe[1] >= 0) {
         char c = 'c';
-        (void)write(g_sigchld_pipe[1], &c, 1);
+        ssize_t wr = write(g_sigchld_pipe[1], &c, 1);
+        (void)wr;
     }
 }
 
@@ -443,8 +445,24 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                        int channel_fd, int interop_fd,
                        struct create_process_info *info)
 {
-    int master_fd;
+    /* FIX: initialize master_fd to -1. glibc forkpty() only sets *amaster
+     * in the parent path (case default), NOT in the child path (case 0).
+     * Without this init, the child's close(master_fd) would close an
+     * uninitialized fd — if that garbage value happens to be 0, 1, or 2,
+     * it closes the PTY slave (stdin/stdout/stderr), causing the shell
+     * to read EOF and exit immediately with code 0. */
+    int master_fd = -1;
     pid_t pid;
+
+    /* E2: Local interop Unix socket server for child→host relay. */
+    char interop_sock_path[64];
+    interop_sock_path[0] = '\0';
+    int interop_listen_fd = wsl_interop_create_server(getpid(),
+                                                       interop_sock_path,
+                                                       sizeof(interop_sock_path));
+    if (interop_listen_fd >= 0) {
+        fcntl(interop_listen_fd, F_SETFL, O_NONBLOCK);
+    }
 
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
@@ -484,6 +502,23 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
         /* Child: start process using parsed CreateProcess info (Phase 2) */
         signal(SIGCHLD, SIG_DFL); /* restore default in child */
 
+        /* E2: Set WSL_INTEROP env var so child processes can find the
+         * interop Unix socket for Windows process launching. */
+        wsl_interop_set_env(interop_sock_path);
+
+        /* Close inherited parent-side fds to prevent resource leaks.
+         * The child only needs stdin/stdout/stderr (PTY slave from forkpty).
+         * The listening socket has FD_CLOEXEC and is closed on exec. */
+        if (interop_listen_fd >= 0) close(interop_listen_fd);
+        if (master_fd >= 0) close(master_fd);
+        if (initial_c >= 0) close(initial_c);
+        if (stdin_fd >= 0) close(stdin_fd);
+        if (stdout_fd >= 0) close(stdout_fd);
+        if (channel_fd >= 0) close(channel_fd);
+        if (interop_fd >= 0) close(interop_fd);
+        if (g_sigchld_pipe[0] >= 0) close(g_sigchld_pipe[0]);
+        if (g_sigchld_pipe[1] >= 0) close(g_sigchld_pipe[1]);
+
         /* Phase 3: Set PTY slave to raw mode.
          * In WSL, the host (Windows Terminal / ConPTY) handles terminal
          * emulation (echo, line editing, signals). The guest PTY should
@@ -513,6 +548,29 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
             if (info->filename && info->argv) {
                 char *default_envp[] = { NULL };
                 char **envp = info->envp ? info->envp : default_envp;
+
+                /* E5: Append WSL_INTEROP to envp. setenv() only modifies
+                 * the process's environ, NOT the custom envp array used by
+                 * execve. We must add it explicitly so the shell and its
+                 * children (e.g. wsl-interop) can find the interop socket. */
+                char wsl_interop_val[128];
+                if (interop_sock_path[0] != '\0') {
+                    size_t env_count = 0;
+                    while (envp[env_count]) env_count++;
+                    snprintf(wsl_interop_val, sizeof(wsl_interop_val),
+                             "%s=%s", WSL_INTEROP_ENV, interop_sock_path);
+                    /* Allocate new array: env_count + WSL_INTEROP + NULL */
+                    char **new_envp = malloc(
+                        (env_count + 2) * sizeof(char *));
+                    if (new_envp) {
+                        for (size_t i = 0; i < env_count; i++)
+                            new_envp[i] = envp[i];
+                        new_envp[env_count] = wsl_interop_val;
+                        new_envp[env_count + 1] = NULL;
+                        envp = new_envp;
+                    }
+                }
+
                 execve(info->filename, info->argv, envp);
                 perror("[bridge] execve");
                 /* fall through to fallback on failure */
@@ -600,7 +658,8 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
     bg_color_tracker_init(&bct);
 
     /* pollfd indices */
-    enum { IDX_CONTROL, IDX_STDIN, IDX_PTY, IDX_SIGCHLD, IDX_CHANNEL, IDX_INTEROP, NFDS };
+    enum { IDX_CONTROL, IDX_STDIN, IDX_PTY, IDX_SIGCHLD, IDX_CHANNEL, IDX_INTEROP,
+           IDX_INTEROP_LOCAL, NFDS };
 
     while (!session_done) {
         struct pollfd pfds[NFDS];
@@ -620,6 +679,10 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
         pfds[IDX_CHANNEL].events = POLLIN;
         pfds[IDX_INTEROP].fd = host_disconnected ? -1 : interop_fd;
         pfds[IDX_INTEROP].events = POLLIN;
+        /* E2: local interop Unix socket — always poll, even after host
+         * disconnect, so child processes can still relay messages. */
+        pfds[IDX_INTEROP_LOCAL].fd = interop_listen_fd;
+        pfds[IDX_INTEROP_LOCAL].events = POLLIN;
 
         /* Phase 4: poll with a shorter timeout while waiting for the child to
          * die after a host disconnect, so we can enforce the SIGKILL deadline. */
@@ -890,6 +953,12 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                 interop_consume(&ir, imsg_size);
             }
         }
+
+        /* E2: local interop Unix socket — accept child connections and
+         * relay CreateProcessUtilityVm to the host control channel. */
+        if (interop_listen_fd >= 0 && (pfds[IDX_INTEROP_LOCAL].revents & POLLIN)) {
+            wsl_interop_try_accept(interop_listen_fd, initial_c);
+        }
     }
 
     /* Phase 4: guaranteed child reaping on every exit path. If we reached here
@@ -904,6 +973,9 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
     }
 
     close(master_fd);
+    /* E2: cleanup the interop Unix socket */
+    if (interop_listen_fd >= 0) close(interop_listen_fd);
+    wsl_interop_cleanup(interop_sock_path);
     signal(SIGCHLD, SIG_DFL);
     /* FIX: close pipe fds to avoid fd leak in multi-session loop */
     if (g_sigchld_pipe[0] >= 0) close(g_sigchld_pipe[0]);
@@ -925,6 +997,7 @@ int main(void)
 
     int opt = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    fcntl(s, F_SETFD, FD_CLOEXEC); /* don't inherit listening socket in child */
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));

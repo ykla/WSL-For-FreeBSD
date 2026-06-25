@@ -72,6 +72,7 @@
 #include <signal.h>
 #include <poll.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 
 #include "wsl_protocol.h"
 
@@ -101,6 +102,12 @@
 
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
+
+/* CHECK macro: when the condition fails, prints the test name and a
+ * printf-style detail string. An empty format string ("") is valid and
+ * produces no extra output. Suppress the benign -Wformat-zero-length. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-zero-length"
 
 #define CHECK(cond, name, ...) do { \
     if (cond) { \
@@ -139,6 +146,101 @@ static int connect_to_port(int port)
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     return fd;
+}
+
+/* ---- PortListenerRelay helpers (Task Group C) ----
+ * The guest's port_tracker sends LxGnsMessagePortListenerRelayStart(59) and
+ * LxGnsMessagePortListenerRelayStop(60) messages on the GNS channel. These
+ * arrive asynchronously and can interleave with response messages. The
+ * helpers below let the mock host drain or skip them when waiting for a
+ * specific response. */
+
+/* Wire layout of PortListenerRelay (matches LX_GNS_PORT_LISTENER_RELAY). */
+typedef struct MOCK_PORT_LISTENER_RELAY {
+    struct MESSAGE_HEADER Header;
+    unsigned short Family;        /* host order */
+    unsigned short Port;          /* network byte order */
+    unsigned int   Address[4];
+} MOCK_PORT_LISTENER_RELAY;
+
+/* Drain all pending data from gns_fd (non-blocking, 200ms total budget).
+ * Used to flush the initial burst of PortListenerRelayStart messages that
+ * the guest sends when the GNS channel first connects. Returns the number
+ * of recv calls that returned data. */
+static int drain_relay_messages(int gns_fd)
+{
+    if (gns_fd < 0) return 0;
+    int drained = 0;
+    int saved_flags = fcntl(gns_fd, F_GETFL, 0);
+    if (saved_flags >= 0) fcntl(gns_fd, F_SETFL, saved_flags | O_NONBLOCK);
+    for (;;) {
+        struct pollfd pfd = { .fd = gns_fd, .events = POLLIN };
+        if (poll(&pfd, 1, 200) <= 0) break;
+        if (!(pfd.revents & POLLIN)) break;
+        char tmp[4096];
+        ssize_t n = recv(gns_fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) break;
+        drained++;
+    }
+    if (saved_flags >= 0) fcntl(gns_fd, F_SETFL, saved_flags);
+    return drained;
+}
+
+/* Receive a GNS message, skipping any PortListenerRelay(59/60) messages.
+ * Returns a malloc'd buffer (caller frees) or NULL on error. */
+static void *recv_gns_response(int gns_fd, struct MESSAGE_HEADER *out_hdr)
+{
+    for (;;) {
+        void *msg = recv_message(gns_fd, out_hdr);
+        if (!msg) return NULL;
+        unsigned int mtype = out_hdr->MessageType;
+        if (mtype == LxGnsMessagePortListenerRelayStart ||
+            mtype == LxGnsMessagePortListenerRelayStop) {
+            free(msg);
+            continue;  /* skip async relay notifications */
+        }
+        return msg;
+    }
+}
+
+/* Wait for a PortListenerRelay message matching host_port within timeout_ms.
+ * Skips non-relay messages and relay messages for other ports.
+ * Returns the message type (59 or 60) on success, 0 on timeout, -1 on error. */
+static int recv_relay_for_port(int gns_fd, uint16_t host_port, int timeout_ms)
+{
+    time_t deadline = time(NULL) + timeout_ms / 1000 + 1;
+    for (;;) {
+        time_t now = time(NULL);
+        if (now >= deadline) return 0;
+        int remaining_ms = (int)((deadline - now) * 1000);
+        if (remaining_ms > timeout_ms) remaining_ms = timeout_ms;
+
+        struct pollfd pfd = { .fd = gns_fd, .events = POLLIN };
+        int rc = poll(&pfd, 1, remaining_ms);
+        if (rc <= 0) return 0;
+
+        struct MESSAGE_HEADER hdr;
+        void *msg = recv_message(gns_fd, &hdr);
+        if (!msg) return -1;
+
+        if (hdr.MessageType != LxGnsMessagePortListenerRelayStart &&
+            hdr.MessageType != LxGnsMessagePortListenerRelayStop) {
+            free(msg);
+            continue;  /* not a relay message — skip */
+        }
+
+        MOCK_PORT_LISTENER_RELAY *relay = (MOCK_PORT_LISTENER_RELAY *)msg;
+        uint16_t relay_port = ntohs(relay->Port);
+        int relay_family = relay->Family;
+        free(msg);
+
+        if (relay_port == host_port) {
+            printf("  Found relay: type=%u family=%d port=%u\n",
+                   hdr.MessageType, relay_family, relay_port);
+            return (int)hdr.MessageType;
+        }
+        /* Relay for a different port — keep looking. */
+    }
 }
 
 /* Read from fd with timeout. Returns bytes read, 0 on timeout, -1 on error. */
@@ -240,6 +342,12 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
     printf("=== WSL Mock Host — Phase 9 Test Harness ===\n\n");
 
+    /* Group A: saved Plan9 port from InitializeResponse for later 9P tests.
+     * Not initialized here: the InitializeResponse block below always runs
+     * (or returns on error) before any read, so an initializer would be a
+     * dead store flagged by -Wunused-but-set-variable. */
+    unsigned int saved_plan9_port;
+
     /* Configure resolv.conf test path when WSL_TEST_ROOT is set */
     {
         const char *test_root = getenv("WSL_TEST_ROOT");
@@ -338,7 +446,7 @@ int main(void)
             "Asia/Shanghai",         /* timezone */
             0x04,                    /* drvfs_volumes_bitmap: bit 2 = C: */
             1000,                    /* drvfs_default_owner (UID) */
-            0x02,                    /* feature_flags: LxInitFeatureVirtIoFs */
+            0x22,                    /* feature_flags: VirtIoFs(0x02) + DnsTunneling(0x20) */
             WSL_DRVFS_MOUNT_NONELEVATED, /* drvfs_mount */
             42,                      /* sequence number */
             &init_msg_size);
@@ -382,6 +490,13 @@ int main(void)
         CHECK(cfg->SystemdEnabled == false,
               "InitializeResponse SystemdEnabled==false (Phase 0 fix)",
               "got %d", cfg->SystemdEnabled);
+        /* Group A: Verify Plan9Port is non-zero (server started before response) */
+        CHECK(cfg->Plan9Port != 0,
+              "Group A: InitializeResponse Plan9Port!=0 (server started)",
+              "got %u", cfg->Plan9Port);
+        saved_plan9_port = cfg->Plan9Port;
+        printf("  Group A: Plan9Port=%u (expected %u)\n",
+               cfg->Plan9Port, LX_INIT_UTILITY_VM_PLAN9_PORT);
         free(cfg);
     }
 
@@ -417,7 +532,9 @@ int main(void)
           "got %u", sess_resp->Port);
     free(sess_resp);
 
-    close(listen_fd);
+    /* NOTE: listen_fd is NOT closed here. It must stay open for the DNS
+     * tunneling channel connection at Step 76b (the guest opens a second
+     * connection to PORT_HVS for DNS relay). Closed at end of main(). */
 
     /* ---- Step 64 (F1): Read OobeResult(28) from init channel ----
      * After the handshake, hvinit sends OobeResult on the init channel
@@ -481,6 +598,211 @@ int main(void)
         }
     }
 
+    /* ---- Step A1 (Group A): 9P Tversion handshake ----
+     * Connect to the Plan9 server port and perform a 9P2000.L version
+     * negotiation. The stub server should respond with Rversion containing
+     * negotiated msize and "9P2000.L" version string.
+     *
+     * 9P wire format: size[4] type[1] tag[2] [body...]
+     * Tversion(100) body: msize[4] version[string]
+     * Rversion(101) body: msize[4] version[string] */
+    printf("\n[host] Step A1: Group A - 9P Tversion handshake on port %u...\n",
+           saved_plan9_port);
+    int p9_fd = -1;
+    CHECK(saved_plan9_port != 0,
+          "Group A: Plan9Port saved from InitializeResponse",
+          "port is 0 (server not started)");
+    if (saved_plan9_port != 0) {
+        p9_fd = connect_to_port(saved_plan9_port);
+        CHECK(p9_fd >= 0,
+              "Group A: connect to Plan9 port",
+              "connect failed (port=%u)", saved_plan9_port);
+    }
+    if (p9_fd >= 0) {
+        /* Build Tversion: size[4] type[1] tag[2] msize[4] ver_len[2] ver[9] */
+        const char *ver = "9P2000.L";
+        size_t ver_len = strlen(ver);
+        size_t msg_size = 4 + 1 + 2 + 4 + 2 + ver_len;  /* 21 for "9P2000.L" */
+        uint8_t tversion[32];
+        tversion[0] = (uint8_t)(msg_size & 0xFF);
+        tversion[1] = (uint8_t)((msg_size >> 8) & 0xFF);
+        tversion[2] = (uint8_t)((msg_size >> 16) & 0xFF);
+        tversion[3] = (uint8_t)((msg_size >> 24) & 0xFF);
+        tversion[4] = 100;        /* Tversion */
+        tversion[5] = 0xFF;       /* tag = NOTAG (0xFFFF) */
+        tversion[6] = 0xFF;
+        uint32_t req_msize = 8192;
+        tversion[7]  = (uint8_t)(req_msize & 0xFF);
+        tversion[8]  = (uint8_t)((req_msize >> 8) & 0xFF);
+        tversion[9]  = (uint8_t)((req_msize >> 16) & 0xFF);
+        tversion[10] = (uint8_t)((req_msize >> 24) & 0xFF);
+        tversion[11] = (uint8_t)(ver_len & 0xFF);
+        tversion[12] = (uint8_t)((ver_len >> 8) & 0xFF);
+        memcpy(&tversion[13], ver, ver_len);
+
+        CHECK(send_all(p9_fd, tversion, msg_size) == 0,
+              "Group A: send Tversion", "send failed");
+
+        uint8_t rbuf[256];
+        int rlen = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+        CHECK(rlen >= 21, "Group A: receive Rversion", "got %d bytes", rlen);
+
+        if (rlen >= 21) {
+            uint8_t  resp_type = rbuf[4];
+            uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+            uint32_t resp_msize = (uint32_t)rbuf[7]
+                                | ((uint32_t)rbuf[8] << 8)
+                                | ((uint32_t)rbuf[9] << 16)
+                                | ((uint32_t)rbuf[10] << 24);
+            uint16_t ver_strlen = (uint16_t)rbuf[11] | ((uint16_t)rbuf[12] << 8);
+            char resp_ver[32] = {0};
+            size_t copy_len = ver_strlen < sizeof(resp_ver) - 1
+                            ? ver_strlen : sizeof(resp_ver) - 1;
+            memcpy(resp_ver, &rbuf[13], copy_len);
+
+            CHECK(resp_type == 101,
+                  "Group A: Rversion type==101",
+                  "got %u", resp_type);
+            CHECK(resp_tag == 0xFFFF,
+                  "Group A: Rversion tag echoed (0xFFFF)",
+                  "got 0x%04X", resp_tag);
+            CHECK(resp_msize > 0 && resp_msize <= req_msize,
+                  "Group A: Rversion msize negotiated (<=8192)",
+                  "got %u", resp_msize);
+            CHECK(strcmp(resp_ver, "9P2000.L") == 0,
+                  "Group A: Rversion version=='9P2000.L'",
+                  "got '%s'", resp_ver);
+            printf("  Rversion: type=%u, tag=0x%04X, msize=%u, version='%s'\n",
+                   resp_type, resp_tag, resp_msize, resp_ver);
+        }
+
+        /* ---- Step A2 (Group A): Tattach and verify root QID ----
+         * Tattach(104) body: fid[4] afid[4] uname[s] aname[s]
+         * Rattach(105) body: qid[13] = qtype[1] qversion[4] qpath[8] */
+        printf("\n[host] Step A2: Group A - 9P Tattach, verify root QID...\n");
+        {
+            uint8_t tattach[32];
+            size_t tattach_size = 4 + 1 + 2 + 4 + 4 + 2 + 2;  /* 19 bytes */
+            tattach[0] = (uint8_t)(tattach_size & 0xFF);
+            tattach[1] = (uint8_t)((tattach_size >> 8) & 0xFF);
+            tattach[2] = 0; tattach[3] = 0;
+            tattach[4] = 104;       /* Tattach */
+            tattach[5] = 0x01;      /* tag = 1 */
+            tattach[6] = 0x00;
+            /* fid = 0 */
+            tattach[7] = 0; tattach[8] = 0; tattach[9] = 0; tattach[10] = 0;
+            /* afid = NOFID (0xFFFFFFFF) */
+            tattach[11] = 0xFF; tattach[12] = 0xFF;
+            tattach[13] = 0xFF; tattach[14] = 0xFF;
+            /* uname = "" (length 0) */
+            tattach[15] = 0; tattach[16] = 0;
+            /* aname = "" (length 0) */
+            tattach[17] = 0; tattach[18] = 0;
+
+            CHECK(send_all(p9_fd, tattach, tattach_size) == 0,
+                  "Group A: send Tattach", "send failed");
+
+            int rlen2 = read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 3000);
+            /* Rattach: size[4] type[1] tag[2] qid[13] = 20 bytes */
+            CHECK(rlen2 >= 20, "Group A: receive Rattach", "got %d bytes", rlen2);
+
+            if (rlen2 >= 20) {
+                uint8_t  resp_type = rbuf[4];
+                uint16_t resp_tag  = (uint16_t)rbuf[5] | ((uint16_t)rbuf[6] << 8);
+                /* QID at offset 7: qtype[1] qversion[4] qpath[8] */
+                uint8_t  qtype = rbuf[7];
+                uint32_t qver  = (uint32_t)rbuf[8]
+                               | ((uint32_t)rbuf[9] << 8)
+                               | ((uint32_t)rbuf[10] << 16)
+                               | ((uint32_t)rbuf[11] << 24);
+                uint64_t qpath = 0;
+                for (int i = 0; i < 8; i++)
+                    qpath |= ((uint64_t)rbuf[12 + i]) << (i * 8);
+
+                CHECK(resp_type == 105,
+                      "Group A: Rattach type==105",
+                      "got %u", resp_type);
+                CHECK(resp_tag == 1,
+                      "Group A: Rattach tag echoed (1)",
+                      "got %u", resp_tag);
+                CHECK((qtype & 0x80) != 0,
+                      "Group A: root QID has QT_DIR (0x80) bit",
+                      "got 0x%02X", qtype);
+                CHECK(qpath == 1,
+                      "Group A: root QID path==1",
+                      "got %llu", (unsigned long long)qpath);
+                printf("  Rattach: qid(type=0x%02X, version=%u, path=%llu)\n",
+                       qtype, qver, (unsigned long long)qpath);
+            }
+
+            /* Tclunk(120) to close fid 0 */
+            {
+                uint8_t tclunk[16];
+                size_t clunk_size = 4 + 1 + 2 + 4;  /* 11 */
+                tclunk[0] = (uint8_t)(clunk_size & 0xFF);
+                tclunk[1] = (uint8_t)((clunk_size >> 8) & 0xFF);
+                tclunk[2] = 0; tclunk[3] = 0;
+                tclunk[4] = 120;       /* Tclunk */
+                tclunk[5] = 0x02;      /* tag = 2 */
+                tclunk[6] = 0x00;
+                tclunk[7] = 0; tclunk[8] = 0;  /* fid = 0 */
+                tclunk[9] = 0; tclunk[10] = 0;
+                send_all(p9_fd, tclunk, clunk_size);
+                read_with_timeout(p9_fd, (char *)rbuf, sizeof(rbuf), 1000);
+            }
+        }
+
+        close(p9_fd);
+        printf("  Group A: 9P connection closed\n");
+    }
+
+    /* ---- Step A3 (Group A): StopPlan9Server(24) round-trip ----
+     * Send StopPlan9Server with Force=true on the init channel.
+     * Guest should stop the Plan9 server and respond with
+     * RESULT_MESSAGE_BOOL (Result != 0 = success).
+     * After stop, the Plan9 port should no longer accept connections. */
+    printf("\n[host] Step A3: Group A - StopPlan9Server(24) round-trip...\n");
+    {
+        LX_INIT_STOP_PLAN9_SERVER_MSG stop_msg;
+        memset(&stop_msg, 0, sizeof(stop_msg));
+        stop_msg.Header.MessageType = LxInitMessageStopPlan9Server;
+        stop_msg.Header.MessageSize = sizeof(stop_msg);
+        stop_msg.Header.SequenceNumber = 777;
+        stop_msg.Force = 1;  /* force=true (SIGKILL) */
+
+        CHECK(send_all(init_fd, &stop_msg, sizeof(stop_msg)) == 0,
+              "Group A: send StopPlan9Server", "send failed");
+
+        RESULT_MESSAGE_BOOL *stop_resp =
+            (RESULT_MESSAGE_BOOL *)recv_message(init_fd, &hdr);
+        CHECK(stop_resp != NULL,
+              "Group A: receive StopPlan9Server response", "no response");
+
+        if (stop_resp) {
+            CHECK(stop_resp->Header.MessageType == LxMessageResultBool,
+                  "Group A: StopPlan9Server response type==76",
+                  "got %u", stop_resp->Header.MessageType);
+            CHECK(stop_resp->Header.SequenceNumber == 777,
+                  "Group A: StopPlan9Server seq echoed (777)",
+                  "got %u", stop_resp->Header.SequenceNumber);
+            CHECK(stop_resp->Result != 0,
+                  "Group A: StopPlan9Server result==true (success)",
+                  "got %u", stop_resp->Result);
+            printf("  StopPlan9Server response: type=%u, seq=%u, result=%u\n",
+                   stop_resp->Header.MessageType,
+                   stop_resp->Header.SequenceNumber, stop_resp->Result);
+            free(stop_resp);
+        }
+
+        /* Verify Plan9 port is no longer accepting connections */
+        usleep(300000);  /* give child time to exit */
+        int retry_fd = connect_to_port(saved_plan9_port);
+        CHECK(retry_fd < 0,
+              "Group A: Plan9 port closed after stop",
+              "connection still accepted (unexpected)");
+        if (retry_fd >= 0) close(retry_fd);
+    }
+
     /* ---- Step 74 (Phase 9 / C1): Accept GNS engine channel ---- */
     printf("\n[host] Step 74: Waiting for GNS channel connection on port %d...\n",
            PORT_HVS_GNS);
@@ -495,6 +817,18 @@ int main(void)
         CHECK(gns_fd >= 0, "C1: GNS channel connected from guest", "timeout");
         if (gns_fd >= 0)
             printf("  GNS channel connected (fd=%d)\n", gns_fd);
+    }
+
+    /* Drain the initial burst of PortListenerRelayStart messages that the
+     * guest's port_tracker sends when the GNS channel first connects.
+     * These arrive asynchronously (within 1s of connect) and would otherwise
+     * be misread as responses by later GNS test steps. */
+    if (gns_fd >= 0) {
+        /* Give the guest's port_tracker up to 1.5s to fire its first scan. */
+        usleep(1500000);
+        int drained = drain_relay_messages(gns_fd);
+        printf("  Drained %d initial port_tracker notification(s)\n", drained);
+        CHECK(1, "C: initial relay burst drained", "");
     }
 
     /* ---- Step 75 (Phase 9 / C3): InterfaceConfiguration ---- */
@@ -524,7 +858,7 @@ int main(void)
 
             if (sent == 0) {
                 LX_GNS_RESULT *gns_resp =
-                    (LX_GNS_RESULT *)recv_message(gns_fd, &hdr);
+                    (LX_GNS_RESULT *)recv_gns_response(gns_fd, &hdr);
                 if (gns_resp) {
                     printf("  Received: type=%u, seq=%u, Result=%d\n",
                            gns_resp->Header.MessageType,
@@ -552,6 +886,361 @@ int main(void)
     printf("\n[host] Step 76: C3 InterfaceConfiguration round-trip complete\n");
     CHECK(gns_fd >= 0, "C3: GNS channel still open after InterfaceConfiguration", "");
 
+    /* ================================================================== */
+    /* ---- Task Group B: LxGnsMessageDnsTunneling(70) tests           ---- */
+    /* ---- Steps 76b-76g: UDP/TCP DNS relay round-trip               ---- */
+    /* ================================================================== */
+
+    /* Determine the DNS port (tests use WSL_DNS_TUNNEL_PORT to avoid
+     * requiring root for binding port 53 on Linux). */
+    int dns_port = 53;
+    {
+        const char *p = getenv("WSL_DNS_TUNNEL_PORT");
+        if (p && p[0]) {
+            int v = atoi(p);
+            if (v > 0) dns_port = v;
+        }
+    }
+
+    /* ---- Step 76b: Accept DNS tunneling channel ----
+     * The guest opens a second connection to PORT_HVS for the DNS channel
+     * right after the GNS channel connection (Step 74). Accept it here. */
+    printf("\n[host] Step 76b: Waiting for DNS tunneling channel on port %d...\n",
+           PORT_HVS);
+    int dns_channel_fd = -1;
+    {
+        for (int attempt = 0; attempt < 50 && dns_channel_fd < 0; attempt++) {
+            struct pollfd pfd = { .fd = listen_fd, .events = POLLIN };
+            if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+                dns_channel_fd = accept(listen_fd, NULL, NULL);
+                break;
+            }
+        }
+        CHECK(dns_channel_fd >= 0, "B: DNS channel connected from guest", "timeout");
+        if (dns_channel_fd >= 0)
+            printf("  DNS channel connected (fd=%d)\n", dns_channel_fd);
+    }
+
+    /* Minimal DNS query: example.com A IN (29 bytes) */
+    static const unsigned char dns_query_a[] = {
+        0x12, 0x34,                                     /* ID */
+        0x01, 0x00,                                     /* Flags: RD=1 */
+        0x00, 0x01,                                     /* QDCOUNT: 1 */
+        0x00, 0x00,                                     /* ANCOUNT: 0 */
+        0x00, 0x00,                                     /* NSCOUNT: 0 */
+        0x00, 0x00,                                     /* ARCOUNT: 0 */
+        0x07, 'e','x','a','m','p','l','e',
+        0x03, 'c','o','m',
+        0x00,                                           /* root label */
+        0x00, 0x01,                                     /* Type: A */
+        0x00, 0x01,                                     /* Class: IN */
+    };
+    /* DNS response: example.com A 10.0.0.1 TTL=60 (45 bytes) */
+    static const unsigned char dns_resp_a[] = {
+        0x12, 0x34,                                     /* ID */
+        0x81, 0x80,                                     /* Flags: response, RA=1 */
+        0x00, 0x01,                                     /* QDCOUNT: 1 */
+        0x00, 0x01,                                     /* ANCOUNT: 1 */
+        0x00, 0x00,                                     /* NSCOUNT: 0 */
+        0x00, 0x00,                                     /* ARCOUNT: 0 */
+        0x07, 'e','x','a','m','p','l','e',
+        0x03, 'c','o','m',
+        0x00,
+        0x00, 0x01, 0x00, 0x01,                         /* Type A, Class IN */
+        0xc0, 0x0c,                                     /* Name ptr to offset 12 */
+        0x00, 0x01, 0x00, 0x01,                         /* Type A, Class IN */
+        0x00, 0x00, 0x00, 0x3c,                         /* TTL: 60 */
+        0x00, 0x04,                                     /* RDLENGTH: 4 */
+        0x0a, 0x00, 0x00, 0x01,                         /* RDATA: 10.0.0.1 */
+    };
+
+    if (dns_channel_fd >= 0) {
+        /* ---- Step 76c: Send UDP DNS query to the guest's DNS server ---- */
+        printf("\n[host] Step 76c: Sending UDP DNS query to 127.0.0.1:%d...\n",
+               dns_port);
+        int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        CHECK(udp_sock >= 0, "B: UDP query socket created", "");
+
+        if (udp_sock >= 0) {
+            struct sockaddr_in dns_addr = {0};
+            dns_addr.sin_family = AF_INET;
+            dns_addr.sin_port = htons((uint16_t)dns_port);
+            dns_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+            /* Retry sending for up to 5s — the DNS grandchild may not
+             * have bound the listener yet. */
+            int sent_ok = 0;
+            for (int attempt = 0; attempt < 50; attempt++) {
+                ssize_t n = sendto(udp_sock, dns_query_a, sizeof(dns_query_a),
+                                   0, (struct sockaddr *)&dns_addr,
+                                   sizeof(dns_addr));
+                if (n > 0) { sent_ok = 1; break; }
+                usleep(100000);  /* 100ms */
+            }
+            CHECK(sent_ok, "B: UDP DNS query sent to guest",
+                  "sendto failed: %s", strerror(errno));
+        }
+
+        /* ---- Step 76d: Receive LxGnsMessageDnsTunneling on DNS channel ---- */
+        printf("\n[host] Step 76d: Waiting for LxGnsMessageDnsTunneling(70) on DNS channel...\n");
+        uint32_t recv_udp_id = 0;
+        {
+            LX_GNS_DNS_TUNNELING_MESSAGE *dm =
+                (LX_GNS_DNS_TUNNELING_MESSAGE *)recv_message(dns_channel_fd, &hdr);
+            if (dm) {
+                size_t dns_payload = hdr.MessageSize - sizeof(*dm);
+                printf("  Received: type=%u, proto=%u, id=%u, dns_len=%zu\n",
+                       dm->Header.MessageType, dm->DnsClientIdentifier.Protocol,
+                       dm->DnsClientIdentifier.DnsClientId, dns_payload);
+                CHECK(dm->Header.MessageType == LxGnsMessageDnsTunneling,
+                      "B: DNS tunneling MessageType==70",
+                      "got %u", dm->Header.MessageType);
+                CHECK(dm->DnsClientIdentifier.Protocol == IPPROTO_UDP,
+                      "B: DNS tunneling Protocol==UDP(17)",
+                      "got %u", dm->DnsClientIdentifier.Protocol);
+                CHECK(dm->DnsClientIdentifier.DnsClientId != 0,
+                      "B: DNS tunneling DnsClientId!=0", "got 0");
+                CHECK(dns_payload == sizeof(dns_query_a),
+                      "B: DNS query payload size matches",
+                      "got %zu, expected %zu", dns_payload, sizeof(dns_query_a));
+                if (dns_payload == sizeof(dns_query_a))
+                    CHECK(memcmp(dm->Buffer, dns_query_a, sizeof(dns_query_a)) == 0,
+                          "B: DNS query payload content matches", "");
+                recv_udp_id = dm->DnsClientIdentifier.DnsClientId;
+                free(dm);
+            } else {
+                CHECK(0, "B: DNS tunneling message received", "no message");
+            }
+        }
+
+        /* ---- Step 76e: Send DNS response, verify UDP client receives it ---- */
+        printf("\n[host] Step 76e: Sending DNS response via channel, verifying UDP reply...\n");
+        {
+            size_t resp_msg_size = sizeof(LX_GNS_DNS_TUNNELING_MESSAGE) + sizeof(dns_resp_a);
+            LX_GNS_DNS_TUNNELING_MESSAGE *resp = calloc(1, resp_msg_size);
+            if (resp) {
+                resp->Header.MessageType = LxGnsMessageDnsTunneling;
+                resp->Header.MessageSize = (unsigned int)resp_msg_size;
+                resp->Header.SequenceNumber = 0;
+                resp->DnsClientIdentifier.Protocol = IPPROTO_UDP;
+                resp->DnsClientIdentifier.DnsClientId = recv_udp_id;
+                memcpy(resp->Buffer, dns_resp_a, sizeof(dns_resp_a));
+                int sent = send_all(dns_channel_fd, resp, resp_msg_size);
+                CHECK(sent == 0, "B: DNS response sent on channel",
+                      "send returned %d", sent);
+                free(resp);
+            } else {
+                CHECK(0, "B: DNS response alloc", "oom");
+            }
+
+            /* Wait for the UDP reply on the original socket (5s timeout) */
+            unsigned char reply[512];
+            ssize_t reply_len = -1;
+            for (int attempt = 0; attempt < 50; attempt++) {
+                struct pollfd pfd = { .fd = udp_sock, .events = POLLIN };
+                if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+                    reply_len = recv(udp_sock, reply, sizeof(reply), 0);
+                    break;
+                }
+            }
+            CHECK(reply_len == (ssize_t)sizeof(dns_resp_a),
+                  "B: UDP reply received with correct size",
+                  "got %zd, expected %zu", reply_len, sizeof(dns_resp_a));
+            if (reply_len == (ssize_t)sizeof(dns_resp_a))
+                CHECK(memcmp(reply, dns_resp_a, sizeof(dns_resp_a)) == 0,
+                      "B: UDP reply content matches DNS response", "");
+            close(udp_sock);
+        }
+
+        /* ---- Step 76f: TCP DNS relay round-trip ---- */
+        printf("\n[host] Step 76f: Sending TCP DNS query to 127.0.0.1:%d...\n",
+               dns_port);
+        {
+            int tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+            CHECK(tcp_sock >= 0, "B: TCP query socket created", "");
+
+            if (tcp_sock >= 0) {
+                struct sockaddr_in dns_addr = {0};
+                dns_addr.sin_family = AF_INET;
+                dns_addr.sin_port = htons((uint16_t)dns_port);
+                dns_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+                /* Retry connect for up to 5s — the DNS grandchild may
+                 * not have bound the TCP listener yet. */
+                int connected = 0;
+                for (int attempt = 0; attempt < 50; attempt++) {
+                    if (connect(tcp_sock, (struct sockaddr *)&dns_addr,
+                                sizeof(dns_addr)) == 0) {
+                        connected = 1;
+                        break;
+                    }
+                    usleep(100000);
+                }
+                CHECK(connected, "B: TCP connected to DNS server",
+                      "connect failed: %s", strerror(errno));
+
+                if (connected) {
+                    /* Send 2-byte big-endian length prefix + DNS query */
+                    uint16_t len_n = htons((uint16_t)sizeof(dns_query_a));
+                    send_all(tcp_sock, &len_n, 2);
+                    send_all(tcp_sock, dns_query_a, sizeof(dns_query_a));
+
+                    /* Receive LxGnsMessageDnsTunneling on DNS channel */
+                    LX_GNS_DNS_TUNNELING_MESSAGE *dm =
+                        (LX_GNS_DNS_TUNNELING_MESSAGE *)recv_message(dns_channel_fd, &hdr);
+                    uint32_t tcp_id = 0;
+                    if (dm) {
+                        CHECK(dm->Header.MessageType == LxGnsMessageDnsTunneling,
+                              "B: TCP DNS tunneling MessageType==70",
+                              "got %u", dm->Header.MessageType);
+                        CHECK(dm->DnsClientIdentifier.Protocol == IPPROTO_TCP,
+                              "B: TCP DNS tunneling Protocol==TCP(6)",
+                              "got %u", dm->DnsClientIdentifier.Protocol);
+                        CHECK(dm->DnsClientIdentifier.DnsClientId != 0,
+                              "B: TCP DNS tunneling DnsClientId!=0", "got 0");
+                        tcp_id = dm->DnsClientIdentifier.DnsClientId;
+                        free(dm);
+                    } else {
+                        CHECK(0, "B: TCP DNS tunneling message received", "no message");
+                    }
+
+                    /* Send response on channel and verify TCP reply */
+                    if (tcp_id != 0) {
+                        size_t resp_msg_size = sizeof(LX_GNS_DNS_TUNNELING_MESSAGE) + sizeof(dns_resp_a);
+                        LX_GNS_DNS_TUNNELING_MESSAGE *resp = calloc(1, resp_msg_size);
+                        resp->Header.MessageType = LxGnsMessageDnsTunneling;
+                        resp->Header.MessageSize = (unsigned int)resp_msg_size;
+                        resp->DnsClientIdentifier.Protocol = IPPROTO_TCP;
+                        resp->DnsClientIdentifier.DnsClientId = tcp_id;
+                        memcpy(resp->Buffer, dns_resp_a, sizeof(dns_resp_a));
+                        send_all(dns_channel_fd, resp, resp_msg_size);
+                        free(resp);
+
+                        /* Read 2-byte length + DNS response from TCP socket */
+                        unsigned char reply[512];
+                        uint16_t rlen_n = 0;
+                        int ok = (recv_all(tcp_sock, &rlen_n, 2) == 0);
+                        uint16_t rlen = ntohs(rlen_n);
+                        ok = ok && (rlen == sizeof(dns_resp_a));
+                        ok = ok && (recv_all(tcp_sock, reply, rlen) == 0);
+                        CHECK(ok && memcmp(reply, dns_resp_a, sizeof(dns_resp_a)) == 0,
+                              "B: TCP DNS reply content matches", "");
+                    }
+                }
+                close(tcp_sock);
+            }
+        }
+
+        /* ---- Step 76g: Concurrent UDP DNS queries ---- */
+        printf("\n[host] Step 76g: Sending 2 concurrent UDP DNS queries...\n");
+        {
+            /* Use two different DNS query IDs (bytes 0-1) to distinguish them */
+            unsigned char q1[sizeof(dns_query_a)];
+            unsigned char q2[sizeof(dns_query_a)];
+            memcpy(q1, dns_query_a, sizeof(q1));
+            memcpy(q2, dns_query_a, sizeof(q2));
+            q1[0] = 0x11; q1[1] = 0x11;  /* ID = 0x1111 */
+            q2[0] = 0x22; q2[1] = 0x22;  /* ID = 0x2222 */
+
+            /* Matching responses with the same IDs */
+            unsigned char r1[sizeof(dns_resp_a)];
+            unsigned char r2[sizeof(dns_resp_a)];
+            memcpy(r1, dns_resp_a, sizeof(r1));
+            memcpy(r2, dns_resp_a, sizeof(r2));
+            r1[0] = 0x11; r1[1] = 0x11;
+            r2[0] = 0x22; r2[1] = 0x22;
+
+            int s1 = socket(AF_INET, SOCK_DGRAM, 0);
+            int s2 = socket(AF_INET, SOCK_DGRAM, 0);
+            CHECK(s1 >= 0 && s2 >= 0, "B: concurrent UDP sockets created", "");
+
+            if (s1 >= 0 && s2 >= 0) {
+                struct sockaddr_in dns_addr = {0};
+                dns_addr.sin_family = AF_INET;
+                dns_addr.sin_port = htons((uint16_t)dns_port);
+                dns_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+                sendto(s1, q1, sizeof(q1), 0,
+                       (struct sockaddr *)&dns_addr, sizeof(dns_addr));
+                sendto(s2, q2, sizeof(q2), 0,
+                       (struct sockaddr *)&dns_addr, sizeof(dns_addr));
+
+                /* Receive 2 DNS tunneling messages — order may vary.
+                 * Match each to the correct response by DNS query ID. */
+                uint32_t ids[2] = {0, 0};
+                unsigned char *queries[2] = {NULL, NULL};
+                for (int i = 0; i < 2; i++) {
+                    LX_GNS_DNS_TUNNELING_MESSAGE *dm =
+                        (LX_GNS_DNS_TUNNELING_MESSAGE *)recv_message(dns_channel_fd, &hdr);
+                    if (dm) {
+                        ids[i] = dm->DnsClientIdentifier.DnsClientId;
+                        size_t plen = hdr.MessageSize - sizeof(*dm);
+                        queries[i] = malloc(plen);
+                        if (queries[i])
+                            memcpy(queries[i], dm->Buffer, plen);
+                        free(dm);
+                    }
+                }
+                CHECK(ids[0] != 0 && ids[1] != 0 && ids[0] != ids[1],
+                      "B: concurrent UDP got 2 distinct DnsClientIds",
+                      "ids=%u,%u", ids[0], ids[1]);
+
+                /* Send the correct response for each DnsClientId */
+                for (int i = 0; i < 2; i++) {
+                    if (ids[i] != 0 && queries[i]) {
+                        unsigned char *resp_data = (queries[i][0] == 0x11) ? r1 : r2;
+                        size_t msg_sz = sizeof(LX_GNS_DNS_TUNNELING_MESSAGE) + sizeof(r1);
+                        LX_GNS_DNS_TUNNELING_MESSAGE *resp = calloc(1, msg_sz);
+                        resp->Header.MessageType = LxGnsMessageDnsTunneling;
+                        resp->Header.MessageSize = (unsigned int)msg_sz;
+                        resp->DnsClientIdentifier.Protocol = IPPROTO_UDP;
+                        resp->DnsClientIdentifier.DnsClientId = ids[i];
+                        memcpy(resp->Buffer, resp_data, sizeof(r1));
+                        send_all(dns_channel_fd, resp, msg_sz);
+                        free(resp);
+                    }
+                }
+
+                /* Verify both sockets receive the correct responses (5s) */
+                int got1 = 0, got2 = 0;
+                for (int attempt = 0; attempt < 50 && (!got1 || !got2); attempt++) {
+                    if (!got1) {
+                        struct pollfd pfd = { .fd = s1, .events = POLLIN };
+                        if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+                            unsigned char reply[512];
+                            ssize_t n = recv(s1, reply, sizeof(reply), 0);
+                            got1 = (n == (ssize_t)sizeof(r1) &&
+                                    memcmp(reply, r1, sizeof(r1)) == 0);
+                        }
+                    }
+                    if (!got2) {
+                        struct pollfd pfd = { .fd = s2, .events = POLLIN };
+                        if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+                            unsigned char reply[512];
+                            ssize_t n = recv(s2, reply, sizeof(reply), 0);
+                            got2 = (n == (ssize_t)sizeof(r2) &&
+                                    memcmp(reply, r2, sizeof(r2)) == 0);
+                        }
+                    }
+                }
+                CHECK(got1, "B: concurrent UDP socket 1 received correct response", "");
+                CHECK(got2, "B: concurrent UDP socket 2 received correct response", "");
+
+                for (int i = 0; i < 2; i++) free(queries[i]);
+            }
+            if (s1 >= 0) close(s1);
+            if (s2 >= 0) close(s2);
+        }
+
+        /* Close the DNS channel — the guest's DNS relay will detect EOF
+         * and shut down. The GNS channel (gns_fd) remains open for the
+         * remaining GNS tests below. */
+        close(dns_channel_fd);
+        dns_channel_fd = -1;
+    } else {
+        printf("\n[host] Steps 76c-76g: SKIPPED (DNS channel not connected)\n");
+    }
+
     /* ---- Step 77 (Phase 9 / C1): GNS NoOp message ---- */
     printf("\n[host] Step 77: Sending GNS NoOp (type=71)...\n");
     {
@@ -566,7 +1255,7 @@ int main(void)
 
         if (sent == 0) {
             LX_GNS_RESULT *gns_resp =
-                (LX_GNS_RESULT *)recv_message(gns_fd, &hdr);
+                (LX_GNS_RESULT *)recv_gns_response(gns_fd, &hdr);
             if (gns_resp) {
                 CHECK(gns_resp->Header.MessageType == LxGnsMessageResult,
                       "C1: NoOp response MessageType==54",
@@ -580,6 +1269,146 @@ int main(void)
             } else {
                 CHECK(0, "C1: NoOp response received", "no response");
             }
+        }
+    }
+
+    /* ================================================================== */
+    /* ---- Task Group D: LxGnsMessageNotification(55) HNS state tests  ---- */
+    /* ---- Steps 78-82: Route/IPAddress/DNS/Interface/unknown          ---- */
+    /* ================================================================== */
+
+    /* Helper: send a Notification(55) with a JSON payload on gns_fd and
+     * verify the LX_GNS_RESULT response (type=54, seq echoed, Result==0). */
+    #define SEND_NOTIFICATION(json, seq_num, desc_ok, desc_fail)                  \
+        do {                                                                      \
+            size_t _clen = strlen(json) + 1;                                      \
+            size_t _msz = sizeof(LX_GNS_INTERFACE_CONFIGURATION) + _clen;         \
+            LX_GNS_INTERFACE_CONFIGURATION *_m = calloc(1, _msz);                 \
+            if (_m) {                                                             \
+                _m->Header.MessageType = LxGnsMessageNotification;                \
+                _m->Header.MessageSize = (unsigned int)_msz;                      \
+                _m->Header.SequenceNumber = (seq_num);                            \
+                memcpy(_m->Content, (json), _clen);                               \
+                int _sr = send_all(gns_fd, _m, _msz);                             \
+                CHECK(_sr == 0, "D: Notification sent (" desc_ok ")",             \
+                      "send failed");                                             \
+                free(_m);                                                         \
+                if (_sr == 0) {                                                   \
+                    LX_GNS_RESULT *_r = (LX_GNS_RESULT *)recv_gns_response(gns_fd, &hdr); \
+                    if (_r) {                                                     \
+                        CHECK(_r->Header.MessageType == LxGnsMessageResult,       \
+                              "D: response type==54", "got %u",                   \
+                              _r->Header.MessageType);                            \
+                        CHECK(_r->Header.SequenceNumber == (seq_num),             \
+                              "D: response seq echoed", "got %u",                 \
+                              _r->Header.SequenceNumber);                         \
+                        CHECK(_r->Result == 0,                                    \
+                              "D: Result==0 (" desc_ok ")", "got %d", _r->Result);\
+                        free(_r);                                                 \
+                    } else {                                                      \
+                        CHECK(0, "D: response received (" desc_ok ")",            \
+                              "no response");                                     \
+                    }                                                             \
+                }                                                                 \
+            } else {                                                              \
+                CHECK(0, "D: alloc (" desc_ok ")", "oom");                        \
+            }                                                                     \
+        } while (0)
+
+    /* Step 78: Notification Route Add (default route via 10.0.0.1) */
+    printf("\n[host] Step 78: Sending Notification(55) Route Add...\n");
+    {
+        const char *json =
+            "{\"ResourceType\":\"Route\",\"RequestType\":\"Add\","
+            "\"Settings\":{\"NextHop\":\"10.0.0.1\","
+            "\"DestinationPrefix\":\"0.0.0.0/0\",\"Family\":2},"
+            "\"targetDeviceName\":\"lo0\"}";
+        SEND_NOTIFICATION(json, 781, "Route Add", "route add");
+    }
+
+    /* Step 79: Notification IPAddress Add (alias 10.99.99.1/32 on lo0) */
+    printf("\n[host] Step 79: Sending Notification(55) IPAddress Add...\n");
+    {
+        const char *json =
+            "{\"ResourceType\":\"IPAddress\",\"RequestType\":\"Add\","
+            "\"Settings\":{\"Address\":\"10.99.99.1\","
+            "\"OnLinkPrefixLength\":32,\"Family\":2},"
+            "\"targetDeviceName\":\"lo0\"}";
+        SEND_NOTIFICATION(json, 791, "IPAddress Add", "ip add");
+    }
+
+    /* Step 80: Notification DNS Update (writes resolv.conf) */
+    printf("\n[host] Step 80: Sending Notification(55) DNS Update...\n");
+    {
+        const char *json =
+            "{\"ResourceType\":\"DNS\",\"RequestType\":\"Update\","
+            "\"Settings\":{\"ServerList\":\"10.0.0.1,10.0.0.2\","
+            "\"Domain\":\"example.com\","
+            "\"Search\":\"example.com,test.com\"}}";
+        SEND_NOTIFICATION(json, 801, "DNS Update", "dns update");
+    }
+
+    /* Step 81: Notification Interface Update (link up + MTU 1500 on lo0) */
+    printf("\n[host] Step 81: Sending Notification(55) Interface Update...\n");
+    {
+        const char *json =
+            "{\"ResourceType\":\"Interface\",\"RequestType\":\"Update\","
+            "\"Settings\":{\"Connected\":true,\"NlMtu\":1500},"
+            "\"targetDeviceName\":\"lo0\"}";
+        SEND_NOTIFICATION(json, 811, "Interface Update", "link update");
+    }
+
+    /* Step 82: Notification unknown ResourceType (ack without error) */
+    printf("\n[host] Step 82: Sending Notification(55) unknown ResourceType...\n");
+    {
+        const char *json =
+            "{\"ResourceType\":\"Neighbor\",\"RequestType\":\"Add\","
+            "\"Settings\":{}}";
+        SEND_NOTIFICATION(json, 821, "unknown ResourceType acked", "unknown type");
+    }
+
+    #undef SEND_NOTIFICATION
+
+    /* ---- Step 83 (Phase 9 / C): Port discovery — PortListenerRelayStart ----
+     * Open a new listening socket on a test port and verify the guest's
+     * port_tracker detects it and sends LxGnsMessagePortListenerRelayStart(59).
+     * The port_tracker scans /proc/net/tcp (Linux) or sysctl pcblist (FreeBSD)
+     * every 1 second and sends relay notifications for new loopback/wildcard
+     * binds. */
+    printf("\n[host] Step 83: Port discovery test (open port 18080)...\n");
+    {
+        /* Flush any relay messages that may have accumulated since the
+         * initial drain (port_tracker may have fired during Steps 75-82). */
+        drain_relay_messages(gns_fd);
+
+        int test_port = 18080;
+        int test_listen = listen_on_port(test_port);
+        CHECK(test_listen >= 0, "C: test port 18080 bound", "bind failed");
+
+        if (test_listen >= 0 && gns_fd >= 0) {
+            printf("  Opened listening socket on port %d, waiting for relay...\n",
+                   test_port);
+            /* port_tracker scans every 1s; allow up to 5s for detection. */
+            int relay_type = recv_relay_for_port(gns_fd, (uint16_t)test_port, 5000);
+            CHECK(relay_type == LxGnsMessagePortListenerRelayStart,
+                  "C: PortListenerRelayStart(59) received for port 18080",
+                  "got type=%d (expected %d)", relay_type,
+                  LxGnsMessagePortListenerRelayStart);
+
+            /* ---- Step 84: Port removal — PortListenerRelayStop ----
+             * Close the test socket and verify the guest sends
+             * LxGnsMessagePortListenerRelayStop(60) for the removed port. */
+            printf("\n[host] Step 84: Port removal test (close port 18080)...\n");
+            close(test_listen);
+            printf("  Closed listening socket, waiting for relay...\n");
+
+            int relay_type2 = recv_relay_for_port(gns_fd, (uint16_t)test_port, 5000);
+            CHECK(relay_type2 == LxGnsMessagePortListenerRelayStop,
+                  "C: PortListenerRelayStop(60) received for port 18080",
+                  "got type=%d (expected %d)", relay_type2,
+                  LxGnsMessagePortListenerRelayStop);
+        } else if (test_listen >= 0) {
+            close(test_listen);
         }
     }
 
@@ -2456,33 +3285,35 @@ int main(void)
             printf("  NetworkInformation sent (no response expected)\n");
             CHECK(1, "NetworkInformation processed (no crash)", "");
 
-            /* Verify resolv.conf was written when WSL_TEST_ROOT is set */
+            /* Verify resolv.conf was written when WSL_TEST_ROOT is set.
+             * NOTE: A prior test step (Step 80 DNS Update) may have already
+             * written resolv.conf with different nameservers. We must retry
+             * on CONTENT, not just file existence, to avoid reading stale
+             * content from a previous write. */
             {
                 const char *test_root = getenv("WSL_TEST_ROOT");
                 if (test_root && test_root[0]) {
                     char resolv_path[512];
                     snprintf(resolv_path, sizeof(resolv_path),
                              "%s/resolv.conf", test_root);
-                    FILE *rf = NULL;
-                    for (int retry = 0; retry < 30 && !rf; retry++) {
-                        rf = fopen(resolv_path, "r");
-                        if (!rf)
+                    int has_nameserver = 0;
+                    for (int retry = 0; retry < 30 && !has_nameserver; retry++) {
+                        FILE *rf = fopen(resolv_path, "r");
+                        if (rf) {
+                            char line[256];
+                            while (fgets(line, sizeof(line), rf)) {
+                                if (strstr(line, "nameserver 8.8.8.8"))
+                                    has_nameserver = 1;
+                            }
+                            fclose(rf);
+                        }
+                        if (!has_nameserver)
                             usleep(100000);
                     }
-                    CHECK(rf != NULL, "C2: resolv.conf written to WSL_TEST_ROOT",
-                          "cannot open %s", resolv_path);
-                    if (rf) {
-                        char line[256];
-                        int has_nameserver = 0;
-                        while (fgets(line, sizeof(line), rf)) {
-                            if (strstr(line, "nameserver 8.8.8.8"))
-                                has_nameserver = 1;
-                        }
-                        fclose(rf);
-                        CHECK(has_nameserver,
-                              "C2: resolv.conf contains nameserver 8.8.8.8",
-                              "content missing expected DNS entry");
-                    }
+                    CHECK(has_nameserver,
+                          "C2: resolv.conf contains nameserver 8.8.8.8",
+                          "content missing expected DNS entry (path=%s)",
+                          resolv_path);
                 }
             }
         }
@@ -2939,8 +3770,11 @@ int main(void)
                         CHECK(bool_resp->Header.SequenceNumber == 591,
                               "CreateLoginSession response seq echoed (591)",
                               "got %u", bool_resp->Header.SequenceNumber);
-                        CHECK(bool_resp->Result == 1,
-                              "CreateLoginSession result==true (success)",
+                        /* E group: CreateLoginSession returns false because
+                         * systemd is disabled on FreeBSD (matching reference
+                         * config.cpp:422 behavior when Config.BootInit=false). */
+                        CHECK(bool_resp->Result == 0,
+                              "CreateLoginSession result==false (systemd disabled)",
                               "got %u", bool_resp->Result);
                         free(cls_resp);
                     } else {
@@ -3055,6 +3889,241 @@ int main(void)
                         free(qvi_resp);
                     } else {
                         CHECK(0, "QueryVmId response received", "no response");
+                    }
+                }
+
+                /* ========================================================= */
+                /* ---- Task Group E: Local interop socket tests          ---- */
+                /* ========================================================= */
+
+                /* Step 62 (E5a): Verify the local interop Unix socket file
+                 * exists at /run/WSL/<pid>_interop during an active session.
+                 * This validates E2a/E2b (wsl_interop_create_server in
+                 * hvbridge creates the socket and listens on it). */
+                printf("\n[host] Step 62: E5a — verify local interop socket file exists...\n");
+                {
+                    usleep(200000);  /* give bridge time to create the socket */
+                    const char *ls_cmd = "ls /run/WSL/ 2>/dev/null\n";
+                    send_all(io_extra[0], ls_cmd, strlen(ls_cmd));
+
+                    memset(outbuf, 0, sizeof(outbuf));
+                    total = 0;
+                    for (int attempt = 0; attempt < 30; attempt++) {
+                        int n = read_with_timeout(io_extra[1], outbuf + total,
+                                                  sizeof(outbuf) - total - 1, 200);
+                        if (n > 0) {
+                            total += n;
+                            outbuf[total] = '\0';
+                            if (strstr(outbuf, "_interop")) break;
+                        }
+                    }
+                    printf("  ls /run/WSL/ output: '%s'\n", outbuf);
+                    CHECK(strstr(outbuf, "_interop") != NULL,
+                          "E5a: local interop socket file exists (/run/WSL/*_interop)",
+                          "output='%s'", outbuf);
+                }
+
+                /* Step 63 (E5b): Verify WSL_INTEROP env var is set in the
+                 * child process (shell). This validates E2b env injection
+                 * (wsl_interop_set_env called before execve). */
+                printf("\n[host] Step 63: E5b — verify WSL_INTEROP env var set in child...\n");
+                {
+                    const char *env_cmd = "echo \"WSL_INTEROP=$WSL_INTEROP\"\n";
+                    send_all(io_extra[0], env_cmd, strlen(env_cmd));
+
+                    memset(outbuf, 0, sizeof(outbuf));
+                    total = 0;
+                    for (int attempt = 0; attempt < 30; attempt++) {
+                        int n = read_with_timeout(io_extra[1], outbuf + total,
+                                                  sizeof(outbuf) - total - 1, 200);
+                        if (n > 0) {
+                            total += n;
+                            outbuf[total] = '\0';
+                            if (strstr(outbuf, "WSL_INTEROP=")) break;
+                        }
+                    }
+                    printf("  env output: '%s'\n", outbuf);
+
+                    /* Extract the socket path from WSL_INTEROP=... */
+                    char *interop_path = strstr(outbuf, "WSL_INTEROP=");
+                    if (interop_path) {
+                        interop_path += strlen("WSL_INTEROP=");
+                        /* Trim trailing whitespace/newline */
+                        char *nl = strchr(interop_path, '\n');
+                        if (nl) *nl = '\0';
+                        char *cr = strchr(interop_path, '\r');
+                        if (cr) *cr = '\0';
+                    }
+                    CHECK(strstr(outbuf, "WSL_INTEROP=/run/WSL/") != NULL,
+                          "E5b: WSL_INTEROP env var set to /run/WSL/<pid>_interop",
+                          "output='%s'", outbuf);
+                }
+
+                /* Step 63b (E5c): Test the full relay path — connect directly
+                 * to the local interop Unix socket and send a minimal
+                 * CreateProcessUtilityVm(8) message. The hvbridge should
+                 * relay it to the host control channel (io_control_fd).
+                 * This validates E2 relay logic (wsl_interop_relay_message)
+                 * and the wsl-interop.c client-side message format (E3). */
+                printf("\n[host] Step 63b: E5c — test interop relay to host control channel...\n");
+                {
+                    /* Re-read WSL_INTEROP to get the socket path */
+                    const char *env_cmd2 = "printf '%s' \"$WSL_INTEROP\"\n";
+                    send_all(io_extra[0], env_cmd2, strlen(env_cmd2));
+                    usleep(200000);
+
+                    char sock_path[108] = {0};
+                    int sp_total = 0;
+                    for (int attempt = 0; attempt < 30; attempt++) {
+                        int n = read_with_timeout(io_extra[1], sock_path + sp_total,
+                                                  sizeof(sock_path) - sp_total - 1, 200);
+                        if (n > 0) {
+                            sp_total += n;
+                            sock_path[sp_total] = '\0';
+                            if (sp_total > 0 && strstr(sock_path, "/run/WSL/"))
+                                break;
+                        }
+                    }
+                    /* Strip any leading prompt noise — find /run/WSL/ */
+                    char *path_start = strstr(sock_path, "/run/WSL/");
+                    if (path_start) {
+                        memmove(sock_path, path_start, strlen(path_start) + 1);
+                    }
+                    /* Strip trailing prompt noise. printf '%s' outputs the
+                     * path without a trailing newline, so the shell prompt
+                     * "$ " gets appended to the read buffer. Truncate at the
+                     * first '$', space, or CR/LF after the path. */
+                    {
+                        char *endp = sock_path;
+                        while (*endp && *endp != '$' &&
+                               *endp != ' ' && *endp != '\n' && *endp != '\r')
+                            endp++;
+                        *endp = '\0';
+                    }
+                    printf("  interop socket path: '%s'\n", sock_path);
+
+                    if (strstr(sock_path, "/run/WSL/") == sock_path) {
+                        /* Connect to the local interop Unix socket */
+                        int interop_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+                        CHECK(interop_fd >= 0,
+                              "E5c: create Unix socket for interop connection",
+                              "socket failed");
+
+                        if (interop_fd >= 0) {
+                            struct sockaddr_un ua;
+                            memset(&ua, 0, sizeof(ua));
+                            ua.sun_family = AF_UNIX;
+                            /* Use snprintf to avoid -Wstringop-truncation
+                             * warning from strncpy. The path has already
+                             * been validated and trimmed above. */
+                            snprintf(ua.sun_path, sizeof(ua.sun_path),
+                                     "%s", sock_path);
+
+                            int conn_rc = connect(interop_fd, (struct sockaddr *)&ua,
+                                                  sizeof(ua));
+                            CHECK(conn_rc == 0,
+                                  "E5c: connect to interop Unix socket",
+                                  "connect failed: %s", strerror(errno));
+
+                            if (conn_rc == 0) {
+                                /* Build a minimal CreateProcessUtilityVm(8)
+                                 * message with just a filename, matching the
+                                 * wsl-interop.c client format (E3).
+                                 * Layout: MESSAGE_HEADER + Rows + Cols +
+                                 *         Common (offsets + Buffer) */
+                                const char *filename = "C:\\Windows\\System32\\cmd.exe";
+                                const char *cwd = "C:\\";
+                                const char *cmdline = "cmd.exe";
+                                uint32_t off_filename = 0;
+                                uint32_t off_cwd = off_filename + strlen(filename) + 1;
+                                uint32_t off_cmdline = off_cwd + strlen(cwd) + 1;
+                                size_t buffer_size = off_cmdline + strlen(cmdline) + 1;
+
+                                size_t msg_size = offsetof(LX_INIT_CREATE_PROCESS_UTILITY_VM,
+                                                           Common.Buffer) + buffer_size;
+                                char *nt_msg = calloc(1, msg_size);
+                                if (nt_msg) {
+                                    LX_INIT_CREATE_PROCESS_UTILITY_VM *umsg =
+                                        (LX_INIT_CREATE_PROCESS_UTILITY_VM *)nt_msg;
+                                    umsg->Header.MessageType = 8; /* CreateProcessUtilityVm */
+                                    umsg->Header.MessageSize = (unsigned int)msg_size;
+                                    umsg->Header.SequenceNumber = 631;
+                                    umsg->Rows = 24;
+                                    umsg->Columns = 80;
+                                    umsg->Common.FilenameOffset = off_filename;
+                                    umsg->Common.CurrentWorkingDirectoryOffset = off_cwd;
+                                    umsg->Common.CommandLineOffset = off_cmdline;
+                                    umsg->Common.CommandLineCount = 1;
+                                    memcpy(umsg->Common.Buffer + off_filename,
+                                           filename, strlen(filename) + 1);
+                                    memcpy(umsg->Common.Buffer + off_cwd,
+                                           cwd, strlen(cwd) + 1);
+                                    memcpy(umsg->Common.Buffer + off_cmdline,
+                                           cmdline, strlen(cmdline) + 1);
+
+                                    int s = send_all(interop_fd, nt_msg, msg_size);
+                                    CHECK(s == 0,
+                                          "E5c: send CreateProcessUtilityVm to interop socket",
+                                          "send failed");
+                                    free(nt_msg);
+
+                                    if (s == 0) {
+                                        /* Read ResultUint32 response from
+                                         * the interop socket (sent by
+                                         * wsl_interop_relay_message) */
+                                        struct MESSAGE_HEADER resp_hdr;
+                                        void *resp = recv_message(interop_fd, &resp_hdr);
+                                        if (resp) {
+                                            RESULT_MESSAGE_UINT32 *r32 =
+                                                (RESULT_MESSAGE_UINT32 *)resp;
+                                            printf("  interop response: type=%u, seq=%u, result=%u\n",
+                                                   r32->Header.MessageType,
+                                                   r32->Header.SequenceNumber,
+                                                   r32->Result);
+                                            CHECK(r32->Header.MessageType == 78,
+                                                  "E5c: interop response type==78 (ResultUint32)",
+                                                  "got %u", r32->Header.MessageType);
+                                            CHECK(r32->Header.SequenceNumber == 631,
+                                                  "E5c: interop response seq echoed (631)",
+                                                  "got %u", r32->Header.SequenceNumber);
+                                            CHECK(r32->Result == 0,
+                                                  "E5c: interop relay result==0 (success)",
+                                                  "got %u", r32->Result);
+                                            free(resp);
+                                        } else {
+                                            CHECK(0, "E5c: interop response received",
+                                                  "no response");
+                                        }
+
+                                        /* Verify the relayed message arrived
+                                         * on the host control channel */
+                                        struct MESSAGE_HEADER ctl_hdr;
+                                        void *relayed = recv_message(io_control_fd, &ctl_hdr);
+                                        if (relayed) {
+                                            struct MESSAGE_HEADER *rh =
+                                                (struct MESSAGE_HEADER *)relayed;
+                                            printf("  relayed to control: type=%u, seq=%u, size=%u\n",
+                                                   rh->MessageType, rh->SequenceNumber,
+                                                   rh->MessageSize);
+                                            CHECK(rh->MessageType == 8,
+                                                  "E5c: relayed message type==8 (CreateProcessUtilityVm)",
+                                                  "got %u", rh->MessageType);
+                                            CHECK(rh->SequenceNumber == 631,
+                                                  "E5c: relayed message seq==631",
+                                                  "got %u", rh->SequenceNumber);
+                                            free(relayed);
+                                        } else {
+                                            CHECK(0, "E5c: relayed message received on control channel",
+                                                  "no message");
+                                        }
+                                    }
+                                }
+                            }
+                            close(interop_fd);
+                        }
+                    } else {
+                        CHECK(0, "E5c: extract interop socket path from child env",
+                              "sock_path='%s'", sock_path);
                     }
                 }
 
@@ -4160,3 +5229,5 @@ int main(void)
 
     return g_tests_failed == 0 ? 0 : 1;
 }
+
+#pragma GCC diagnostic pop

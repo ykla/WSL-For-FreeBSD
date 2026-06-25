@@ -15,10 +15,12 @@
  *   3. Host runs Plan9 file server on port 50002 (non-elevated) or 50003 (elevated)
  *   4. Guest connects via vsock/fd and mounts using 9p filesystem type
  *
- * FreeBSD limitation: no native 9p/drvfs kernel filesystem type.
- * Mount calls use "best-effort" strategy — failures are logged but non-fatal,
- * allowing protocol flow testing without a real 9p server. This mirrors the
- * F2 unmount behavior where failures are logged but don't block shutdown.
+ * FreeBSD support: FreeBSD 14.4+ provides native 9P filesystem support via
+ * the "p9fs" kernel filesystem type. Older FreeBSD can use 9pfuse (FUSE-based
+ * 9P client from the plan9port package). Mount calls use "best-effort"
+ * strategy — failures are logged but non-fatal, allowing protocol flow testing
+ * without a real 9p server. This mirrors the F2 unmount behavior where
+ * failures are logged but don't block shutdown.
  *
  * Three mount paths (matching reference):
  *   Path 1: Automatic mount after Initialize(5) — drvfs_mount_volumes()
@@ -60,7 +62,11 @@
 
 #define DRVFS_SOURCE_TEMPLATE " :\\"     /* Source[0] set to 'A' + drive index */
 #define DRVFS_TARGET_MODE 0777           /* mkdir mode for mount points */
-#define PLAN9_FS_TYPE "9p"               /* 9p filesystem type for mount() */
+#ifdef __FreeBSD__
+#define PLAN9_FS_TYPE "p9fs"             /* FreeBSD 14.4+ native 9P filesystem */
+#else
+#define PLAN9_FS_TYPE "9p"               /* Linux 9p filesystem type for mount() */
+#endif
 #define VIRTIO_FS_TYPE "virtiofs"        /* virtiofs filesystem type */
 #define PLAN9_ANAME_OPTION "aname="      /* 9p aname option prefix */
 #define PLAN9_ANAME_DRVFS "aname=drvfs"  /* 9p aname for DrvFs share */
@@ -85,21 +91,24 @@
 /* ---- Internal: platform-specific mount wrapper ----
  *
  * FreeBSD: int mount(const char *type, const char *dir, int flags, void *data);
+ *   - Uses "p9fs" filesystem type (FreeBSD 14.4+).
+ *   - Options are passed via a filesystem-specific data structure, not a
+ *     comma-separated string. NULL is passed for now; a proper p9fs mount
+ *     would set up the data struct or use the mount command.
+ *   - On older FreeBSD without p9fs, returns ENODEV (best-effort).
  * Linux:   int mount(const char *source, const char *target,
  *                    const char *filesystemtype, unsigned long mountflags,
  *                    const void *data);
- *
- * For 9p mounts, the source is encoded in the 9p options (trans=fd mode),
- * so the FreeBSD signature (which lacks source) is sufficient. */
+ *   - Uses "9p" filesystem type with comma-separated options string. */
 static inline int drvfs_do_mount(const char *source, const char *target,
                                   const char *fstype, const char *options)
 {
     (void)source; /* source is encoded in 9p options for fd transport */
 #ifdef __FreeBSD__
     /* FreeBSD: mount(type, dir, flags, data)
-     * NOTE: FreeBSD has no 9p kernel filesystem type; this returns ENODEV.
-     * The options string is not passed because FreeBSD mount() uses a
-     * filesystem-specific data structure, not an options string. */
+     * p9fs uses a filesystem-specific data struct; NULL for now (best-effort).
+     * In production, would construct the proper iovec-based mount args or
+     * invoke the mount command via nmount(). */
     (void)options;
     return mount(fstype, target, 0, NULL);
 #else

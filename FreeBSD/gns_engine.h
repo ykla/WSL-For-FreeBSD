@@ -30,6 +30,10 @@
 #ifndef GNS_ENGINE_H
 #define GNS_ENGINE_H
 
+/* Task Group C (localhost relay): port discovery + PortListenerRelay notify.
+ * Included here so gns_engine_loop can poll the tracker each cycle. */
+#include "port_tracker.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +44,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -94,6 +99,8 @@ struct MESSAGE_HEADER {
     unsigned int MessageSize;
     unsigned int SequenceNumber;
 };
+/* typedef alias so production code can use `MESSAGE_HEADER` without `struct` */
+typedef struct MESSAGE_HEADER MESSAGE_HEADER;
 
 /* RESULT_MESSAGE<uint32_t> (type 78) */
 typedef struct RESULT_MESSAGE_UINT32 {
@@ -112,6 +119,9 @@ typedef struct RESULT_MESSAGE_BOOL {
     struct MESSAGE_HEADER Header;
     bool Result;
 } RESULT_MESSAGE_BOOL;
+/* Guard macro: later headers (e.g. plan9_server.h) can check this to avoid
+ * redefining RESULT_MESSAGE_BOOL when gns_engine.h has already provided it. */
+#define RESULT_MESSAGE_BOOL_DEFINED
 
 /* NetworkInformation (host -> guest, type 4)
  * Buffer contains two NUL-terminated strings indexed by FileHeaderIndex
@@ -155,6 +165,19 @@ typedef struct LX_GNS_RESULT {
     int Result;
     char Buffer[];
 } LX_GNS_RESULT;
+
+/* B1: MountDrvFs / RemountDrvfs (host -> guest, type 13)
+ * Triggers DrvFs remount in the specified mount namespace (elevated/non-elevated).
+ * Response is RESULT_MESSAGE_INT32 (type 77).
+ * Reference: lxinitshared.h LX_INIT_MOUNT_DRVFS */
+#define LxInitMessageRemountDrvfs 13
+typedef struct LX_INIT_MOUNT_DRVFS {
+    struct MESSAGE_HEADER Header;
+    bool Admin;                   /* true = use elevated (admin) 9p server */
+    unsigned int VolumesToMount;  /* bitmap of drive indices to mount */
+    unsigned int UnreadableVolumes; /* bitmap of volumes that can't be read */
+    int DefaultOwnerUid;          /* UID to use for file ownership */
+} LX_INIT_MOUNT_DRVFS;
 
 #endif /* WSL_PROTOCOL_H */
 
@@ -296,11 +319,17 @@ static inline int gns_handle_network_information(void *msg_buf, size_t msg_size)
         return 0;
     }
 
-    /* Write resolv.conf (path configurable for test harness) */
+    /* Write resolv.conf atomically: write to temp file, then rename.
+     * This prevents a TOCTOU race where the test harness opens the file
+     * between fopen("w") (which creates an empty file) and fputs (which
+     * writes the content). With rename(), the file only appears with its
+     * complete content. */
     const char *resolv_path = g_resolvconf_path;
-    FILE *fp = fopen(resolv_path, "w");
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", resolv_path);
+    FILE *fp = fopen(tmp_path, "w");
     if (!fp) {
-        fprintf(stderr, "[gns] fopen %s: %s\n", resolv_path, strerror(errno));
+        fprintf(stderr, "[gns] fopen %s: %s\n", tmp_path, strerror(errno));
         return -1;
     }
     if (file_contents) {
@@ -312,7 +341,13 @@ static inline int gns_handle_network_information(void *msg_buf, size_t msg_size)
             fputc('\n', fp);
     }
     if (fclose(fp) != 0) {
-        fprintf(stderr, "[gns] fclose %s: %s\n", resolv_path, strerror(errno));
+        fprintf(stderr, "[gns] fclose %s: %s\n", tmp_path, strerror(errno));
+        return -1;
+    }
+    if (rename(tmp_path, resolv_path) < 0) {
+        fprintf(stderr, "[gns] rename %s -> %s: %s\n",
+                tmp_path, resolv_path, strerror(errno));
+        unlink(tmp_path);
         return -1;
     }
     printf("[gns] wrote %s\n", resolv_path);
@@ -355,10 +390,20 @@ static inline void gns_send_result(int fd, unsigned int seq, int result_code,
     free(resp);
 }
 
-/* Run a shell command, returning exit status (0 = success). */
+/* Run a shell command, returning exit status (0 = success).
+ * On Linux (test harness), FreeBSD-specific ifconfig keywords (e.g. 'alias')
+ * can cause ifconfig to attempt a DNS lookup that hangs indefinitely when
+ * the nameserver is unreachable. Wrap with `timeout` to prevent test hangs.
+ * Production (FreeBSD) runs commands directly. */
 static inline int gns_run_cmd(const char *cmd)
 {
+#ifdef __FreeBSD__
     int rc = system(cmd);
+#else
+    char wrapped[512];
+    snprintf(wrapped, sizeof(wrapped), "timeout 3 %s", cmd);
+    int rc = system(wrapped);
+#endif
     if (rc == -1) {
         perror("[gns] system()");
         return -1;
@@ -466,6 +511,395 @@ static inline int gns_handle_interface_configuration(int gns_fd, void *msg_buf,
 
     free(content);
     gns_send_result(gns_fd, seq, result, result == 0 ? "ok" : "partial");
+    return result;
+}
+
+/* ===================================================================
+ * D-group: LxGnsMessageNotification(55) — HNS state changes
+ * ===================================================================
+ *
+ * The host sends Notification(55) on the GNS channel to apply ongoing
+ * network state changes. The payload is a JSON string of the form:
+ *   {
+ *     "ResourceType": "Route|IPAddress|DNS|Interface|MacAddress",
+ *     "RequestType":  "Add|Remove|Update|Refresh|Reset",
+ *     "Settings":     { ... type-specific ... },
+ *     "targetDeviceName": "<iface>"    // optional
+ *   }
+ *
+ * This is the primary state-change channel for NAT mode (the FreeBSD
+ * default). Reference: src/linux/init/GnsEngine.cpp ProcessNotification,
+ * ProcessRouteChange, ProcessIpAddressChange, ProcessDNSChange,
+ * ProcessLinkChange, ProcessMacAddressChange. JSON schema:
+ * src/shared/inc/hns_schema.h (Route, IPAddress, DNS, NetworkInterface,
+ * MacAddress, ModifyGuestEndpointSettingRequest, GuestEndpointResourceType,
+ * ModifyRequestType).
+ *
+ * Note: the reference opens the adapter by GUID; FreeBSD uses interface
+ * names. We use targetDeviceName if present, else g_default_interface
+ * (default "lo0" for safe testing; production sets this to the NIC).
+ *
+ * All apply paths are best-effort (shell out to ifconfig/route) and always
+ * acknowledge with LX_GNS_RESULT so the host does not hang.
+ */
+
+/* Default interface used when Notification omits targetDeviceName.
+ * Tests use "lo0" (always present, safe). Production should set this
+ * to the actual NIC (e.g. "hn0" for Hyper-V netvsc, "vtnet0" for virtio). */
+static char g_default_interface[32] = "lo0";
+
+static inline void gns_set_default_interface(const char *name)
+{
+    if (name && name[0]) {
+        strncpy(g_default_interface, name, sizeof(g_default_interface) - 1);
+        g_default_interface[sizeof(g_default_interface) - 1] = '\0';
+    }
+}
+
+/* ---- Minimal JSON value extractor ----
+ * Targets the fixed HNS schema; not a general-purpose parser. Finds
+ * `"key"` followed by `:` and returns a pointer to the value start.
+ * String values are returned without surrounding quotes via the _string
+ * helper; numbers/bools via _int/_bool. Sub-objects are copied into a
+ * caller buffer via _subobject. All return 0 on success, -1 if absent. */
+
+static inline const char *gns_json_find_value(const char *json, const char *key)
+{
+    char pat[64];
+    int n = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (n <= 0 || n >= (int)sizeof(pat)) return NULL;
+    const char *p = json;
+    for (;;) {
+        p = strstr(p, pat);
+        if (!p) return NULL;
+        p += n;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == ':') { p++; while (*p == ' ' || *p == '\t') p++; return p; }
+    }
+}
+
+static inline int gns_json_get_string(const char *json, const char *key,
+                                      char *out, size_t outsz)
+{
+    const char *v = gns_json_find_value(json, key);
+    if (!v || *v != '"') return -1;
+    v++;
+    size_t i = 0;
+    while (*v && *v != '"' && i + 1 < outsz) {
+        if (*v == '\\' && v[1]) v++;  /* skip escaped char */
+        out[i++] = *v++;
+    }
+    out[i] = '\0';
+    return 0;
+}
+
+static inline long gns_json_get_int(const char *json, const char *key, long def)
+{
+    const char *v = gns_json_find_value(json, key);
+    if (!v) return def;
+    return strtol(v, NULL, 10);
+}
+
+static inline int gns_json_get_bool(const char *json, const char *key, int def)
+{
+    const char *v = gns_json_find_value(json, key);
+    if (!v) return def;
+    if (strncmp(v, "true", 4) == 0) return 1;
+    if (strncmp(v, "false", 5) == 0) return 0;
+    return def;
+}
+
+/* Copy the {...} sub-object for `key` into `out` (NUL-terminated).
+ * Returns 0 on success, -1 if absent/not an object. */
+static inline int gns_json_get_subobject(const char *json, const char *key,
+                                         char *out, size_t outsz)
+{
+    const char *v = gns_json_find_value(json, key);
+    if (!v || *v != '{') return -1;
+    int depth = 0;
+    size_t i = 0;
+    while (*v && i + 1 < outsz) {
+        char c = *v++;
+        if (c == '{') depth++;
+        else if (c == '}') { depth--; if (depth == 0) { out[i++] = c; break; } }
+        else if (c == '"') {  /* copy string literal verbatim, honoring escapes */
+            out[i++] = c;
+            while (*v && i + 1 < outsz) {
+                char ch = *v++;
+                out[i++] = ch;
+                if (ch == '\\' && *v) {
+                    out[i++] = *v++;  /* copy escaped char so \" won't terminate */
+                } else if (ch == '"') {
+                    break;  /* closing quote */
+                }
+            }
+            continue;
+        }
+        out[i++] = c;
+    }
+    out[i] = '\0';
+    return i > 0 ? 0 : -1;
+}
+
+/* ---- Apply helpers (best-effort, via ifconfig/route) ---- */
+
+/* ResourceType=Route. Settings: NextHop, DestinationPrefix, SitePrefixLength,
+ * Metric, Family (2=AF_INET, 23=AF_INET6 on Windows; we only act on IPv4). */
+static inline void gns_apply_route_change(const char *settings,
+                                          const char *request_type)
+{
+    char next_hop[64] = {0};
+    char dest_prefix[80] = {0};
+    gns_json_get_string(settings, "NextHop", next_hop, sizeof(next_hop));
+    gns_json_get_string(settings, "DestinationPrefix", dest_prefix, sizeof(dest_prefix));
+
+    printf("[gns] Route %s: NextHop=%s DestPrefix=%s\n",
+           request_type, next_hop, dest_prefix);
+
+    if (strcmp(request_type, "Reset") == 0) {
+        /* Reset routing table — flush default routes (best-effort) */
+        gns_run_cmd("route delete default 2>/dev/null");
+        return;
+    }
+
+    if (!next_hop[0]) return;
+
+    char cmd[256];
+    if (strcmp(request_type, "Remove") == 0) {
+        /* Default route removal */
+        if (dest_prefix[0] == '\0' || strncmp(dest_prefix, "0.0.0.0", 7) == 0) {
+            snprintf(cmd, sizeof(cmd), "route delete default %s 2>/dev/null", next_hop);
+        } else {
+            snprintf(cmd, sizeof(cmd), "route delete %s %s 2>/dev/null", dest_prefix, next_hop);
+        }
+        gns_run_cmd(cmd);
+    } else {
+        /* Add / Update → add (update is best-effort: delete then add) */
+        if (strcmp(request_type, "Update") == 0) {
+            snprintf(cmd, sizeof(cmd), "route delete default %s 2>/dev/null", next_hop);
+            gns_run_cmd(cmd);
+        }
+        if (dest_prefix[0] == '\0' || strncmp(dest_prefix, "0.0.0.0", 7) == 0) {
+            snprintf(cmd, sizeof(cmd), "route add default %s 2>/dev/null", next_hop);
+        } else {
+            snprintf(cmd, sizeof(cmd), "route add %s %s 2>/dev/null", dest_prefix, next_hop);
+        }
+        gns_run_cmd(cmd);
+    }
+}
+
+/* ResourceType=IPAddress. Settings: Address, Family, OnLinkPrefixLength. */
+static inline void gns_apply_ip_change(const char *iface,
+                                       const char *settings,
+                                       const char *request_type)
+{
+    char address[64] = {0};
+    gns_json_get_string(settings, "Address", address, sizeof(address));
+    long prefix = gns_json_get_int(settings, "OnLinkPrefixLength", 0);
+
+    printf("[gns] IPAddress %s: %s/%ld on %s\n",
+           request_type, address, prefix, iface);
+
+    if (!address[0] || !iface[0]) return;
+
+    char cmd[256];
+    if (strcmp(request_type, "Remove") == 0) {
+        snprintf(cmd, sizeof(cmd), "ifconfig %s delete %s 2>/dev/null", iface, address);
+    } else {
+        /* Add / Update. FreeBSD: ifconfig iface address[/mask] alias */
+        if (prefix > 0 && prefix <= 32) {
+            snprintf(cmd, sizeof(cmd), "ifconfig %s %s/%ld alias 2>/dev/null",
+                     iface, address, prefix);
+        } else {
+            snprintf(cmd, sizeof(cmd), "ifconfig %s %s netmask 255.255.255.255 alias 2>/dev/null",
+                     iface, address);
+        }
+        if (strcmp(request_type, "Update") == 0) {
+            gns_run_cmd(cmd);  /* add first */
+            snprintf(cmd, sizeof(cmd), "ifconfig %s %s/%ld alias 2>/dev/null",
+                     iface, address, prefix > 0 ? prefix : 32);
+        }
+    }
+    gns_run_cmd(cmd);
+}
+
+/* ResourceType=DNS. Settings: Domain, Search, ServerList, Options.
+ * Writes /etc/resolv.conf (path configurable via g_resolvconf_path). */
+static inline void gns_apply_dns_change(const char *settings,
+                                        const char *request_type)
+{
+    if (strcmp(request_type, "Remove") == 0) {
+        printf("[gns] DNS Remove: ignored (next add/update overwrites)\n");
+        return;
+    }
+
+    char domain[128] = {0};
+    char search[256] = {0};
+    char server_list[512] = {0};
+    char options[256] = {0};
+    gns_json_get_string(settings, "Domain", domain, sizeof(domain));
+    gns_json_get_string(settings, "Search", search, sizeof(search));
+    gns_json_get_string(settings, "ServerList", server_list, sizeof(server_list));
+    gns_json_get_string(settings, "Options", options, sizeof(options));
+
+    printf("[gns] DNS %s: servers=%s domain=%s search=%s\n",
+           request_type, server_list, domain, search);
+
+    if (!g_generate_resolvconf) {
+        printf("[gns] generateResolvConf=false, skipping %s write\n",
+               g_resolvconf_path);
+        return;
+    }
+
+    FILE *fp = fopen(g_resolvconf_path, "w");
+    if (!fp) {
+        fprintf(stderr, "[gns] DNS fopen %s: %s\n", g_resolvconf_path, strerror(errno));
+        return;
+    }
+    if (options[0]) fputs(options, fp);
+    /* ServerList is comma-separated */
+    char servers[512];
+    strncpy(servers, server_list, sizeof(servers) - 1);
+    servers[sizeof(servers) - 1] = '\0';
+    char *save = NULL;
+    for (char *s = strtok_r(servers, ",", &save); s; s = strtok_r(NULL, ",", &save)) {
+        while (*s == ' ') s++;
+        fprintf(fp, "nameserver %s\n", s);
+    }
+    if (domain[0]) fprintf(fp, "domain %s\n", domain);
+    if (search[0]) {
+        /* Search is comma-separated; resolv.conf wants space-separated */
+        char search_out[256] = {0};
+        char *sv = NULL;
+        for (char *s = strtok_r(search, ",", &sv); s; s = strtok_r(NULL, ",", &sv)) {
+            while (*s == ' ') s++;
+            if (search_out[0]) strncat(search_out, " ", sizeof(search_out) - strlen(search_out) - 1);
+            strncat(search_out, s, sizeof(search_out) - strlen(search_out) - 1);
+        }
+        if (search_out[0]) fprintf(fp, "search %s\n", search_out);
+    }
+    fclose(fp);
+    printf("[gns] wrote %s\n", g_resolvconf_path);
+}
+
+/* ResourceType=Interface. Settings: Connected (bool), NlMtu, Metric. */
+static inline void gns_apply_link_change(const char *iface,
+                                         const char *settings,
+                                         const char *request_type)
+{
+    int connected = gns_json_get_bool(settings, "Connected", 1);
+    long mtu = gns_json_get_int(settings, "NlMtu", 0);
+
+    printf("[gns] Interface %s: %s mtu=%ld on %s\n",
+           request_type, connected ? "up" : "down", mtu, iface);
+
+    if (!iface[0]) return;
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "ifconfig %s %s 2>/dev/null",
+             iface, connected ? "up" : "down");
+    gns_run_cmd(cmd);
+    if (connected && mtu > 0) {
+        snprintf(cmd, sizeof(cmd), "ifconfig %s mtu %ld 2>/dev/null", iface, mtu);
+        gns_run_cmd(cmd);
+    }
+}
+
+/* ResourceType=MacAddress. Settings: PhysicalAddress (e.g. "00-15-5d-..."). */
+static inline void gns_apply_mac_change(const char *iface,
+                                        const char *settings)
+{
+    char mac[64] = {0};
+    gns_json_get_string(settings, "PhysicalAddress", mac, sizeof(mac));
+    printf("[gns] MacAddress: %s on %s (best-effort)\n", mac, iface);
+    if (!mac[0] || !iface[0]) return;
+    /* FreeBSD ifconfig uses ':' separator; HNS uses '-'. Convert. */
+    char bsd_mac[64];
+    size_t j = 0;
+    for (size_t i = 0; mac[i] && j + 1 < sizeof(bsd_mac); i++) {
+        bsd_mac[j++] = (mac[i] == '-') ? ':' : mac[i];
+    }
+    bsd_mac[j] = '\0';
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "ifconfig %s link %s 2>/dev/null", iface, bsd_mac);
+    gns_run_cmd(cmd);
+}
+
+/* Main Notification(55) dispatcher. msg_buf is the full message (header+body);
+ * the body is a NUL-terminated JSON string starting after the fixed header. */
+static inline int gns_handle_notification(int gns_fd, void *msg_buf,
+                                          size_t msg_size, unsigned int seq)
+{
+    if (msg_size < sizeof(struct MESSAGE_HEADER)) {
+        gns_send_result(gns_fd, seq, -1, "msg too small");
+        return -1;
+    }
+    /* The payload follows the 12-byte MESSAGE_HEADER. Treat it as a JSON
+     * string. (Wire layout matches LX_GNS_INTERFACE_CONFIGURATION.) */
+    size_t header_fixed = sizeof(struct MESSAGE_HEADER);
+    if (msg_size <= header_fixed) {
+        gns_send_result(gns_fd, seq, -1, "no payload");
+        return -1;
+    }
+    size_t body_len = msg_size - header_fixed;
+    char *body = malloc(body_len + 1);
+    if (!body) {
+        gns_send_result(gns_fd, seq, -1, "oom");
+        return -1;
+    }
+    memcpy(body, (char *)msg_buf + header_fixed, body_len);
+    body[body_len] = '\0';
+
+    printf("[gns] Notification(55) payload: %s\n", body);
+
+    char resource_type[32] = {0};
+    char request_type[16] = {0};
+    char target_device[32] = {0};
+    gns_json_get_string(body, "ResourceType", resource_type, sizeof(resource_type));
+    gns_json_get_string(body, "RequestType", request_type, sizeof(request_type));
+    gns_json_get_string(body, "targetDeviceName", target_device, sizeof(target_device));
+
+    const char *iface = target_device[0] ? target_device : g_default_interface;
+
+    int result = 0;
+    if (strcmp(resource_type, "Route") == 0) {
+        char settings[1024];
+        if (gns_json_get_subobject(body, "Settings", settings, sizeof(settings)) == 0)
+            gns_apply_route_change(settings, request_type);
+        else
+            result = -1;
+    } else if (strcmp(resource_type, "IPAddress") == 0) {
+        char settings[1024];
+        if (gns_json_get_subobject(body, "Settings", settings, sizeof(settings)) == 0)
+            gns_apply_ip_change(iface, settings, request_type);
+        else
+            result = -1;
+    } else if (strcmp(resource_type, "DNS") == 0) {
+        char settings[1024];
+        if (gns_json_get_subobject(body, "Settings", settings, sizeof(settings)) == 0)
+            gns_apply_dns_change(settings, request_type);
+        else
+            result = -1;
+    } else if (strcmp(resource_type, "Interface") == 0) {
+        char settings[512];
+        if (gns_json_get_subobject(body, "Settings", settings, sizeof(settings)) == 0)
+            gns_apply_link_change(iface, settings, request_type);
+        else
+            result = -1;
+    } else if (strcmp(resource_type, "MacAddress") == 0) {
+        char settings[256];
+        if (gns_json_get_subobject(body, "Settings", settings, sizeof(settings)) == 0)
+            gns_apply_mac_change(iface, settings);
+        else
+            result = -1;
+    } else {
+        printf("[gns] Notification: unknown ResourceType '%s' — acknowledging\n",
+               resource_type);
+        result = 0;  /* ack unknown to avoid host hang */
+    }
+
+    free(body);
+    gns_send_result(gns_fd, seq, result,
+                    result == 0 ? "notification applied" : "partial");
     return result;
 }
 
@@ -685,19 +1119,44 @@ static inline void gns_engine_loop(int gns_fd)
     /* Set non-blocking so we can handle partial reads */
     fcntl(gns_fd, F_SETFL, fcntl(gns_fd, F_GETFL) | O_NONBLOCK);
 
+    /* Task Group C: localhost port tracker. Polls listening ports every
+     * second and sends PortListenerRelayStart/Stop to the host so Windows
+     * can forward localhost:<port> traffic into the guest. */
+    struct port_tracker tracker;
+    if (port_tracker_init(&tracker) < 0) {
+        fprintf(stderr, "[gns] port_tracker_init failed; relay disabled\n");
+        tracker.entries = NULL;
+        tracker.count = tracker.cap = 0;
+    }
+    time_t last_port_scan = 0;
+
     for (;;) {
         struct pollfd pfd;
         pfd.fd = gns_fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
 
-        int rc = poll(&pfd, 1, -1);
+        /* 1s timeout so the port tracker can scan periodically. */
+        int rc = poll(&pfd, 1, 1000);
         if (rc < 0) {
-            if (errno == EINTR) continue;
-            perror("[gns] poll");
-            break;
+            if (errno == EINTR) {
+                /* Still run the port scan on EINTR if due. */
+            } else {
+                perror("[gns] poll");
+                break;
+            }
         }
-        if (rc == 0) continue;
+        if (rc == 0 || (rc < 0 && errno == EINTR)) {
+            /* Timeout or interrupt: run port tracker scan if ≥1s elapsed. */
+            time_t now = time(NULL);
+            if (tracker.entries != NULL || tracker.cap > 0) {
+                if (now - last_port_scan >= 1) {
+                    port_tracker_poll(&tracker, gns_fd);
+                    last_port_scan = now;
+                }
+            }
+            if (rc == 0) continue;
+        }
 
         if (pfd.revents & (POLLERR | POLLNVAL)) {
             fprintf(stderr, "[gns] poll error on gns_fd\n");
@@ -741,6 +1200,13 @@ static inline void gns_engine_loop(int gns_fd)
                                                hdr.SequenceNumber);
             break;
 
+        case LxGnsMessageNotification:
+            /* D-group: HNS state changes (Route/IPAddress/DNS/Interface/Mac).
+             * Primary state-change channel for NAT mode. */
+            gns_handle_notification(gns_fd, full_msg,
+                                    hdr.MessageSize, hdr.SequenceNumber);
+            break;
+
         case LxGnsMessageNoOp:
             /* No-op: respond with success result */
             gns_send_result(gns_fd, hdr.SequenceNumber, 0, "noop");
@@ -777,6 +1243,7 @@ static inline void gns_engine_loop(int gns_fd)
         free(full_msg);
     }
 
+    port_tracker_free(&tracker);
     printf("[gns] engine exiting\n");
 }
 

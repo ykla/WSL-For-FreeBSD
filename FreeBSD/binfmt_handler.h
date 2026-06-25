@@ -21,12 +21,24 @@
  * boot.protectBinfmt (default true) makes the handler immutable by
  * removing write permissions, preventing user-space modification.
  *
- * On FreeBSD, binfmt_misc is not available. The function logs this
- * and returns success (best-effort: interop still works through the
- * interop_server.h channel mechanism, not through kernel binfmt).
+ * On FreeBSD, binfmt_misc is not available. FreeBSD's imgact subsystem
+ * (sys/kern/imgact_elf.c, imgact_shell.c) does not support magic-byte
+ * based binary format registration. Adding an imgact handler for PE
+ * binaries would require a kernel module (kldload), which is out of
+ * scope for this userspace port.
+ *
+ * FreeBSD alternative (E group): The `wsl-interop` userspace wrapper
+ * (wsl-interop.c) replaces binfmt_misc with explicit invocation:
+ *   wsl-interop C:/Windows/System32/clip.exe < file.txt
+ * The bridge (hvbridge.c) creates a local Unix socket at
+ * /run/WSL/<pid>_interop and sets the WSL_INTEROP env var. The wsl-interop
+ * wrapper connects to this socket and sends a CreateNtProcessUtilityVm
+ * message, which the bridge relays to the host control channel.
+ * See wsl_interop.h for the server-side implementation.
  *
  * Reference: src/linux/init/binfmt.cpp RegisterBinfmtInterop(),
- *            src/linux/init/binfmt.h
+ *            src/linux/init/binfmt.h,
+ *            FreeBSD sys/kern/imgact_shell.c (shell script activator only)
  */
 #ifndef BINFMT_HANDLER_H
 #define BINFMT_HANDLER_H

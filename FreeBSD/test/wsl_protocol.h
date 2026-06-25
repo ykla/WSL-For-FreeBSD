@@ -41,6 +41,7 @@
 #define LxInitMessageQueryEnvironmentVariable    16
 #define LxInitMessageQueryFeatureFlags           17
 #define LxInitMessageCreateLoginSession          23
+#define LxInitMessageStopPlan9Server             24  /* Group A: host->guest, stop Plan9 server */
 #define LxInitMessageQueryNetworkingMode         25
 #define LxInitMessageQueryVmId                   26
 #define LxInitMessageOobeResult                  28  /* F1: guest->host, OOBE completion */
@@ -54,8 +55,20 @@
 /* GNS message types (correct enum values from lxinitshared.h) */
 #define LxGnsMessageInterfaceConfiguration              53
 #define LxGnsMessageResult                              54
+#define LxGnsMessageDnsTunneling                        70
 #define LxGnsMessageNoOp                                71
 #define LxGnsMessageConnectTestRequest                  74
+
+/* B (DNS Tunneling): IP address the guest DNS server binds to.
+ * Reference: lxinitshared.h LX_INIT_DNS_TUNNELING_IP_ADDRESS.
+ * In production this is 10.255.255.254; tests override via WSL_DNS_TUNNEL_IP. */
+#define LX_INIT_DNS_TUNNELING_IP_ADDRESS  "10.255.255.254"
+#define LX_INIT_DNS_SERVER_PORT           53
+#define LX_INIT_DNS_MAX_UDP_SIZE          4096
+#define LX_INIT_DNS_TCP_LEN_PREFIX        2   /* bytes storing DNS-over-TCP request length */
+
+/* Group A: Plan9 file server port (lxinitshared.h LX_INIT_UTILITY_VM_PLAN9_PORT) */
+#define LX_INIT_UTILITY_VM_PLAN9_PORT     50001
 
 /* ---- Core structures ---- */
 
@@ -287,6 +300,17 @@ typedef struct RESULT_MESSAGE_BOOL {
     uint32_t Result;
 } RESULT_MESSAGE_BOOL;
 
+/* Group A: StopPlan9Server (type 24) — host requests Plan9 server shutdown.
+ * Response is RESULT_MESSAGE_BOOL (type 76). Force=true → SIGKILL immediately.
+ * Reference: lxinitshared.h LX_INIT_STOP_PLAN9_SERVER */
+#ifndef LX_INIT_STOP_PLAN9_SERVER_MSG_DEFINED
+#define LX_INIT_STOP_PLAN9_SERVER_MSG_DEFINED
+typedef struct LX_INIT_STOP_PLAN9_SERVER_MSG {
+    struct MESSAGE_HEADER Header;
+    uint32_t Force;   /* bool: 1=force (SIGKILL), 0=graceful */
+} LX_INIT_STOP_PLAN9_SERVER_MSG;
+#endif
+
 /* RESULT_MESSAGE<int32_t> (type 77) */
 typedef struct RESULT_MESSAGE_INT32 {
     struct MESSAGE_HEADER Header;
@@ -328,6 +352,39 @@ typedef struct LX_INIT_CREATE_PROCESS_RESPONSE {
 } LX_INIT_CREATE_PROCESS_RESPONSE;
 
 #define LX_INIT_CREATE_PROCESS_RESULT_FLAG_GUI_APPLICATION 0x1
+
+/* ---- Task Group B: DNS Tunneling structures ----
+ * Reference: lxinitshared.h LX_GNS_DNS_CLIENT_IDENTIFIER, LX_GNS_DNS_TUNNELING_MESSAGE.
+ * Wire format: MESSAGE_HEADER + DnsClientIdentifier + raw DNS bytes (no padding).
+ * The host runs the actual resolver; the guest just relays DNS packets over
+ * a dedicated hvsock/TCP channel using this message type (LxGnsMessageDnsTunneling=70). */
+
+typedef struct LX_GNS_DNS_CLIENT_IDENTIFIER {
+    uint8_t  Protocol;     /* IPPROTO_UDP (17) or IPPROTO_TCP (6) */
+    uint8_t  _pad[3];      /* align DnsClientId to 4-byte boundary */
+    uint32_t DnsClientId;  /* unique id per UDP request or TCP connection */
+} LX_GNS_DNS_CLIENT_IDENTIFIER;
+#define LX_GNS_DNS_TUNNELING_MESSAGE_DEFINED
+
+/* static_assert equivalent: Buffer must start right after the identifier.
+ * sizeof(Header)=12, sizeof(DnsClientIdentifier)=8, so Buffer offset = 20. */
+typedef struct LX_GNS_DNS_TUNNELING_MESSAGE {
+    struct MESSAGE_HEADER          Header;
+    LX_GNS_DNS_CLIENT_IDENTIFIER   DnsClientIdentifier;
+    char                           Buffer[];  /* raw DNS request/response */
+} LX_GNS_DNS_TUNNELING_MESSAGE;
+
+/* Sanity check: ensure no padding before Buffer. */
+/* (offsetof cannot be used in #if, so we rely on the struct layout above
+ *  matching the reference static_assert.) */
+
+/* Protocol numbers for DNS client identifier (from <netinet/in.h>) */
+#ifndef IPPROTO_UDP
+#define IPPROTO_UDP 17
+#endif
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP 6
+#endif
 
 /* Networking modes (for QueryNetworkingMode response) */
 #define LxInitNetworkingModeNat       0
