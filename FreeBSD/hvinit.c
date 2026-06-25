@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>    /* A2: for getpwnam() to resolve user.default */
 
 #include "gns_engine.h"
 
@@ -39,6 +40,7 @@ unsigned char   hvs_zero[sizeof(struct sockaddr) -
 #define LxInitMessageCreateSessionResponse       3
 #define LxInitMessageInitialize                  5
 #define LxInitMessageInitializeResponse          6
+#define LxInitMessageTimezoneInformation          7  /* A3: host->guest timezone update */
 #define LxInitMessageCreateProcessUtilityVm      8
 #define LxInitMessageExitStatus                  9
 #define LxInitMessageWindowSizeChanged           10
@@ -46,11 +48,15 @@ unsigned char   hvs_zero[sizeof(struct sockaddr) -
 #define LxMiniInitMessageCreateInstanceResult    33
 #define LxMiniInitMessageGuestCapabilities       43
 #define LxMessageResultUint32                    78
+#define LxInitMessageOobeResult                  28  /* F1: guest->host, OOBE completion */
 /* Phase 9 (Task Group C): networking message types */
 #define LxInitMessageNetworkInformation           4
 #define LxInitMessageStartSocketRelay            15
 #define LxInitMessageQueryNetworkingMode         25
 #define LxInitMessageQueryVmId                   26
+
+/* F1: CreateProcess AllowOOBE flag (from lxinitshared.h LX_INIT_CREATE_PROCESS_FLAGS) */
+#define LxInitCreateProcessFlagAllowOOBE         0x20
 
 /* MESSAGE_HEADER in C */
 struct MESSAGE_HEADER {
@@ -62,6 +68,29 @@ typedef struct MESSAGE_HEADER MESSAGE_HEADER;
 
 /* A1: Include the Initialize(5) config parser after MESSAGE_HEADER is defined */
 #include "config_parser.h"
+
+/* A2: Include /etc/wsl.conf parser */
+#include "wsl_conf_parser.h"
+
+/* A3: Include timezone handler */
+#include "timezone_handler.h"
+
+/* A4: Include network configuration (hostname/hosts generation) */
+#include "network_config.h"
+
+/* B1: Include DrvFs mount module */
+#include "drvfs_mount.h"
+
+/* E1: Include binfmt_misc handler */
+#include "binfmt_handler.h"
+
+/* A1: Global parsed configuration from Initialize(5) message. */
+static struct wsl_config g_config;
+static int g_config_parsed = 0;
+
+/* A2: Global parsed /etc/wsl.conf configuration. */
+static struct wsl_conf g_wsl_conf;
+static int g_wsl_conf_parsed = 0;
 
 typedef struct LX_INIT_GUEST_CAPABILITIES {
     MESSAGE_HEADER Header;    // full 12-byte message header
@@ -126,6 +155,23 @@ typedef struct _LX_INIT_PROCESS_EXIT_STATUS {
     int ExitCode;
 } LX_INIT_PROCESS_EXIT_STATUS;
 
+/* F1: OobeResult (guest -> host, type 28)
+ * Sent on a dedicated OOBE channel when the distribution's first-run
+ * setup (OOBE) completes. The host blocks waiting for this message
+ * when RunOOBE=true and the create-process request has an empty
+ * filename/commandline with the AllowOOBE flag (0x20) set.
+ *
+ * Fields:
+ *   Result     - 0 on success, non-zero on failure
+ *   DefaultUid - configured default UID, or -1 if not present
+ *
+ * Reference: src/shared/inc/lxinitshared.h LX_INIT_OOBE_RESULT */
+typedef struct _LX_INIT_OOBE_RESULT {
+    MESSAGE_HEADER Header;
+    uint32_t Result;
+    int64_t DefaultUid;
+} LX_INIT_OOBE_RESULT;
+
 /* ---- Helper: reliable send/recv ---- */
 /* FIX: handle EAGAIN on non-blocking sockets by polling. */
 static int send_all(int fd, const void *buf, size_t len)
@@ -164,6 +210,89 @@ static int recv_all(int fd, void *buf, size_t len)
     return 0;
 }
 
+/* ---- F2: Filesystem mount tracking for graceful shutdown ----
+ * Each entry records the mount point path. Unmount happens in reverse
+ * order (last mounted = first unmounted), mirroring the reference WSL
+ * shutdown sequence in init.cpp where the guest cleans up mounted
+ * filesystems (DrvFs, Plan9, etc.) before exiting. */
+#define F2_MAX_MOUNTS 16
+static char g_mounted_fs[F2_MAX_MOUNTS][64];
+static int g_mounted_count = 0;
+
+/* F2: Record a filesystem mount for later cleanup. */
+static void fs_track_mount(const char *path)
+{
+    if (g_mounted_count < F2_MAX_MOUNTS) {
+        strncpy(g_mounted_fs[g_mounted_count], path,
+                sizeof(g_mounted_fs[g_mounted_count]) - 1);
+        g_mounted_fs[g_mounted_count][sizeof(g_mounted_fs[0]) - 1] = '\0';
+        g_mounted_count++;
+        printf("[init] tracked mount: %s (total=%d)\n", path, g_mounted_count);
+    }
+}
+
+/* F2: Unmount all tracked filesystems in reverse mount order.
+ * Returns the number of successful unmounts.
+ * Uses FreeBSD unmount() — the production hvinit runs on FreeBSD. */
+static int fs_unmount_all(void)
+{
+    int unmounted = 0;
+    for (int i = g_mounted_count - 1; i >= 0; i--) {
+        printf("[init] unmounting %s...\n", g_mounted_fs[i]);
+        int rc = unmount(g_mounted_fs[i], 0);
+        if (rc < 0 && errno == EBUSY) {
+            fprintf(stderr, "[init] %s busy, forcing unmount\n", g_mounted_fs[i]);
+            rc = unmount(g_mounted_fs[i], MNT_FORCE);
+        }
+        if (rc < 0) {
+            /* Log but don't fail — best-effort cleanup. */
+            fprintf(stderr, "[init] unmount %s: %s\n",
+                    g_mounted_fs[i], strerror(errno));
+        } else {
+            unmounted++;
+            printf("[init] unmounted %s\n", g_mounted_fs[i]);
+        }
+    }
+    return unmounted;
+}
+
+/* ---- F1: OobeResult sender ----
+ * Send OobeResult (type 28) on the given channel.
+ *
+ * In the reference WSL, this is sent on a dedicated OOBE channel when
+ * the distribution's first-run setup completes. The host blocks waiting
+ * for this message when RunOOBE=true and the create-process request
+ * has AllowOOBE flag (0x20) set with empty filename/commandline.
+ *
+ * For the FreeBSD port, we send it on the init channel after the
+ * handshake completes. The host reads it to unblock session creation.
+ *
+ * Parameters:
+ *   fd          - channel to send on (typically init_fd)
+ *   result      - 0 on success, non-zero on failure
+ *   default_uid - configured default UID, or -1 if not present
+ *
+ * Reference: src/linux/init/init.cpp lines 642-648,
+ *            src/shared/inc/lxinitshared.h LX_INIT_OOBE_RESULT */
+static void send_oobe_result(int fd, uint32_t result, int64_t default_uid)
+{
+    LX_INIT_OOBE_RESULT msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.Header.MessageType = LxInitMessageOobeResult;
+    msg.Header.MessageSize = sizeof(msg);
+    msg.Header.SequenceNumber = 1;  /* first message on the OOBE channel */
+    msg.Result = result;
+    msg.DefaultUid = default_uid;
+
+    if (send_all(fd, &msg, sizeof(msg)) < 0) {
+        perror("[init] send OobeResult");
+    } else {
+        printf("[init] sent OobeResult (type=%u, size=%u, Result=%u, DefaultUid=%lld)\n",
+               msg.Header.MessageType, msg.Header.MessageSize,
+               msg.Result, (long long)msg.DefaultUid);
+    }
+}
+
 /* ---- Phase 1: File system initialization ---- */
 static void initialize_filesystems(void)
 {
@@ -173,16 +302,22 @@ static void initialize_filesystems(void)
     if (stat("/dev", &st) != 0) mkdir("/dev", 0755);
     if (mount("devfs", "/dev", 0, NULL) < 0)
         perror("[init] mount devfs (may already be mounted)");
+    else
+        fs_track_mount("/dev");
 
     /* /proc — linprocfs (Linux-compatible procfs on FreeBSD) */
     if (stat("/proc", &st) != 0) mkdir("/proc", 0555);
     if (mount("linprocfs", "/proc", 0, NULL) < 0)
         perror("[init] mount linprocfs (may already be mounted)");
+    else
+        fs_track_mount("/proc");
 
     /* /run — tmpfs */
     if (stat("/run", &st) != 0) mkdir("/run", 0755);
     if (mount("tmpfs", "/run", 0, NULL) < 0)
         perror("[init] mount tmpfs (may already be mounted)");
+    else
+        fs_track_mount("/run");
 
     printf("[init] filesystems initialized (devfs, linprocfs, tmpfs)\n");
 }
@@ -208,12 +343,28 @@ static void reap_children(void)
 
 /* ---- Phase 1: Message handlers ---- */
 
-/* Handle TerminateInstance (type 14): clean shutdown */
+/* F2: Handle TerminateInstance (type 14) — graceful shutdown.
+ *
+ * Enhanced from Phase 1's simple sync()+exit() to a proper cleanup sequence:
+ *   1. Send ResultUint32 response (acknowledge the request)
+ *   2. Unmount all tracked filesystems in reverse mount order
+ *   3. sync() to flush all pending filesystem writes
+ *   4. exit(0)
+ *
+ * This mirrors the reference WSL shutdown sequence in init.cpp where
+ * the guest cleans up mounted filesystems (DrvFs, Plan9, etc.) before
+ * exiting. For the FreeBSD port, we unmount devfs/linprocfs/tmpfs that
+ * were mounted during initialize_filesystems().
+ *
+ * Edge cases:
+ *   - Unmount failure (EBUSY): retry with MNT_FORCE, log but continue
+ *   - No tracked mounts: skip unmount step entirely
+ *   - Double TerminateInstance: first call exits before second can arrive */
 static void handle_terminate_instance(int init_fd, MESSAGE_HEADER *hdr)
 {
-    printf("[init] received TerminateInstance, shutting down\n");
+    printf("[init] received TerminateInstance, initiating graceful shutdown\n");
 
-    /* Send success response */
+    /* 1. Send success response immediately so the host knows we're shutting down */
     RESULT_MESSAGE_UINT32 resp;
     memset(&resp, 0, sizeof(resp));
     resp.Header.MessageType = LxMessageResultUint32;
@@ -221,9 +372,21 @@ static void handle_terminate_instance(int init_fd, MESSAGE_HEADER *hdr)
     resp.Header.SequenceNumber = hdr->SequenceNumber;
     resp.Result = 0;
     send_all(init_fd, &resp, sizeof(resp));
+    printf("[init] sent TerminateInstance response (seq=%u, result=0)\n",
+           hdr->SequenceNumber);
 
-    /* Clean up and exit */
+    /* 2. Unmount tracked filesystems in reverse order */
+    if (g_mounted_count > 0) {
+        printf("[init] unmounting %d filesystem(s)...\n", g_mounted_count);
+        int unmounted = fs_unmount_all();
+        printf("[init] unmounted %d/%d filesystem(s)\n", unmounted, g_mounted_count);
+    }
+
+    /* 3. Sync to flush all pending writes */
     sync();
+    printf("[init] sync complete, exiting\n");
+
+    /* 4. Exit */
     exit(0);
 }
 
@@ -334,6 +497,14 @@ static void event_loop(int init_fd, int notify_fd)
                     gns_handle_network_information(full_msg, hdr.MessageSize);
                     break;
 
+                /* A3: TimezoneInformation(7) — host pushes timezone update */
+                case LxInitMessageTimezoneInformation: {
+                    int auto_tz = g_wsl_conf_parsed
+                                  ? g_wsl_conf.time_use_windows_timezone : 1;
+                    timezone_handle_message(full_msg, hdr.MessageSize, auto_tz);
+                    break;
+                }
+
                 case LxInitMessageStartSocketRelay: {
                     struct relay_state rs;
                     memset(&rs, 0, sizeof(rs));
@@ -353,6 +524,53 @@ static void event_loop(int init_fd, int notify_fd)
                 case LxInitMessageQueryVmId:
                     gns_handle_query_vm_id(init_fd, full_msg, hdr.MessageSize);
                     break;
+
+                /* B1: RemountDrvfs(13) — host requests DrvFs remount in namespace.
+                 * Parses LX_INIT_MOUNT_DRVFS message, mounts specified volumes,
+                 * sends RESULT_MESSAGE_INT32 response.
+                 * Reference: init.cpp line 2448, config.cpp ConfigRemountDrvFsImpl() */
+                case LxInitMessageRemountDrvfs: {
+                    if (hdr.MessageSize < sizeof(LX_INIT_MOUNT_DRVFS)) {
+                        fprintf(stderr, "[init] B1: RemountDrvfs too small (%u < %zu)\n",
+                                hdr.MessageSize, sizeof(LX_INIT_MOUNT_DRVFS));
+                        RESULT_MESSAGE_INT32 resp;
+                        memset(&resp, 0, sizeof(resp));
+                        resp.Header.MessageType = LxMessageResultInt32;
+                        resp.Header.MessageSize = sizeof(resp);
+                        resp.Header.SequenceNumber = hdr.SequenceNumber;
+                        resp.Result = -1;
+                        send_all(init_fd, &resp, sizeof(resp));
+                        break;
+                    }
+                    LX_INIT_MOUNT_DRVFS *mnt = (LX_INIT_MOUNT_DRVFS *)full_msg;
+                    printf("[init] B1: RemountDrvfs admin=%d volumes=0x%08x uid=%d\n",
+                           mnt->Admin, mnt->VolumesToMount, mnt->DefaultOwnerUid);
+
+                    const char *prefix = (g_wsl_conf_parsed &&
+                                          g_wsl_conf.automount_root)
+                                         ? g_wsl_conf.automount_root : "/mnt";
+                    const char *opts = (g_wsl_conf_parsed &&
+                                        g_wsl_conf.automount_options)
+                                       ? g_wsl_conf.automount_options : NULL;
+                    int mounted = drvfs_mount_volumes(mnt->VolumesToMount,
+                                                       (uid_t)mnt->DefaultOwnerUid,
+                                                       mnt->Admin ? 1 : 0,
+                                                       prefix, opts,
+                                                       g_config_parsed
+                                                       ? g_config.feature_flags : 0,
+                                                       fs_track_mount);
+
+                    RESULT_MESSAGE_INT32 resp;
+                    memset(&resp, 0, sizeof(resp));
+                    resp.Header.MessageType = LxMessageResultInt32;
+                    resp.Header.MessageSize = sizeof(resp);
+                    resp.Header.SequenceNumber = hdr.SequenceNumber;
+                    resp.Result = 0;
+                    send_all(init_fd, &resp, sizeof(resp));
+                    printf("[init] B1: RemountDrvfs response sent (result=0, mounted=%d)\n",
+                           mounted);
+                    break;
+                }
 
                 default:
                     printf("[init] unhandled message type %u (size=%u, seq=%u)\n",
@@ -643,6 +861,139 @@ printf("[capability] Host closed connection before first message\n");
                     /* Still send a response with default values */
                 }
 
+                /* A2: Parse /etc/wsl.conf after Initialize message.
+                 * This reads per-distribution settings (automount, interop,
+                 * network, user.default, etc.) and applies them.
+                 * If user.default is set, look up the UID via getpwnam()
+                 * and override DefaultUid (mirrors config.cpp:692). */
+                wsl_conf_init(&g_wsl_conf);
+                if (wsl_conf_parse_file(&g_wsl_conf, "/etc/wsl.conf") == 0) {
+                    g_wsl_conf_parsed = 1;
+                    wsl_conf_dump(&g_wsl_conf);
+
+                    /* A2: If user.default is set, resolve UID and override DefaultUid */
+                    if (g_wsl_conf.user_default && g_config_parsed) {
+                        struct passwd *pw = getpwnam(g_wsl_conf.user_default);
+                        if (pw) {
+                            g_config.drvfs_default_owner = pw->pw_uid;
+                            printf("[init] wsl.conf user.default='%s' -> UID=%u\n",
+                                   g_wsl_conf.user_default, g_config.drvfs_default_owner);
+                        } else {
+                            fprintf(stderr, "[init] wsl.conf user.default='%s' not found\n",
+                                    g_wsl_conf.user_default);
+                        }
+                    }
+                }
+
+                /* A3: Apply timezone from Initialize(5) message.
+                 * The timezone is an IANA identifier (e.g. "Asia/Shanghai")
+                 * extracted from the message's TimezoneOffset field.
+                 * Gated by time.useWindowsTimezone (default true).
+                 * Reference: config.cpp line 876, timezone.cpp UpdateTimezone() */
+                if (g_config_parsed && g_config.timezone) {
+                    int auto_tz = g_wsl_conf_parsed
+                                  ? g_wsl_conf.time_use_windows_timezone : 1;
+                    timezone_apply(g_config.timezone, auto_tz);
+                }
+
+                /* A4: Set hostname and generate /etc/hosts.
+                 * The hostname comes from Initialize(5) message, optionally
+                 * overridden by [network] hostname in /etc/wsl.conf.
+                 * /etc/hosts generation is gated by generateHosts (default true).
+                 * Reference: config.cpp ConfigInitializeInstance() lines 738-837 */
+                if (g_config_parsed) {
+                    const char *conf_host = g_wsl_conf_parsed
+                                            ? g_wsl_conf.network_hostname : NULL;
+                    network_apply_hostname(g_config.hostname, conf_host);
+                    network_apply_domainname(g_config.domainname);
+
+                    int gen_hosts = g_wsl_conf_parsed
+                                    ? g_wsl_conf.network_generate_hosts : 1;
+                    network_generate_hosts(g_config.hostname,
+                                           g_config.domainname,
+                                           g_config.windows_hosts,
+                                           gen_hosts);
+                }
+
+                /* B1: Mount DrvFs volumes if automount is enabled.
+                 * Triggered by Initialize(5) DrvfsMount field (None/NonElevated/Elevated)
+                 * and DrvFsVolumesBitmap (bit 0=A:, bit 2=C:, etc.).
+                 * Mount prefix and options come from /etc/wsl.conf [automount].
+                 * Best-effort: mount failures are logged but non-fatal.
+                 * Reference: config.cpp ConfigMountDrvFsVolumes() lines 1913-2022,
+                 *            drvfs.cpp MountDrvfs() lines 306-403 */
+                if (g_config_parsed && g_config.drvfs_mount != 0) {
+                    int auto_mount = g_wsl_conf_parsed
+                                     ? g_wsl_conf.automount_enabled : 1;
+                    if (auto_mount) {
+                        const char *prefix = (g_wsl_conf_parsed &&
+                                              g_wsl_conf.automount_root)
+                                             ? g_wsl_conf.automount_root : "/mnt";
+                        const char *opts = (g_wsl_conf_parsed &&
+                                            g_wsl_conf.automount_options)
+                                           ? g_wsl_conf.automount_options : NULL;
+                        printf("[init] B1: mounting DrvFs volumes (mount=%u, bitmap=0x%08x)\n",
+                               g_config.drvfs_mount, g_config.drvfs_volumes_bitmap);
+                        drvfs_mount_volumes(g_config.drvfs_volumes_bitmap,
+                                            g_config.drvfs_default_owner,
+                                            g_config.drvfs_elevated,
+                                            prefix, opts,
+                                            g_config.feature_flags,
+                                            fs_track_mount);
+                    } else {
+                        printf("[init] B1: DrvFs automount disabled by wsl.conf\n");
+                    }
+                }
+
+                /* E1: Register binfmt_misc WSLInterop handler.
+                 * Allows Windows PE executables to be run from the guest
+                 * by relaying to the host via the interop channel.
+                 * Gated by boot.protectBinfmt (default true).
+                 * On FreeBSD: skipped gracefully (no binfmt_misc). */
+                {
+                    int protect = g_wsl_conf_parsed
+                                  ? g_wsl_conf.boot_protect_binfmt : 1;
+                    binfmt_setup(protect);
+                }
+
+                /* E2: Execute boot.command from /etc/wsl.conf.
+                 * Runs a custom startup command before the main event loop.
+                 * Failures are logged but non-fatal.
+                 * Reference: config.cpp ConfigInitializeInstance() line 858 */
+                if (g_wsl_conf_parsed && g_wsl_conf.boot_command) {
+                    printf("[init] E2: executing boot.command: '%s'\n",
+                           g_wsl_conf.boot_command);
+                    int rc = system(g_wsl_conf.boot_command);
+                    if (rc == -1) {
+                        perror("[init] boot.command system() failed");
+                    } else if (rc != 0) {
+                        fprintf(stderr, "[init] boot.command exited with code %d\n",
+                                WEXITSTATUS(rc));
+                    } else {
+                        printf("[init] E2: boot.command completed successfully\n");
+                    }
+                }
+
+                /* E3: Apply wsl.conf network.generateResolvConf setting.
+                 * When false, GNS engine skips writing /etc/resolv.conf. */
+                {
+                    int gen_resolv = g_wsl_conf_parsed
+                                     ? g_wsl_conf.network_generate_resolvconf : 1;
+                    g_generate_resolvconf = gen_resolv;
+                    printf("[init] E3: generateResolvConf=%d\n", gen_resolv);
+                }
+
+                /* E3: Apply interop.appendWindowsPath setting.
+                 * When true (default), Windows PATH is appended to guest PATH.
+                 * Stored as env var for interop server and bridge to check. */
+                {
+                    int append_path = g_wsl_conf_parsed
+                                      ? g_wsl_conf.interop_append_windows_path : 1;
+                    setenv("WSL_APPEND_WINDOWS_PATH",
+                           append_path ? "1" : "0", 1);
+                    printf("[init] E3: appendWindowsPath=%d\n", append_path);
+                }
+
                 send_configuration_info_response(init_fd, init_hdr.SequenceNumber);
                 free(full_msg);
             }
@@ -664,6 +1015,17 @@ if (r2 <= 0) {
     send_create_session_response(init_fd, PORT_HVS_BSD, create_sess.Header.SequenceNumber);
 }
 
+/* F1: Send OobeResult (type 28) after handshake completes.
+ * The host reads this to unblock session creation when RunOOBE=true.
+ * DefaultUid comes from the parsed Initialize(5) config (DrvFsDefaultOwner),
+ * or -1 if no config was parsed. */
+{
+    int64_t oobe_uid = -1;
+    if (g_config_parsed && g_config.drvfs_default_owner != 0)
+        oobe_uid = (int64_t)g_config.drvfs_default_owner;
+    send_oobe_result(init_fd, 0, oobe_uid);
+}
+
 // --- 7. Receive and echo LX_INIT_CREATE_PROCESS_UTILITY_VM ---
 // handle_create_process_utility_vm(init_fd);
 
@@ -674,6 +1036,12 @@ if (r2 <= 0) {
     if (g_config_parsed) {
         wsl_config_free(&g_config);
         g_config_parsed = 0;
+    }
+
+    /* A2: Free parsed wsl.conf */
+    if (g_wsl_conf_parsed) {
+        wsl_conf_free(&g_wsl_conf);
+        g_wsl_conf_parsed = 0;
     }
 
     /* Clean up (only reached if event loop exits) */

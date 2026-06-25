@@ -158,6 +158,12 @@ typedef struct LX_GNS_RESULT {
 
 #endif /* WSL_PROTOCOL_H */
 
+/* E3: Global flag controlling /etc/resolv.conf generation.
+ * Set from wsl.conf [network] generateResolvConf (default true).
+ * When false, gns_handle_network_information() skips writing resolv.conf.
+ * Declared as non-static so hvinit_tcp.c / hvinit.c can set it via extern. */
+static int g_generate_resolvconf = 1;
+
 /* ---- Helper: reliable send/recv (duplicated from wsl_protocol.h to keep
  *      this header self-contained for the production hvinit.c build). ---- */
 static inline int gns_send_all(int fd, const void *buf, size_t len)
@@ -256,6 +262,16 @@ static inline int gns_handle_network_information(void *msg_buf, size_t msg_size)
     printf("[gns] NetworkInformation: FileHeader='%s', FileContents='%s'\n",
            file_header ? file_header : "(null)",
            file_contents ? file_contents : "(null)");
+
+    /* E3: Check generateResolvConf flag (from wsl.conf [network]).
+     * When false, skip writing /etc/resolv.conf — the guest keeps
+     * its existing resolv.conf (user-managed or pre-configured). */
+    if (!g_generate_resolvconf) {
+        printf("[gns] generateResolvConf=false, skipping /etc/resolv.conf write\n");
+        free((void *)file_header);
+        free((void *)file_contents);
+        return 0;
+    }
 
     /* Write /etc/resolv.conf */
     const char *resolv_path = "/etc/resolv.conf";

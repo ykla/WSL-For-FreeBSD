@@ -15,10 +15,10 @@ BINARIES = wsl_mock_host hvinit_tcp hvbridge_tcp
 
 all: $(BINARIES)
 
-wsl_mock_host: wsl_mock_host.c wsl_protocol.h ../config_parser.h
+wsl_mock_host: wsl_mock_host.c wsl_protocol.h ../config_parser.h ../wsl_conf_parser.h ../timezone_handler.h ../network_config.h ../drvfs_mount.h
 	$(CC) $(CFLAGS) -o $@ wsl_mock_host.c $(LDFLAGS)
 
-hvinit_tcp: hvinit_tcp.c wsl_protocol.h ../config_parser.h ../gns_engine.h
+hvinit_tcp: hvinit_tcp.c wsl_protocol.h ../config_parser.h ../wsl_conf_parser.h ../timezone_handler.h ../network_config.h ../drvfs_mount.h ../gns_engine.h
 	$(CC) $(CFLAGS) -o $@ hvinit_tcp.c
 
 hvbridge_tcp: hvbridge_tcp.c wsl_protocol.h ../interop_server.h

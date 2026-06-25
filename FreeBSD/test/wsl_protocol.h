@@ -28,11 +28,14 @@
 #define LxInitMessageNetworkInformation           4
 #define LxInitMessageInitialize                  5
 #define LxInitMessageInitializeResponse          6
+#define LxInitMessageTimezoneInformation          7  /* A3: host->guest timezone update */
 #define LxInitMessageCreateProcessUtilityVm      8
 #define LxInitMessageExitStatus                  9
 #define LxInitMessageWindowSizeChanged           10
 #define LxInitMessageCreateProcessResponse       11
 #define LxInitMessageQueryDrvfsElevated          12
+#define LxInitMessageRemountDrvfs                13  /* B1: host->guest, remount DrvFs in namespace */
+#define LxInitMessageTerminateInstance           14
 #define LxInitMessageStartSocketRelay            15
 #define LxInitMessageQueryEnvironmentVariable    16
 #define LxInitMessageQueryFeatureFlags           17
@@ -200,6 +203,18 @@ typedef struct LX_INIT_WINDOW_SIZE_CHANGED {
     unsigned short Columns;
 } LX_INIT_WINDOW_SIZE_CHANGED;
 
+/* B1: MountDrvFs / RemountDrvfs (host -> guest, type 13)
+ * Triggers DrvFs remount in the specified mount namespace (elevated/non-elevated).
+ * Response is RESULT_MESSAGE_INT32 (type 77).
+ * Reference: lxinitshared.h LX_INIT_MOUNT_DRVFS */
+typedef struct LX_INIT_MOUNT_DRVFS {
+    struct MESSAGE_HEADER Header;
+    bool Admin;                   /* true = use elevated (admin) 9p server */
+    unsigned int VolumesToMount;  /* bitmap of drive indices to mount */
+    unsigned int UnreadableVolumes; /* bitmap of volumes that can't be read */
+    int DefaultOwnerUid;          /* UID to use for file ownership */
+} LX_INIT_MOUNT_DRVFS;
+
 /* F1: OobeResult (guest -> host, type 28)
  * Sent on a dedicated OOBE channel when the distribution's first-run
  * setup (OOBE) completes. The host blocks waiting for this message
@@ -231,6 +246,15 @@ typedef struct LX_INIT_NETWORK_INFORMATION {
     unsigned int FileContentsIndex;
     char Buffer[];
 } LX_INIT_NETWORK_INFORMATION;
+
+/* TimezoneInformation (host -> guest, type 7) — A3
+ * Buffer contains a NUL-terminated IANA timezone string at TimezoneOffset.
+ * Reference: lxinitshared.h LX_INIT_TIMEZONE_INFORMATION */
+typedef struct LX_INIT_TIMEZONE_INFORMATION {
+    struct MESSAGE_HEADER Header;
+    unsigned int TimezoneOffset;  /* offset into Buffer[] */
+    char Buffer[];
+} LX_INIT_TIMEZONE_INFORMATION;
 
 /* StartSocketRelay (host -> guest, type 15) */
 typedef struct LX_INIT_START_SOCKET_RELAY {

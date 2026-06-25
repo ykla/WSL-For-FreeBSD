@@ -829,14 +829,24 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
         }
 
         /* stdin -> PTY */
-        if (!host_disconnected && (pfds[IDX_STDIN].revents & POLLIN)) {
+        if (!host_disconnected && stdin_fd >= 0 &&
+            (pfds[IDX_STDIN].revents & POLLIN)) {
             ssize_t n = recv(stdin_fd, buf, sizeof(buf), 0);
             if (n > 0) {
                 /* FIX: use write_all to handle partial writes / EAGAIN */
                 write_all(master_fd, buf, (size_t)n);
             } else if (n == 0) {
+                /* FIX: stdin EOF — remove fd from poll set to prevent
+                 * infinite loop (poll would keep returning POLLIN with
+                 * recv() returning 0). Don't end the session; the shell
+                 * may still be running and producing output on the PTY. */
                 printf("[bridge] stdin closed\n");
-                /* Don't end session on stdin close; shell may still be running */
+                stdin_fd = -1;
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                       errno != EINTR) {
+                /* On a persistent read error, also stop polling stdin. */
+                printf("[bridge] stdin recv error: %s\n", strerror(errno));
+                stdin_fd = -1;
             }
         }
 

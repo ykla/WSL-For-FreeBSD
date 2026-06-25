@@ -23,6 +23,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <pwd.h>    /* A2: for getpwnam() to resolve user.default */
 
 #include "wsl_protocol.h"
 
@@ -30,9 +31,29 @@
  * wsl_protocol.h already defines struct MESSAGE_HEADER and LxInitMessageInitialize. */
 #include "../config_parser.h"
 
+/* A2: Include /etc/wsl.conf parser */
+#include "../wsl_conf_parser.h"
+
+/* A3: Include timezone handler */
+#include "../timezone_handler.h"
+
+/* A4: Include network configuration (hostname/hosts generation) */
+#include "../network_config.h"
+
+/* B1: Include DrvFs mount module */
+#include "../drvfs_mount.h"
+
+/* E1: Include binfmt_misc handler */
+#include "../binfmt_handler.h"
+
 /* A1: Global parsed configuration from Initialize(5) message. */
 static struct wsl_config g_config;
 static int g_config_parsed = 0;
+
+/* A2: Global parsed /etc/wsl.conf configuration. */
+static struct wsl_conf g_wsl_conf;
+static int g_wsl_conf_parsed = 0;
+
 #include "../gns_engine.h"
 
 /* Phase 1: additional message types for event loop */
@@ -297,6 +318,14 @@ static void event_loop(int init_fd, int notify_fd)
                     gns_handle_network_information(full_msg, hdr.MessageSize);
                     break;
 
+                /* A3: TimezoneInformation(7) — host pushes timezone update */
+                case LxInitMessageTimezoneInformation: {
+                    int auto_tz = g_wsl_conf_parsed
+                                  ? g_wsl_conf.time_use_windows_timezone : 1;
+                    timezone_handle_message(full_msg, hdr.MessageSize, auto_tz);
+                    break;
+                }
+
                 case LxInitMessageStartSocketRelay: {
                     struct relay_state rs;
                     memset(&rs, 0, sizeof(rs));
@@ -316,6 +345,56 @@ static void event_loop(int init_fd, int notify_fd)
                 case LxInitMessageQueryVmId:
                     gns_handle_query_vm_id(init_fd, full_msg, hdr.MessageSize);
                     break;
+
+                /* B1: RemountDrvfs(13) — host requests DrvFs remount in namespace.
+                 * Parses LX_INIT_MOUNT_DRVFS message, mounts specified volumes,
+                 * sends RESULT_MESSAGE_INT32 response.
+                 * Reference: init.cpp line 2448, config.cpp ConfigRemountDrvFsImpl() */
+                case LxInitMessageRemountDrvfs: {
+                    if (hdr.MessageSize < sizeof(LX_INIT_MOUNT_DRVFS)) {
+                        fprintf(stderr, "[init] B1: RemountDrvfs too small (%u < %zu)\n",
+                                hdr.MessageSize, sizeof(LX_INIT_MOUNT_DRVFS));
+                        /* Send error response */
+                        RESULT_MESSAGE_INT32 resp;
+                        memset(&resp, 0, sizeof(resp));
+                        resp.Header.MessageType = LxMessageResultInt32;
+                        resp.Header.MessageSize = sizeof(resp);
+                        resp.Header.SequenceNumber = hdr.SequenceNumber;
+                        resp.Result = -1;
+                        send_all(init_fd, &resp, sizeof(resp));
+                        break;
+                    }
+                    LX_INIT_MOUNT_DRVFS *mnt = (LX_INIT_MOUNT_DRVFS *)full_msg;
+                    printf("[init] B1: RemountDrvfs admin=%d volumes=0x%08x uid=%d\n",
+                           mnt->Admin, mnt->VolumesToMount, mnt->DefaultOwnerUid);
+
+                    const char *prefix = (g_wsl_conf_parsed &&
+                                          g_wsl_conf.automount_root)
+                                         ? g_wsl_conf.automount_root : "/mnt";
+                    const char *opts = (g_wsl_conf_parsed &&
+                                        g_wsl_conf.automount_options)
+                                       ? g_wsl_conf.automount_options : NULL;
+                    int mounted = drvfs_mount_volumes(mnt->VolumesToMount,
+                                                       (uid_t)mnt->DefaultOwnerUid,
+                                                       mnt->Admin ? 1 : 0,
+                                                       prefix, opts,
+                                                       g_config_parsed
+                                                       ? g_config.feature_flags : 0,
+                                                       fs_track_mount);
+
+                    /* Send ResultInt32 response (0 = success, regardless of
+                     * individual mount failures — best-effort strategy). */
+                    RESULT_MESSAGE_INT32 resp;
+                    memset(&resp, 0, sizeof(resp));
+                    resp.Header.MessageType = LxMessageResultInt32;
+                    resp.Header.MessageSize = sizeof(resp);
+                    resp.Header.SequenceNumber = hdr.SequenceNumber;
+                    resp.Result = 0;
+                    send_all(init_fd, &resp, sizeof(resp));
+                    printf("[init] B1: RemountDrvfs response sent (result=0, mounted=%d)\n",
+                           mounted);
+                    break;
+                }
 
                 default:
                     printf("[init] unhandled message type %u (size=%u, seq=%u)\n",
@@ -519,6 +598,151 @@ int main(void)
                         printf("[init] Initialize too small for full parse, using defaults\n");
                     }
 
+                    /* A2: Parse /etc/wsl.conf after Initialize message.
+                     * This reads per-distribution settings (automount, interop,
+                     * network, user.default, etc.) and applies them.
+                     * If user.default is set, look up the UID via getpwnam()
+                     * and override DefaultUid (mirrors config.cpp:692). */
+                    wsl_conf_init(&g_wsl_conf);
+                    if (wsl_conf_parse_file(&g_wsl_conf, "/etc/wsl.conf") == 0) {
+                        g_wsl_conf_parsed = 1;
+                        wsl_conf_dump(&g_wsl_conf);
+
+                        /* A2: If user.default is set, resolve UID and override DefaultUid */
+                        if (g_wsl_conf.user_default && g_config_parsed) {
+                            struct passwd *pw = getpwnam(g_wsl_conf.user_default);
+                            if (pw) {
+                                g_config.drvfs_default_owner = pw->pw_uid;
+                                printf("[init] wsl.conf user.default='%s' -> UID=%u\n",
+                                       g_wsl_conf.user_default, g_config.drvfs_default_owner);
+                            } else {
+                                fprintf(stderr, "[init] wsl.conf user.default='%s' not found\n",
+                                        g_wsl_conf.user_default);
+                            }
+                        }
+                    }
+
+                    /* A3: Apply timezone from Initialize(5) message.
+                     * The timezone is an IANA identifier (e.g. "Asia/Shanghai")
+                     * extracted from the message's TimezoneOffset field.
+                     * Gated by time.useWindowsTimezone (default true).
+                     * Reference: config.cpp line 876, timezone.cpp UpdateTimezone() */
+                    if (g_config_parsed && g_config.timezone) {
+                        int auto_tz = g_wsl_conf_parsed
+                                      ? g_wsl_conf.time_use_windows_timezone : 1;
+                        timezone_apply(g_config.timezone, auto_tz);
+                    }
+
+                    /* A4: Set hostname and generate /etc/hosts.
+                     * The hostname comes from Initialize(5) message, optionally
+                     * overridden by [network] hostname in /etc/wsl.conf.
+                     * /etc/hosts generation is gated by generateHosts (default true).
+                     * Reference: config.cpp ConfigInitializeInstance() lines 738-837 */
+                    if (g_config_parsed) {
+                        const char *conf_host = g_wsl_conf_parsed
+                                                ? g_wsl_conf.network_hostname : NULL;
+                        network_apply_hostname(g_config.hostname, conf_host);
+                        network_apply_domainname(g_config.domainname);
+
+                        int gen_hosts = g_wsl_conf_parsed
+                                        ? g_wsl_conf.network_generate_hosts : 1;
+                        network_generate_hosts(g_config.hostname,
+                                               g_config.domainname,
+                                               g_config.windows_hosts,
+                                               gen_hosts);
+                    }
+
+                    /* B1: Mount DrvFs volumes if automount is enabled.
+                     * Triggered by Initialize(5) DrvfsMount field (None/NonElevated/Elevated)
+                     * and DrvFsVolumesBitmap (bit 0=A:, bit 2=C:, etc.).
+                     * Mount prefix and options come from /etc/wsl.conf [automount].
+                     * Best-effort: mount failures are logged but non-fatal
+                     * (no 9p server in test environment, no 9p kernel module on FreeBSD).
+                     * Reference: config.cpp ConfigMountDrvFsVolumes() lines 1913-2022,
+                     *            drvfs.cpp MountDrvfs() lines 306-403 */
+                    if (g_config_parsed && g_config.drvfs_mount != 0) {
+                        int auto_mount = g_wsl_conf_parsed
+                                         ? g_wsl_conf.automount_enabled : 1;
+                        if (auto_mount) {
+                            const char *prefix = (g_wsl_conf_parsed &&
+                                                  g_wsl_conf.automount_root)
+                                                 ? g_wsl_conf.automount_root : "/mnt";
+                            const char *opts = (g_wsl_conf_parsed &&
+                                                g_wsl_conf.automount_options)
+                                               ? g_wsl_conf.automount_options : NULL;
+                            printf("[init] B1: mounting DrvFs volumes (mount=%u, bitmap=0x%08x)\n",
+                                   g_config.drvfs_mount, g_config.drvfs_volumes_bitmap);
+                            drvfs_mount_volumes(g_config.drvfs_volumes_bitmap,
+                                                g_config.drvfs_default_owner,
+                                                g_config.drvfs_elevated,
+                                                prefix, opts,
+                                                g_config.feature_flags,
+                                                fs_track_mount);
+                        } else {
+                            printf("[init] B1: DrvFs automount disabled by wsl.conf\n");
+                        }
+                    }
+
+                    /* E1: Register binfmt_misc WSLInterop handler.
+                     * Allows Windows PE executables to be run from the guest
+                     * by relaying to the host via the interop channel.
+                     * Gated by boot.protectBinfmt (default true) which makes
+                     * the handler immutable.
+                     * On FreeBSD/test: skipped gracefully (no binfmt_misc).
+                     * Reference: binfmt.cpp RegisterBinfmtInterop() */
+                    {
+                        int protect = g_wsl_conf_parsed
+                                      ? g_wsl_conf.boot_protect_binfmt : 1;
+                        binfmt_setup(protect);
+                    }
+
+                    /* E2: Execute boot.command from /etc/wsl.conf.
+                     * This runs a custom startup command (e.g. starting a
+                     * daemon, configuring kernel parameters) before the
+                     * guest enters its main event loop.
+                     * Failures are logged but non-fatal.
+                     * Reference: config.cpp ConfigInitializeInstance() line 858 */
+                    if (g_wsl_conf_parsed && g_wsl_conf.boot_command) {
+                        printf("[init] E2: executing boot.command: '%s'\n",
+                               g_wsl_conf.boot_command);
+                        int rc = system(g_wsl_conf.boot_command);
+                        if (rc == -1) {
+                            perror("[init] boot.command system() failed");
+                        } else if (rc != 0) {
+                            fprintf(stderr, "[init] boot.command exited with code %d\n",
+                                    WEXITSTATUS(rc));
+                        } else {
+                            printf("[init] E2: boot.command completed successfully\n");
+                        }
+                    }
+
+                    /* E3: Apply wsl.conf network.generateResolvConf setting.
+                     * When false, the GNS engine should NOT overwrite
+                     * /etc/resolv.conf when NetworkInformation(4) arrives.
+                     * The flag is stored as a global in gns_engine.h.
+                     * Reference: config.cpp line 753, gns.cpp UpdateResolvConf() */
+                    {
+                        int gen_resolv = g_wsl_conf_parsed
+                                         ? g_wsl_conf.network_generate_resolvconf : 1;
+                        g_generate_resolvconf = gen_resolv;
+                        printf("[init] E3: generateResolvConf=%d\n", gen_resolv);
+                    }
+
+                    /* E3: Apply interop.appendWindowsPath setting.
+                     * When true (default), the Windows PATH is appended to
+                     * the guest PATH so Windows executables are accessible
+                     * by name. When false, Windows PATH is not added.
+                     * We store this as an environment variable that the
+                     * interop server and bridge check when spawning processes.
+                     * Reference: config.cpp line 760 */
+                    {
+                        int append_path = g_wsl_conf_parsed
+                                          ? g_wsl_conf.interop_append_windows_path : 1;
+                        setenv("WSL_APPEND_WINDOWS_PATH",
+                               append_path ? "1" : "0", 1);
+                        printf("[init] E3: appendWindowsPath=%d\n", append_path);
+                    }
+
                     send_configuration_info_response(init_fd, init_hdr.SequenceNumber);
                     free(full_msg);
                 }
@@ -580,6 +804,12 @@ int main(void)
     if (g_config_parsed) {
         wsl_config_free(&g_config);
         g_config_parsed = 0;
+    }
+
+    /* A2: Free parsed wsl.conf */
+    if (g_wsl_conf_parsed) {
+        wsl_conf_free(&g_wsl_conf);
+        g_wsl_conf_parsed = 0;
     }
 
     /* Clean up (only reached if event loop exits) */
