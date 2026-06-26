@@ -24,9 +24,7 @@
 
 CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -O2 -g -std=gnu11 -D__FreeBSD__=1
-# lib9p headers: main header + backend/ + transport/ subdirs
-CFLAGS  += -I/usr/local/include
-LDFLAGS ?= -L/usr/local/lib -lutil -levent -l9p
+LDFLAGS ?= -lutil -levent -l9p
 
 # Installation paths
 PREFIX     ?= /usr/local
