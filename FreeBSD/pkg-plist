@@ -1,0 +1,6 @@
+libexec/wsl/hvinit
+libexec/wsl/hvbridge
+bin/wslpath
+bin/wslinfo
+etc/rc.d/wsl_init
+@comment Empty plist - files listed in PLIST_FILES in Makefile
