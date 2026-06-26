@@ -70,6 +70,7 @@
 
 #include "wsl_protocol.h"
 #include "../terminal_notify.h"
+#include "../logger.h"
 #include "../interop_server.h"
 #include "../wsl_interop.h"
 

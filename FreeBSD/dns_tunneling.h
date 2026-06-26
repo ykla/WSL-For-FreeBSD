@@ -314,6 +314,9 @@ static inline int dns_channel_send(struct dns_tunnel *t, uint8_t protocol,
     }
     printf("[dns] → host: proto=%s id=%u len=%zu\n",
            protocol == IPPROTO_UDP ? "UDP" : "TCP", client_id, dns_len);
+#ifdef LOGGER_H
+    g_log_stats.dns_relays++;
+#endif
     return 0;
 }
 

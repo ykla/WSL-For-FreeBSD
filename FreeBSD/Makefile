@@ -48,11 +48,12 @@ WSLINFO_SRCS = wslinfo.c
 #                wsl_conf_parser.h, timezone_handler.h, network_config.h,
 #                drvfs_mount.h, binfmt_handler.h, plan9_server.h
 #   hvbridge.c -> terminal_notify.h, interop_server.h, wsl_interop.h
-#   wsl-interop.c is included by wsl_interop.h as a .c header.
+#   wsl-interop.c is included by wsl_interop.h as a .c
+# Headers that trigger rebuild.
 HDRS = gns_engine.h plan9_server.h dns_tunneling.h port_tracker.h \
        drvfs_mount.h interop_server.h wsl_interop.h wsl_conf_parser.h \
        config_parser.h timezone_handler.h network_config.h binfmt_handler.h \
-       terminal_notify.h wsl-interop.c
+       terminal_notify.h wsl-interop.c logger.h
 
 all: $(BINS)
 

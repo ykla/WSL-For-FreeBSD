@@ -427,6 +427,9 @@ static inline int port_tracker_poll(struct port_tracker *t, int gns_fd)
     free(t->entries);
     t->entries = current;
     t->count = (size_t)cur_count;
+#ifdef LOGGER_H
+    g_log_stats.port_events += (unsigned long)(added + removed);
+#endif
     if (t->count > t->cap) t->cap = t->count;
 
     if (added || removed) {

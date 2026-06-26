@@ -44,6 +44,19 @@
 #include <sys/wait.h>
 #include <spawn.h>
 
+/* Conditional logger support */
+#ifdef LOGGER_H
+#define IOP_LOG_ERROR(mod, ...)   LOG_ERROR(mod, __VA_ARGS__)
+#define IOP_LOG_WARN(mod, ...)    LOG_WARN(mod, __VA_ARGS__)
+#define IOP_LOG_INFO(mod, ...)    LOG_INFO(mod, __VA_ARGS__)
+#define IOP_LOG_DEBUG(mod, ...)   LOG_DEBUG(mod, __VA_ARGS__)
+#else
+#define IOP_LOG_ERROR(mod, ...)   do { fprintf(stderr, "[%s] ", mod); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#define IOP_LOG_WARN(mod, ...)    do { fprintf(stderr, "[%s] ", mod); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#define IOP_LOG_INFO(mod, ...)    do { printf("[%s] ", mod); printf(__VA_ARGS__); printf("\n"); } while(0)
+#define IOP_LOG_DEBUG(mod, ...)   do { printf("[%s] ", mod); printf(__VA_ARGS__); printf("\n"); } while(0)
+#endif
+
 /* ===================================================================
  * VM GUID helper (interop-local, independent of gns_engine.h)
  * ===================================================================
@@ -476,6 +489,16 @@ static inline int interop_process_message(int fd, void *msg, size_t msg_size)
                    cp->CommandLineOffset < buffer_size) {
             cmdline = buffer + cp->CommandLineOffset;
         }
+        /* Task Group B: verify the command line is NUL-terminated
+         * within the buffer bounds. Use strnlen to prevent reading
+         * past the buffer on malformed messages. */
+        if (cmdline) {
+            size_t cmd_max = buffer_size - (size_t)(cmdline - buffer);
+            if (strnlen(cmdline, cmd_max) >= cmd_max) {
+                printf("[interop] CreateProcess: unterminated command line\n");
+                cmdline = NULL;
+            }
+        }
         if (!cmdline || !cmdline[0]) {
             printf("[interop] CreateProcess: empty command line\n");
             interop_send_create_process_response(fd, hdr->SequenceNumber,
@@ -507,11 +530,21 @@ static inline int interop_process_message(int fd, void *msg, size_t msg_size)
                 const char *env_end = buffer + buffer_size;
                 const char *p = env_start;
                 for (uint16_t i = 0; i < cp->EnvironmentCount && p < env_end; i++) {
-                    /* Each entry is NUL-terminated */
+                    /* Each entry is NUL-terminated — verify we don't
+                     * walk past the buffer end. */
+                    size_t remaining = (size_t)(env_end - p);
+                    if (remaining == 0) break;
+                    /* Task Group B: ensure NUL terminator exists within bounds */
+                    size_t entry_len = strnlen(p, remaining);
+                    if (entry_len >= remaining) {
+                        fprintf(stderr, "[interop] env entry %u: "
+                                "unterminated string, skipping\n", i);
+                        break;
+                    }
                     if (p[0]) {
                         putenv(strdup(p));  /* strdup: safe in child before exec */
                     }
-                    p += strlen(p) + 1;
+                    p += entry_len + 1;
                 }
             }
 

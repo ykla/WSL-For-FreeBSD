@@ -363,7 +363,8 @@ main(int argc, char *argv[])
         MODE_NETWORKING_MODE,
         MODE_VERSION,
         MODE_WSL_VERSION,
-        MODE_NAME
+        MODE_NAME,
+        MODE_DIAG
     } mode = MODE_NONE;
 
     bool no_newline = false;
@@ -394,6 +395,10 @@ main(int argc, char *argv[])
         else if (strcmp(argv[i], "--name") == 0)
         {
             mode = MODE_NAME;
+        }
+        else if (strcmp(argv[i], "--diag") == 0)
+        {
+            mode = MODE_DIAG;
         }
         else if (strcmp(argv[i], "-n") == 0)
         {

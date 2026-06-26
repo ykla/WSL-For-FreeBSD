@@ -47,6 +47,8 @@
 /* E1: Include binfmt_misc handler */
 #include "../binfmt_handler.h"
 
+#include "../logger.h"
+
 /* Group A: Include Plan9 file server module.
  * Uses lib9p on FreeBSD (hvsocket 50001), 9P stub on Linux (TCP 50001). */
 #include "../plan9_server.h"

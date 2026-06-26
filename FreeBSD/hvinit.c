@@ -19,6 +19,7 @@
 #include <pwd.h>    /* A2: for getpwnam() to resolve user.default */
 #include <sys/utsname.h>  /* Group B: uname() for KernelVersion(18) */
 
+#include "logger.h"
 #include "gns_engine.h"
 
 /* B (DNS Tunneling): Include DNS tunneling module.
@@ -571,14 +572,17 @@ static void event_loop(int init_fd, int notify_fd)
         if (pfds[0].revents & POLLIN) {
             MESSAGE_HEADER hdr;
             if (recv_all(init_fd, &hdr, sizeof(hdr)) < 0) {
-                printf("[init] host disconnected from init channel\n");
+                LOG_WARN("init", "host disconnected from init channel");
                 break;
             }
 
             if (hdr.MessageSize < sizeof(hdr)) {
-                printf("[init] invalid message size %u\n", hdr.MessageSize);
+                LOG_WARN("init", "invalid message size %u", hdr.MessageSize);
+                g_log_stats.errors++;
                 continue;
             }
+
+            g_log_stats.messages_rx++;
 
             /* Read payload */
             size_t payload_len = hdr.MessageSize - sizeof(hdr);
@@ -785,9 +789,15 @@ static void event_loop(int init_fd, int notify_fd)
                      * On Linux test harness: command will fail (no virtiofs
                      * kernel module) — log and return Result=0 for testing. */
                     char cmd[512];
-                    snprintf(cmd, sizeof(cmd),
+                    int n = snprintf(cmd, sizeof(cmd),
                              "mount -t virtiofs wsl-virtiofs %s -o %s 2>/dev/null",
                              path, options);
+                    /* Task Group B: check for truncation */
+                    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+                        fprintf(stderr, "[init] Group B: AddVirtioFsDevice "
+                                "mount command truncated\n");
+                        cmd[sizeof(cmd) - 1] = '\0';
+                    }
                     int mrc = system(cmd);
                     (void)mrc;  /* best-effort */
 
@@ -909,8 +919,9 @@ static void event_loop(int init_fd, int notify_fd)
                 }
 
                 default:
-                    printf("[init] unhandled message type %u (size=%u, seq=%u)\n",
+                    LOG_WARN("init", "unhandled message type %u (size=%u, seq=%u)",
                            hdr.MessageType, hdr.MessageSize, hdr.SequenceNumber);
+                    g_log_stats.errors++;
                     break;
                 }
                 free(full_msg);
@@ -1003,8 +1014,9 @@ void send_configuration_info_response(int init_fd, unsigned int seq) {
 
     ssize_t sent = send(init_fd, resp, msglen, 0);
     if (sent < 0) {
-        perror("[init] send configuration_info_response");
+        LOG_ERROR("init", "send configuration_info_response: %s", strerror(errno));
     } else {
+        g_log_stats.messages_tx++;
         printf("[init] sent LX_INIT_CONFIGURATION_INFORMATION_RESPONSE (%zd bytes, DefaultUid=%u)\n",
                sent, resp->DefaultUid);
     }
@@ -1070,6 +1082,8 @@ static int hv_connect(unsigned int port) {
 }
 
 int main(void) {
+    log_init("hvinit");
+    log_stats_init();
     gns_configure_test_paths();
 
     /* Phase 1: Initialize filesystems before handshake */
@@ -1078,7 +1092,8 @@ int main(void) {
     /* === 1. Capability socket === */
     int cap_fd = hv_connect(PORT_HVS);
     if (cap_fd < 0) {
-        fprintf(stderr, "Failed to establish capability socket\n");
+        LOG_ERROR("init", "Failed to establish capability socket");
+        g_log_stats.errors++;
         return 1;
     }
 
@@ -1092,19 +1107,21 @@ int main(void) {
     strcpy(msg->Buffer, kver);
 
     if (send(cap_fd, msg, msglen, 0) < 0) {
-        perror("send mini_init");
+        LOG_ERROR("init", "send mini_init: %s", strerror(errno));
         free(msg);
         close(cap_fd);
+        g_log_stats.errors++;
         return 1;
     }
     free(msg);
+    g_log_stats.messages_tx++;
 
 printf("[capability] sent capabilities: %s\n", kver);
 
     /* === 2. Notify socket === */
     int notify_fd = hv_connect(PORT_HVS);
     if (notify_fd < 0) {
-        fprintf(stderr, "Failed to establish notify socket\n");
+        LOG_WARN("init", "Failed to establish notify socket");
         // continue anyway, still have cap_fd
     } else {
         printf("[notify] socket connected (fd=%d)\n", notify_fd);
@@ -1116,12 +1133,13 @@ printf("[capability] sent capabilities: %s\n", kver);
         buf[r] = '\0';
         printf("[capability] first message received (%zd bytes): %s\n", r, buf);
     } else if (r == 0) {
-printf("[capability] Host closed connection before first message\n");
+        LOG_ERROR("init", "Host closed capability connection before first message");
+        g_log_stats.errors++;
         close(cap_fd);
         if (notify_fd >= 0) close(notify_fd);
         return 1;
     } else {
-        perror("[capability] recv");
+        LOG_ERROR("init", "capability recv: %s", strerror(errno));
         close(cap_fd);
         if (notify_fd >= 0) close(notify_fd);
         return 1;
@@ -1129,7 +1147,8 @@ printf("[capability] Host closed connection before first message\n");
     /* === 4. Create init socket after first message === */
     int init_fd = hv_connect(PORT_HVS);
     if (init_fd < 0) {
-        fprintf(stderr, "Failed to establish init socket\n");
+        LOG_ERROR("init", "Failed to establish init socket");
+        g_log_stats.errors++;
     } else {
         printf("[init] socket connected (fd=%d)\n", init_fd);
     }
@@ -1339,11 +1358,10 @@ printf("[capability] Host closed connection before first message\n");
                 {
                     unsigned int p9port = plan9_start_server();
                     if (p9port > 0) {
-                        printf("[init] Group A: Plan9 server started on port %u\n",
-                               p9port);
+                        LOG_INFO("init", "Plan9 server started on port %u", p9port);
+                        g_log_stats.plan9_conns++;
                     } else {
-                        fprintf(stderr, "[init] Group A: Plan9 server failed to start"
-                                " (non-fatal, continuing)\n");
+                        LOG_WARN("init", "Plan9 server failed to start (non-fatal)");
                     }
                 }
 
@@ -1362,6 +1380,7 @@ if (r2 <= 0) {
 } else {
     printf("[init] received LX_INIT_CREATE_SESSION (%zd bytes): ConsoleId=%lld\n",
            r2, (long long)create_sess.ConsoleId);
+    g_log_stats.sessions++;
 
     // Send back LX_INIT_CREATE_SESSION_RESPONSE
     // echo the sequence number from host

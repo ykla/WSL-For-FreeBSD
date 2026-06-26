@@ -61,6 +61,19 @@
 #include <netinet/in.h>
 #include <poll.h>
 
+/* Conditional logger support */
+#ifdef LOGGER_H
+#define P9_LOG_ERROR(mod, ...)   LOG_ERROR(mod, __VA_ARGS__)
+#define P9_LOG_WARN(mod, ...)    LOG_WARN(mod, __VA_ARGS__)
+#define P9_LOG_INFO(mod, ...)    LOG_INFO(mod, __VA_ARGS__)
+#define P9_LOG_DEBUG(mod, ...)   LOG_DEBUG(mod, __VA_ARGS__)
+#else
+#define P9_LOG_ERROR(mod, ...)   do { fprintf(stderr, "[%s] ", mod); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#define P9_LOG_WARN(mod, ...)    do { fprintf(stderr, "[%s] ", mod); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#define P9_LOG_INFO(mod, ...)    do { printf("[%s] ", mod); printf(__VA_ARGS__); printf("\n"); } while(0)
+#define P9_LOG_DEBUG(mod, ...)   do { printf("[%s] ", mod); printf(__VA_ARGS__); printf("\n"); } while(0)
+#endif
+
 /* ---- WSL protocol constants (lxinitshared.h) ---- */
 #define LX_INIT_UTILITY_VM_PLAN9_PORT 50001
 #define LxInitMessageStopPlan9Server  24

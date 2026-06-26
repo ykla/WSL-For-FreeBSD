@@ -22,12 +22,17 @@
 
 #include "terminal_notify.h"
 
+#include "logger.h"
+
 /* WSL message type values (from lxinitshared.h LX_MESSAGE_TYPE enum) */
 #define LxInitMessageCreateProcessUtilityVm      8
 #define LxInitMessageExitStatus                  9
 #define LxInitMessageWindowSizeChanged           10
 #define LxInitMessageTerminateInstance           14
+#define LxInitMessageNetworkInformation           4
+#define LxInitMessageTimezoneInformation          7
 #define LxMessageResultUint32                    78
+#define LxMessageResultBool                      76
 
 struct sockaddr_hvs {
     unsigned char sa_len;
@@ -93,6 +98,30 @@ typedef struct LX_INIT_WINDOW_SIZE_CHANGED
     unsigned short Rows;
     unsigned short Columns;
 } LX_INIT_WINDOW_SIZE_CHANGED;
+
+/* RESULT_MESSAGE<bool> for control channel NACK responses.
+ * Result is uint32_t for 4-byte alignment (true=1, false=0). */
+typedef struct {
+    struct MESSAGE_HEADER Header;
+    uint32_t Result;
+} LX_RESULT_MESSAGE_BOOL;
+
+/* NetworkInformation (host -> guest, type 4). Buffer contains NUL-terminated
+ * strings for /etc/resolv.conf content. */
+typedef struct {
+    struct MESSAGE_HEADER Header;
+    unsigned int FileHeaderIndex;
+    unsigned int FileContentsIndex;
+    char Buffer[];
+} LX_NETWORK_INFORMATION;
+
+/* TimezoneInformation (host -> guest, type 7). Buffer contains a NUL-terminated
+ * IANA timezone string at TimezoneOffset. */
+typedef struct {
+    struct MESSAGE_HEADER Header;
+    unsigned int TimezoneOffset;
+    char Buffer[];
+} LX_TIMEZONE_INFORMATION;
 
 /* Global storage for initial message */
 LX_INIT_CREATE_PROCESS_UTILITY_VM *g_initial_message = NULL;
@@ -681,6 +710,7 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
     }
 
     printf("[bridge] session started (shell pid=%d)\n", pid);
+    g_log_stats.sessions++;
 
     struct control_reader cr;
     memset(&cr, 0, sizeof(cr));
@@ -916,6 +946,7 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                 /* Do NOT break — keep looping to wait for SIGCHLD. */
             } else if (r > 0 && msg) {
                 struct MESSAGE_HEADER *mhdr = (struct MESSAGE_HEADER *)msg;
+                g_log_stats.messages_rx++;
                 switch (mhdr->MessageType) {
                 case LxInitMessageWindowSizeChanged:
                     if (mhdr->MessageSize >= sizeof(LX_INIT_WINDOW_SIZE_CHANGED)) {
@@ -924,9 +955,6 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                         printf("[bridge] WindowSizeChanged: rows=%u, cols=%u\n",
                                wsc->Rows, wsc->Columns);
                         update_pty_winsize(master_fd, wsc->Rows, wsc->Columns);
-                        /* Phase 6/7: update tracking to suppress feedback loop.
-                         * Also re-read pixel dimensions — TIOCSWINSZ may
-                         * zero ws_xpixel/ws_ypixel, so read actual state. */
                         struct winsize sync_ws;
                         unsigned short sync_x = fst.tracked_xpixel;
                         unsigned short sync_y = fst.tracked_ypixel;
@@ -939,9 +967,93 @@ static int run_session(int initial_c, int stdin_fd, int stdout_fd,
                                                     sync_x, sync_y);
                     }
                     break;
+
+                /* Task Group A: TerminateInstance(14) — host requests
+                 * forced session termination. Triggers the same graceful
+                 * shutdown path as a host disconnect (SIGHUP → SIGKILL). */
+                case LxInitMessageTerminateInstance:
+                    printf("[bridge] TerminateInstance received, "
+                           "starting graceful shutdown (SIGHUP child pid=%d)\n",
+                           (int)pid);
+                    host_disconnected = 1;
+                    bg_color_tracker_reset_sniffer(&bct);
+                    if (!sighup_sent) {
+                        kill(pid, SIGHUP);
+                        sighup_sent = 1;
+                    }
+                    shutdown_deadline = time(NULL) + 5;
+                    break;
+
+                /* Task Group A: NetworkInformation(4) — host pushes
+                 * updated /etc/resolv.conf content during a session.
+                 * Write to /etc/resolv.conf (best-effort, may fail as
+                 * non-root). */
+                case LxInitMessageNetworkInformation:
+                    if (mhdr->MessageSize >= sizeof(LX_NETWORK_INFORMATION)) {
+                        LX_NETWORK_INFORMATION *ni =
+                            (LX_NETWORK_INFORMATION *)msg;
+                        size_t buf_off = offsetof(LX_NETWORK_INFORMATION, Buffer);
+                        size_t buf_size = mhdr->MessageSize - buf_off;
+                        if (ni->FileContentsIndex < buf_size) {
+                            const char *content = ni->Buffer + ni->FileContentsIndex;
+                            FILE *f = fopen("/etc/resolv.conf", "w");
+                            if (f) {
+                                fputs(content, f);
+                                fclose(f);
+                                printf("[bridge] NetworkInformation: "
+                                       "updated /etc/resolv.conf\n");
+                            } else {
+                                printf("[bridge] NetworkInformation: "
+                                       "cannot write /etc/resolv.conf: %s\n",
+                                       strerror(errno));
+                            }
+                        }
+                    }
+                    break;
+
+                /* Task Group A: TimezoneInformation(7) — host pushes
+                 * updated timezone during a session. Symlinks
+                 * /etc/localtime to the zoneinfo file. */
+                case LxInitMessageTimezoneInformation:
+                    if (mhdr->MessageSize >= sizeof(LX_TIMEZONE_INFORMATION)) {
+                        LX_TIMEZONE_INFORMATION *tz =
+                            (LX_TIMEZONE_INFORMATION *)msg;
+                        size_t buf_off = offsetof(LX_TIMEZONE_INFORMATION, Buffer);
+                        size_t buf_size = mhdr->MessageSize - buf_off;
+                        if (tz->TimezoneOffset < buf_size) {
+                            const char *zone = tz->Buffer + tz->TimezoneOffset;
+                            printf("[bridge] TimezoneInformation: "
+                                   "applying timezone '%s'\n", zone);
+                            char zone_path[256];
+                            snprintf(zone_path, sizeof(zone_path),
+                                     "/usr/share/zoneinfo/%s", zone);
+                            unlink("/etc/localtime");
+                            if (symlink(zone_path, "/etc/localtime") < 0) {
+                                printf("[bridge] TimezoneInformation: "
+                                       "symlink failed: %s\n",
+                                       strerror(errno));
+                            }
+                        }
+                    }
+                    break;
+
                 default:
-                    printf("[bridge] control msg type=%u (size=%u, seq=%u)\n",
-                           mhdr->MessageType, mhdr->MessageSize, mhdr->SequenceNumber);
+                    /* Task Group A: send NACK for unknown control channel
+                     * message types so the host knows we don't handle them. */
+                    printf("[bridge] control msg type=%u (size=%u, seq=%u) "
+                           "→ NACK\n",
+                           mhdr->MessageType, mhdr->MessageSize,
+                           mhdr->SequenceNumber);
+                    {
+                        LX_RESULT_MESSAGE_BOOL nack;
+                        memset(&nack, 0, sizeof(nack));
+                        nack.Header.MessageType = LxMessageResultBool;
+                        nack.Header.MessageSize = sizeof(nack);
+                        nack.Header.SequenceNumber = mhdr->SequenceNumber;
+                        nack.Result = 0; /* false = not handled */
+                        if (initial_c >= 0 && !host_disconnected)
+                            send_all(initial_c, &nack, sizeof(nack));
+                    }
                     break;
                 }
                 control_consume(&cr, mhdr->MessageSize);
@@ -1066,9 +1178,12 @@ int main(void) {
     int s;
     struct sockaddr_hvs addr;
 
+    log_init("hvbridge");
+    log_stats_init();
+
     s = socket(AF_HYPERV, SOCK_STREAM, 0);
     if (s < 0) {
-        perror("socket");
+        LOG_ERROR("bridge", "socket: %s", strerror(errno));
         exit(1);
     }
 
@@ -1078,18 +1193,18 @@ int main(void) {
     addr.hvs_port = PORT_HVS_BSD;
 
     if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
+        LOG_ERROR("bridge", "bind: %s", strerror(errno));
         close(s);
         exit(1);
     }
 
     if (listen(s, 10) < 0) {
-        perror("listen");
+        LOG_ERROR("bridge", "listen: %s", strerror(errno));
         close(s);
         exit(1);
     }
 
-    printf("hv_sock server listening on port %u...\n", addr.hvs_port);
+    LOG_INFO("bridge", "hv_sock server listening on port %u", addr.hvs_port);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, terminate_handler);
     signal(SIGINT, terminate_handler);
@@ -1101,21 +1216,21 @@ int main(void) {
         /* Accept first connection (init channel — accepted but unused) */
         int init_c = accept_with_poll(s);
         if (init_c < 0) {
-            fprintf(stderr, "[bridge] accept init failed\n");
+            LOG_ERROR("bridge", "accept init failed");
             break;
         }
-        printf("[bridge] accepted init connection\n");
+        LOG_INFO("bridge", "accepted init connection");
 
         /* Accept control channel (initial_c) */
         int initial_c = accept_with_poll(s);
         if (initial_c < 0) {
-            fprintf(stderr, "[bridge] accept initial failed\n");
+            LOG_ERROR("bridge", "accept initial failed");
             close(init_c);
             break;
         }
 
         if (receive_initial_message(initial_c) < 0) {
-            fprintf(stderr, "[bridge] FATAL: failed to receive initial message\n");
+            LOG_ERROR("bridge", "FATAL: failed to receive initial message");
             close(init_c);
             close(initial_c);
             break;
@@ -1134,11 +1249,11 @@ int main(void) {
         for (int i = 0; i < NUM_ADDITIONAL_SOCKETS; i++) {
             client_sockets[i] = accept_with_poll(s);
             if (client_sockets[i] < 0) {
-                fprintf(stderr, "[bridge] accept additional %d failed\n", i);
+                LOG_ERROR("bridge", "accept additional %d failed", i);
                 accept_failed = 1;
                 break;
             }
-            printf("[bridge] accepted additional socket %d\n", i);
+            LOG_DEBUG("bridge", "accepted additional socket %d", i);
         }
 
         if (accept_failed) {

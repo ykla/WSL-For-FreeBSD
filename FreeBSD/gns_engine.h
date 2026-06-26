@@ -34,6 +34,20 @@
  * Included here so gns_engine_loop can poll the tracker each cycle. */
 #include "port_tracker.h"
 
+/* Conditional logger support: if logger.h has been included by the caller,
+ * use LOG_* macros; otherwise fall back to raw printf/fprintf. */
+#ifdef LOGGER_H
+#define GNS_LOG_ERROR(mod, ...)   LOG_ERROR(mod, __VA_ARGS__)
+#define GNS_LOG_WARN(mod, ...)    LOG_WARN(mod, __VA_ARGS__)
+#define GNS_LOG_INFO(mod, ...)    LOG_INFO(mod, __VA_ARGS__)
+#define GNS_LOG_DEBUG(mod, ...)   LOG_DEBUG(mod, __VA_ARGS__)
+#else
+#define GNS_LOG_ERROR(mod, ...)   do { fprintf(stderr, "[%s] ", mod); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#define GNS_LOG_WARN(mod, ...)    do { fprintf(stderr, "[%s] ", mod); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#define GNS_LOG_INFO(mod, ...)    do { printf("[%s] ", mod); printf(__VA_ARGS__); printf("\n"); } while(0)
+#define GNS_LOG_DEBUG(mod, ...)   do { printf("[%s] ", mod); printf(__VA_ARGS__); printf("\n"); } while(0)
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -406,14 +420,14 @@ static inline void *gns_recv_message(int fd, struct MESSAGE_HEADER *out_hdr)
 static inline int gns_handle_network_information(void *msg_buf, size_t msg_size)
 {
     if (msg_size < sizeof(LX_INIT_NETWORK_INFORMATION)) {
-        fprintf(stderr, "[gns] NetworkInformation: message too small (%zu)\n", msg_size);
+        GNS_LOG_ERROR("gns", "NetworkInformation: message too small (%zu)", msg_size);
         return -1;
     }
     LX_INIT_NETWORK_INFORMATION *ni = (LX_INIT_NETWORK_INFORMATION *)msg_buf;
 
     size_t header_fixed = offsetof(LX_INIT_NETWORK_INFORMATION, Buffer);
     if (msg_size <= header_fixed) {
-        fprintf(stderr, "[gns] NetworkInformation: no buffer data\n");
+        GNS_LOG_ERROR("gns", "NetworkInformation: no buffer data");
         return -1;
     }
     size_t buf_size = msg_size - header_fixed;
@@ -451,7 +465,7 @@ static inline int gns_handle_network_information(void *msg_buf, size_t msg_size)
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", resolv_path);
     FILE *fp = fopen(tmp_path, "w");
     if (!fp) {
-        fprintf(stderr, "[gns] fopen %s: %s\n", tmp_path, strerror(errno));
+        GNS_LOG_ERROR("gns", "fopen %s: %s", tmp_path, strerror(errno));
         return -1;
     }
     if (file_contents) {
@@ -523,11 +537,17 @@ static inline int gns_run_cmd(const char *cmd)
     int rc = system(cmd);
 #else
     char wrapped[512];
-    snprintf(wrapped, sizeof(wrapped), "timeout 3 %s", cmd);
+    int n = snprintf(wrapped, sizeof(wrapped), "timeout 3 %s", cmd);
+    /* Task Group B: if command is too long, truncation is safer than
+     * buffer overflow. The truncated command will likely fail. */
+    if (n < 0 || (size_t)n >= sizeof(wrapped)) {
+        fprintf(stderr, "[gns] gns_run_cmd: command truncated\n");
+        return -1;
+    }
     int rc = system(wrapped);
 #endif
     if (rc == -1) {
-        perror("[gns] system()");
+        GNS_LOG_ERROR("gns", "system() failed: %s", strerror(errno));
         return -1;
     }
     return WEXITSTATUS(rc);
@@ -2179,6 +2199,9 @@ static inline void gns_engine_loop(int gns_fd)
 
         printf("[gns] received message type=%u (size=%u, seq=%u)\n",
                hdr.MessageType, hdr.MessageSize, hdr.SequenceNumber);
+#ifdef LOGGER_H
+        g_log_stats.messages_rx++;
+#endif
 
         switch (hdr.MessageType) {
         case LxGnsMessageInterfaceConfiguration:
